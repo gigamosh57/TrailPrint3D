@@ -138,7 +138,21 @@ def tp3d_debug_logging_enabled():
 def tp3d_log(message, force=False):
     if force or tp3d_debug_logging_enabled():
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[TrailPrint3D {ts}] {message}")
+        log_line = f"[TrailPrint3D {ts}] {message}"
+        print(log_line)
+
+        scene = bpy.context.scene if bpy.context else None
+        if scene and hasattr(scene, "tp3d"):
+            export_path_value = getattr(scene.tp3d, "export_path", "")
+            if export_path_value:
+                try:
+                    export_dir = bpy.path.abspath(export_path_value)
+                    os.makedirs(export_dir, exist_ok=True)
+                    log_path = os.path.join(export_dir, "trailprint3d.log")
+                    with open(log_path, "a", encoding="utf-8") as logfile:
+                        logfile.write(log_line + "\n")
+                except Exception:
+                    pass
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -349,7 +363,7 @@ class MyProperties(bpy.types.PropertyGroup):
     enableDetailedLogging: bpy.props.BoolProperty(
         name="Enable Detailed Logging",
         default=False,
-        description="Print detailed OSM request and parsing logs to Blender's console"
+        description="Write detailed OSM request and parsing logs to trailprint3d.log in your Export Path folder"
     )
 
     mountain_treshold:bpy.props.IntProperty(name="Mountain Treshold", default = 60, min = 0, max = 100,subtype='PERCENTAGE', description="Height Treshold to Color Mountians")
@@ -365,6 +379,7 @@ class MyProperties(bpy.types.PropertyGroup):
     show_special: bpy.props.BoolProperty(name="Special",default=False)
     show_postProcess: bpy.props.BoolProperty(name="Post Process", default = False)
     show_api: bpy.props.BoolProperty(name="API", default=False)
+    show_logging: bpy.props.BoolProperty(name="Logging", default=False)
     show_attribution: bpy.props.BoolProperty(name="Attribution", default = False)
     show_preset: bpy.props.BoolProperty(name="Preset", default=False)
 
@@ -1448,11 +1463,18 @@ class MY_PT_Advanced(bpy.types.Panel):
                 layout.separator()  # Adds a horizontal line
             
 
+        #LOGGING
+        layout.prop(props,"show_logging", icon="TRIA_DOWN" if props.show_logging else "TRIA_RIGHT", emboss=True)
+        if props.show_logging:
+            box = layout.box()
+            box.label(text="Log file location: Export Path/trailprint3d.log")
+            box.prop(props, "enableDetailedLogging", toggle=True)
+            layout.separator()
+
         #INCLUDE ELEMENTS
         layout.prop(props,"show_coloring", icon="TRIA_DOWN" if props.show_coloring else "TRIA_RIGHT", emboss=True)
         if props.show_coloring:
             boxer = layout.box()
-            boxer.prop(props, "enableDetailedLogging", toggle=True)
             box = boxer.box()
             box.label(text = "Water")
             box.prop(props, "col_wActive")
