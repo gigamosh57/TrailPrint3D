@@ -53,6 +53,7 @@ import xml.etree.ElementTree as ET
 import math
 import requests # type: ignore
 import time
+import random
 from datetime import date
 from datetime import datetime
 import bmesh # type: ignore
@@ -4568,61 +4569,106 @@ def single_color_mode(crv, mapName):
 
 def fetch_osm_data(bbox, kind = "WATER"):
     south, west, north, east = bbox
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    query = None
-    if kind == "WATER":
-        query = f"""
+    overpass_endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    ]
+    overpass_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "User-Agent": f"TrailPrint3D/{AddonVersion[0]}.{AddonVersion[1]} (Blender Addon; https://github.com/)"
+    }
+
+    queries = {
+        "WATER": f"""
         [out:json][timeout:25];
         (
             nwr["natural"="water"]({south},{west},{north},{east});
             nwr["water"="river"]({south},{west},{north},{east});
             nwr["water"="lake"]({south},{west},{north},{east});
-
         );
         out body;
         >;
         out skel qt;
-        """
-    if kind == "FOREST":
-        query = f"""
+        """,
+        "FOREST": f"""
         [out:json][timeout:25];
         (
             nwr["natural"="wood"]({south},{west},{north},{east});
             nwr["landuse"="forest"]({south},{west},{north},{east});
-
         );
         out body;
         >;
         out skel qt;
-        """
-    if kind == "CITY":
-        query = f"""
+        """,
+        "CITY": f"""
         [out:json][timeout:25];
         (
             nwr["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
-
-
         );
         out body;
         >;
         out skel qt;
-        """
-    if kind == "GLACIER":
-        query = f"""
+        """,
+        "GLACIER": f"""
         [out:json][timeout:25];
         (
             nwr["natural"="glacier"]({south},{west},{north},{east});
-
-
         );
         out body;
         >;
         out skel qt;
         """
+    }
+    query = queries.get(kind)
+    request_id = f"osm-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+
+    try:
+        lat_span = float(north) - float(south)
+        lon_span = float(east) - float(west)
+    except Exception:
+        lat_span = None
+        lon_span = None
 
     if query is None:
-        tp3d_log(f"Unsupported OSM kind '{kind}'.")
-        return None
+        reason_code = "OSM_UNSUPPORTED_KIND"
+        tp3d_log(f"{reason_code}: request_id={request_id} unsupported OSM kind '{kind}'.")
+        return {
+            "status": "http_failure",
+            "endpoint": None,
+            "error_text": f"Unsupported OSM kind '{kind}'.",
+            "response_json_or_none": None,
+            "reason_code": reason_code,
+            "request_id": request_id,
+            "http_status": None
+        }
+
+    if lat_span is None or lon_span is None:
+        reason_code = "OSM_INVALID_BBOX_FORMAT"
+        tp3d_log(f"{reason_code}: request_id={request_id} bbox={bbox}")
+        return {
+            "status": "transport_failure",
+            "endpoint": None,
+            "error_text": f"Invalid bbox values: {bbox}",
+            "response_json_or_none": None,
+            "reason_code": reason_code,
+            "request_id": request_id,
+            "http_status": None
+        }
+
+    if north <= south or east <= west:
+        reason_code = "OSM_INVALID_BBOX_ORDER"
+        tp3d_log(f"{reason_code}: request_id={request_id} bbox={bbox}")
+        return {
+            "status": "transport_failure",
+            "endpoint": None,
+            "error_text": f"Invalid bbox order: {bbox}",
+            "response_json_or_none": None,
+            "reason_code": reason_code,
+            "request_id": request_id,
+            "http_status": None
+        }
 
     '''
     #way["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
@@ -4645,32 +4691,151 @@ def fetch_osm_data(bbox, kind = "WATER"):
     '''
     #print(query)
     tp3d_log(
-        f"OSM request prepared for kind={kind} bbox={bbox}."
+        f"OSM request prepared request_id={request_id} kind={kind} bbox={bbox} "
+        f"lat_span={lat_span:.6f} lon_span={lon_span:.6f} query_chars={len(query)} endpoint_count={len(overpass_endpoints)}."
     )
-    tp3d_log(f"OSM query:\n{query}")
+    tp3d_log(f"OSM query request_id={request_id}:\n{query}")
 
-    for attempt in range(3):
-        try:
-            tp3d_log(f"OSM request attempt {attempt + 1}/3 for kind={kind}.")
-            response = requests.post(overpass_url, data={'data': query}, timeout=45)
+    max_attempts = 3
+    failover_used = False
+    final_result = {
+        "status": "transport_failure",
+        "endpoint": overpass_endpoints[0],
+        "error_text": "No request was sent.",
+        "response_json_or_none": None,
+        "reason_code": "OSM_UNKNOWN_FAILURE",
+        "request_id": request_id,
+        "http_status": None
+    }
 
-            #check if response is valid
-            tp3d_log(f"OSM response status={response.status_code}, content-type={response.headers.get('content-type')}")
-            if response.status_code != 200:
-                tp3d_log(f"OSM non-200 response preview: {response.text[:500]}")
+    for endpoint_index, endpoint_url in enumerate(overpass_endpoints):
+        if endpoint_index > 1 and failover_used:
+            break
+        for attempt in range(1, max_attempts + 1):
+            tp3d_log(
+                f"OSM request attempt {attempt}/{max_attempts} request_id={request_id} "
+                f"url={endpoint_url} kind={kind}."
+            )
+            try:
+                started_at = time.monotonic()
+                response = requests.post(
+                    endpoint_url,
+                    headers=overpass_headers,
+                    data={"data": query},
+                    timeout=45
+                )
+                elapsed_seconds = time.monotonic() - started_at
+                status = response.status_code
+                tp3d_log(
+                    f"OSM response request_id={request_id} status={status} elapsed={elapsed_seconds:.2f}s "
+                    f"content-type={response.headers.get('content-type')} bytes={len(response.content)}"
+                )
 
-            #print(response.json())
-            if response.status_code == 504:
-                tp3d_log(f"OSM timeout (504), retrying... {attempt+1}/3")
-            if response.status_code == 200:
-                return response
-            
-        except Exception as e:
-            tp3d_log(f"OSM request exception (attempt {attempt + 1}/3): {e}")
-            time.sleep(5)
+                if status == 200:
+                    try:
+                        response_json = response.json()
+                        elements = response_json.get("elements", []) if isinstance(response_json, dict) else []
+                        tp3d_log(
+                            f"OSM parse success request_id={request_id} endpoint={endpoint_url} "
+                            f"elements={len(elements)} keys={list(response_json.keys()) if isinstance(response_json, dict) else 'n/a'}"
+                        )
+                        return {
+                            "status": "ok",
+                            "endpoint": endpoint_url,
+                            "error_text": None,
+                            "response_json_or_none": response_json,
+                            "reason_code": "OSM_OK",
+                            "request_id": request_id,
+                            "http_status": status
+                        }
+                    except Exception as json_error:
+                        reason_code = "OSM_JSON_PARSE_FAILURE"
+                        error_text = f"Failed to decode OSM JSON: {json_error}"
+                        tp3d_log(f"{reason_code}: request_id={request_id} {error_text}")
+                        tp3d_log(f"OSM raw response preview request_id={request_id}: {response.text[:500]}")
+                        return {
+                            "status": "json_parse_failure",
+                            "endpoint": endpoint_url,
+                            "error_text": error_text,
+                            "response_json_or_none": None,
+                            "reason_code": reason_code,
+                            "request_id": request_id,
+                            "http_status": status
+                        }
 
-    tp3d_log(f"OSM request failed after 3 attempts for kind={kind} bbox={bbox}.", force=True)
-    return None
+                tp3d_log(f"OSM non-200 response preview request_id={request_id}: {response.text[:500]}")
+                is_retryable_http = (status == 429) or (500 <= status <= 599)
+                if is_retryable_http and attempt < max_attempts:
+                    delay = (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
+                    reason_code = "OSM_HTTP_RETRYABLE"
+                    tp3d_log(f"{reason_code}: request_id={request_id} status={status} retrying in {delay:.2f}s.")
+                    time.sleep(delay)
+                    continue
+
+                reason_code = "OSM_HTTP_RETRYABLE_EXHAUSTED" if is_retryable_http else "OSM_HTTP_PERMANENT_4XX"
+                final_result = {
+                    "status": "http_failure",
+                    "endpoint": endpoint_url,
+                    "error_text": f"HTTP {status}: {response.text[:500]}",
+                    "response_json_or_none": None,
+                    "reason_code": reason_code,
+                    "request_id": request_id,
+                    "http_status": status
+                }
+
+                if (400 <= status <= 499) and status != 429 and not failover_used and endpoint_index < len(overpass_endpoints) - 1:
+                    failover_used = True
+                    tp3d_log(f"{reason_code}: request_id={request_id} one-time endpoint failover from {endpoint_url}.")
+                    break
+                if is_retryable_http and attempt < max_attempts:
+                    continue
+                if (400 <= status <= 499) and status != 429:
+                    return final_result
+
+            except (requests.Timeout, requests.ConnectionError) as transport_error:
+                reason_code = "OSM_TRANSPORT_RETRYABLE"
+                final_result = {
+                    "status": "transport_failure",
+                    "endpoint": endpoint_url,
+                    "error_text": str(transport_error),
+                    "response_json_or_none": None,
+                    "reason_code": reason_code,
+                    "request_id": request_id,
+                    "http_status": None
+                }
+                if attempt < max_attempts:
+                    delay = (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
+                    tp3d_log(f"{reason_code}: request_id={request_id} {transport_error}. retrying in {delay:.2f}s.")
+                    time.sleep(delay)
+                    continue
+                tp3d_log(f"{reason_code}: request_id={request_id} retries exhausted on endpoint={endpoint_url}.")
+
+            except Exception as unexpected_error:
+                reason_code = "OSM_TRANSPORT_UNEXPECTED"
+                final_result = {
+                    "status": "transport_failure",
+                    "endpoint": endpoint_url,
+                    "error_text": str(unexpected_error),
+                    "response_json_or_none": None,
+                    "reason_code": reason_code,
+                    "request_id": request_id,
+                    "http_status": None
+                }
+                tp3d_log(f"{reason_code}: request_id={request_id} endpoint={endpoint_url} error={unexpected_error}")
+                return final_result
+
+        if failover_used and endpoint_index == 0:
+            continue
+        if final_result["status"] == "http_failure" and final_result["reason_code"] == "OSM_HTTP_PERMANENT_4XX":
+            break
+
+    tp3d_log(
+        f"{final_result['reason_code']}: request_id={request_id} OSM request failed for kind={kind} "
+        f"bbox={bbox} endpoint={final_result.get('endpoint')} http_status={final_result.get('http_status')} "
+        f"error={final_result.get('error_text')}",
+        force=True
+    )
+    return final_result
 
 
 def extract_multipolygon_bodies(elements, nodes):
@@ -4871,28 +5036,31 @@ def coloring_main(map,kind = "WATER"):
                 #data = fetch_osm_data(bbox, kind)
                 try:
                     resp = fetch_osm_data(bbox, kind)
-                    if resp is None:
-                        tp3d_log(f"No OSM response received for kind={kind} bbox={bbox}.")
-                        show_message_box(f"OSM fetch failed for {kind} in bbox {bbox}. Enable detailed logging for more info.")
-                        continue
-                    if resp.status_code != 200:
-                        tp3d_log(f"OSM response was not successful for kind={kind} bbox={bbox}. status={resp.status_code}")
-                        show_message_box(f"OSM returned HTTP {resp.status_code} for {kind}. Enable detailed logging for details.")
-                        return
-                    
-
                 except Exception as e:
                     tp3d_log(f"Unexpected OSM fetch error for kind={kind} bbox={bbox}: {e}")
                     tp3d_log(traceback.format_exc())
                     show_message_box(f"Something went wrong while fetching OSM data for {kind}. Enable detailed logging and check console.")
                     continue
 
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    tp3d_log(f"Failed to decode OSM JSON for kind={kind} bbox={bbox}: {e}")
-                    tp3d_log(f"Raw response preview: {resp.text[:500]}")
-                    show_message_box(f"OSM response for {kind} was not valid JSON. Enable detailed logging and check console.")
+                if resp.get("status") != "ok":
+                    tp3d_log(
+                        f"OSM fetch failed for kind={kind} bbox={bbox}. "
+                        f"status={resp.get('status')} reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} "
+                        f"http_status={resp.get('http_status')} request_id={resp.get('request_id')} error={resp.get('error_text')}"
+                    )
+                    show_message_box(
+                        f"OSM fetch failed for {kind}. "
+                        f"Reason: {resp.get('reason_code')} request_id={resp.get('request_id')} (see logs for endpoint/error details)."
+                    )
+                    continue
+
+                data = resp.get("response_json_or_none")
+                if data is None:
+                    tp3d_log(
+                        f"OSM fetch result had no JSON payload for kind={kind} bbox={bbox}. "
+                        f"reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} request_id={resp.get('request_id')}"
+                    )
+                    show_message_box(f"OSM returned empty JSON payload for {kind}. Enable detailed logging for details.")
                     continue
                 nodes = build_osm_nodes(data)
                 bodies = extract_multipolygon_bodies(data['elements'], nodes)
