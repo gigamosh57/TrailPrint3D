@@ -64,6 +64,7 @@ import platform
 import zlib
 import struct
 import csv
+import traceback
 
 
 gpx_file_path = ""
@@ -125,6 +126,19 @@ objWater = None
 objForest = None
 objCity = None
 objGlacier = None
+
+
+def tp3d_debug_logging_enabled():
+    scene = bpy.context.scene if bpy.context else None
+    if scene and hasattr(scene, "tp3d"):
+        return bool(getattr(scene.tp3d, "enableDetailedLogging", False))
+    return False
+
+
+def tp3d_log(message, force=False):
+    if force or tp3d_debug_logging_enabled():
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[TrailPrint3D {ts}] {message}")
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -332,6 +346,11 @@ class MyProperties(bpy.types.PropertyGroup):
     col_glArea: bpy.props.FloatProperty(name="Glacier Size Treshold", default = 1, description = "Glaciers smaller than the treshold wont be included")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
+    enableDetailedLogging: bpy.props.BoolProperty(
+        name="Enable Detailed Logging",
+        default=False,
+        description="Print detailed OSM request and parsing logs to Blender's console"
+    )
 
     mountain_treshold:bpy.props.IntProperty(name="Mountain Treshold", default = 60, min = 0, max = 100,subtype='PERCENTAGE', description="Height Treshold to Color Mountians")
     cl_thickness: bpy.props.FloatProperty(name="Contour Line Thickness", default = 0.2, description = "Thickness of the Contour Line")
@@ -1433,6 +1452,7 @@ class MY_PT_Advanced(bpy.types.Panel):
         layout.prop(props,"show_coloring", icon="TRIA_DOWN" if props.show_coloring else "TRIA_RIGHT", emboss=True)
         if props.show_coloring:
             boxer = layout.box()
+            boxer.prop(props, "enableDetailedLogging", toggle=True)
             box = boxer.box()
             box.label(text = "Water")
             box.prop(props, "col_wActive")
@@ -4527,6 +4547,7 @@ def single_color_mode(crv, mapName):
 def fetch_osm_data(bbox, kind = "WATER"):
     south, west, north, east = bbox
     overpass_url = "http://overpass-api.de/api/interpreter"
+    query = None
     if kind == "WATER":
         query = f"""
         [out:json][timeout:25];
@@ -4577,6 +4598,10 @@ def fetch_osm_data(bbox, kind = "WATER"):
         out skel qt;
         """
 
+    if query is None:
+        tp3d_log(f"Unsupported OSM kind '{kind}'.")
+        return None
+
     '''
     #way["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
     #relation["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
@@ -4597,26 +4622,32 @@ def fetch_osm_data(bbox, kind = "WATER"):
 
     '''
     #print(query)
+    tp3d_log(
+        f"OSM request prepared for kind={kind} bbox={bbox}."
+    )
+    tp3d_log(f"OSM query:\n{query}")
+
     for attempt in range(3):
         try:
-            response = requests.post(overpass_url, data={'data': query})
+            tp3d_log(f"OSM request attempt {attempt + 1}/3 for kind={kind}.")
+            response = requests.post(overpass_url, data={'data': query}, timeout=45)
 
             #check if response is valid
-            print("Status:", response.status_code)
+            tp3d_log(f"OSM response status={response.status_code}, content-type={response.headers.get('content-type')}")
             if response.status_code != 200:
-                print("Content-Type:", response.headers.get("content-type"))
-                print("Response text preview:\n", response.text[:500])
+                tp3d_log(f"OSM non-200 response preview: {response.text[:500]}")
 
             #print(response.json())
             if response.status_code == 504:
-                print(f"Timeout (504), retrying... {attempt+1}/3")
+                tp3d_log(f"OSM timeout (504), retrying... {attempt+1}/3")
             if response.status_code == 200:
                 return response
             
         except Exception as e:
-            print("Request failed:", e)
+            tp3d_log(f"OSM request exception (attempt {attempt + 1}/3): {e}")
             time.sleep(5)
 
+    tp3d_log(f"OSM request failed after 3 attempts for kind={kind} bbox={bbox}.", force=True)
     return None
 
 
@@ -4817,20 +4848,33 @@ def coloring_main(map,kind = "WATER"):
                 data = []
                 #data = fetch_osm_data(bbox, kind)
                 try:
-                    #pass
                     resp = fetch_osm_data(bbox, kind)
+                    if resp is None:
+                        tp3d_log(f"No OSM response received for kind={kind} bbox={bbox}.")
+                        show_message_box(f"OSM fetch failed for {kind} in bbox {bbox}. Enable detailed logging for more info.")
+                        continue
                     if resp.status_code != 200:
-                        print("OSM Timeout")
+                        tp3d_log(f"OSM response was not successful for kind={kind} bbox={bbox}. status={resp.status_code}")
+                        show_message_box(f"OSM returned HTTP {resp.status_code} for {kind}. Enable detailed logging for details.")
                         return
                     
 
-                except:
-                    show_message_box("Something went wrong with fetching OSM data, Try again maybe or idk")
+                except Exception as e:
+                    tp3d_log(f"Unexpected OSM fetch error for kind={kind} bbox={bbox}: {e}")
+                    tp3d_log(traceback.format_exc())
+                    show_message_box(f"Something went wrong while fetching OSM data for {kind}. Enable detailed logging and check console.")
                     continue
 
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    tp3d_log(f"Failed to decode OSM JSON for kind={kind} bbox={bbox}: {e}")
+                    tp3d_log(f"Raw response preview: {resp.text[:500]}")
+                    show_message_box(f"OSM response for {kind} was not valid JSON. Enable detailed logging and check console.")
+                    continue
                 nodes = build_osm_nodes(data)
                 bodies = extract_multipolygon_bodies(data['elements'], nodes)
+                tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={len(data.get('elements', []))}, nodes={len(nodes)}, multipolygons={len(bodies)}")
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
 
                 for i, coords in enumerate(bodies):
