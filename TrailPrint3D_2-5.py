@@ -4856,14 +4856,41 @@ def extract_multipolygon_bodies(elements, nodes):
     def way_coords(way):
         return [ (nodes[nid]['lat'], nodes[nid]['lon'], nodes[nid].get('elevation', 0)) for nid in way['nodes'] if nid in nodes ]
 
-    # Store all multipolygon lakes as lists of outer rings (each ring = list of coords)
+    # Store all multipolygon lakes as structured polygons: {relation_id, outer, inners}
     multipolygon_lakes = []
 
     # Index ways by their id for quick lookup
     way_dict = {el['id']: el for el in elements if el['type'] == 'way'}
 
+    def ring_signed_area_latlon(coords):
+        if len(coords) < 3:
+            return 0.0
+        area = 0.0
+        for i in range(len(coords)):
+            y0, x0, _ = coords[i]
+            y1, x1, _ = coords[(i + 1) % len(coords)]
+            area += (x0 * y1) - (x1 * y0)
+        return area * 0.5
+
+    def point_in_ring_latlon(point, ring):
+        if len(ring) < 3:
+            return False
+        py, px, _ = point
+        inside = False
+        j = len(ring) - 1
+        for i in range(len(ring)):
+            y1, x1, _ = ring[i]
+            y2, x2, _ = ring[j]
+            intersects = ((y1 > py) != (y2 > py)) and (
+                px < ((x2 - x1) * (py - y1) / ((y2 - y1) if (y2 - y1) != 0 else 1e-12) + x1)
+            )
+            if intersects:
+                inside = not inside
+            j = i
+        return inside
+
     for el in elements:
-        if el['type'] in ('relation', 'way'):
+        if el['type'] == 'relation':
             # Collect outer and inner member ways
             outer_ways = []
             inner_ways = []
@@ -4924,9 +4951,41 @@ def extract_multipolygon_bodies(elements, nodes):
             outer_loops = stitch_ways(outer_ways)
             inner_loops = stitch_ways(inner_ways)
 
-            # For now, just add outer loops as separate lakes (you could add inner loops for holes)
+            normalized_outers = []
+            normalized_inners = []
             for loop in outer_loops:
-                multipolygon_lakes.append(loop)
+                if len(loop) >= 3:
+                    normalized_outers.append(loop)
+            for loop in inner_loops:
+                if len(loop) >= 3:
+                    normalized_inners.append(loop)
+
+            # Map each inner ring to its containing outer ring (choose smallest containing outer area)
+            outer_payloads = [{"outer": o, "inners": []} for o in normalized_outers]
+            for inner in normalized_inners:
+                sample = inner[0]
+                containing = []
+                for oi, outer_payload in enumerate(outer_payloads):
+                    outer = outer_payload["outer"]
+                    if point_in_ring_latlon(sample, outer):
+                        containing.append((oi, abs(ring_signed_area_latlon(outer))))
+                if containing:
+                    best_outer_index = min(containing, key=lambda x: x[1])[0]
+                    outer_payloads[best_outer_index]["inners"].append(inner)
+                elif outer_payloads:
+                    # Fallback: attach to largest outer when geometric containment is ambiguous.
+                    best_outer_index = max(
+                        range(len(outer_payloads)),
+                        key=lambda idx: abs(ring_signed_area_latlon(outer_payloads[idx]["outer"]))
+                    )
+                    outer_payloads[best_outer_index]["inners"].append(inner)
+
+            for payload in outer_payloads:
+                multipolygon_lakes.append({
+                    "relation_id": el.get("id"),
+                    "outer": payload["outer"],
+                    "inners": payload["inners"]
+                })
 
     return multipolygon_lakes
 
@@ -4982,6 +5041,26 @@ def calculate_polygon_area_2d(coords):
             area += (x0 * y1) - (x1 * y0)
     
     return abs(area) * 0.5
+
+def calculate_polygon_signed_area_2d(coords):
+    area = 0.0
+
+    if len(coords) >= 3:
+
+        n = len(coords)
+        for i in range(n):
+            x0, y0, z0 = coords[i]
+            x1, y1, z1 = coords[(i + 1) % n]  # Wrap around to the first point
+            area += (x0 * y1) - (x1 * y0)
+
+    return area * 0.5
+
+def ensure_ring_orientation(coords, clockwise=False):
+    signed_area = calculate_polygon_signed_area_2d(coords)
+    is_clockwise = signed_area < 0
+    if clockwise != is_clockwise:
+        return list(reversed(coords))
+    return coords
 
 def build_osm_nodes(data):
     nodes = {}
@@ -5079,16 +5158,83 @@ def coloring_main(map,kind = "WATER"):
                 tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={len(data.get('elements', []))}, nodes={len(nodes)}, multipolygons={len(bodies)}")
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
 
-                for i, coords in enumerate(bodies):
-                    blender_coords = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in coords]
-                    calcArea = calculate_polygon_area_2d(blender_coords)
-                    #print(f"tArea1: {calcArea}")
-                    if calcArea > col_Area:
-                        tobj = col_create_face_mesh(f"Relation_{i}", blender_coords)
-                        created_objects.append(tobj)
+                relation_stats = {}
+                for i, body in enumerate(bodies):
+                    relation_id = body.get("relation_id", "unknown")
+                    outer = body.get("outer", [])
+                    inners = body.get("inners", [])
+
+                    if relation_id not in relation_stats:
+                        relation_stats[relation_id] = {
+                            "outers": 0,
+                            "inners": 0,
+                            "area_before": 0.0,
+                            "area_after": 0.0
+                        }
+
+                    outer_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in outer]
+                    outer_blender = ensure_ring_orientation(outer_blender, clockwise=False)
+                    area_before = calculate_polygon_area_2d(outer_blender)
+                    relation_stats[relation_id]["outers"] += 1
+                    relation_stats[relation_id]["inners"] += len(inners)
+                    relation_stats[relation_id]["area_before"] += area_before
+
+                    if area_before <= col_Area:
+                        waterDeleted += 1
+                        continue
+
+                    outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_outer", outer_blender)
+                    if outer_obj is None:
+                        waterDeleted += 1
+                        continue
+
+                    hole_area_total = 0.0
+                    for h_idx, inner in enumerate(inners):
+                        inner_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in inner]
+                        inner_blender = ensure_ring_orientation(inner_blender, clockwise=True)
+                        inner_area = calculate_polygon_area_2d(inner_blender)
+                        hole_area_total += inner_area
+
+                        if inner_area <= 0:
+                            continue
+                        inner_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_inner_{h_idx}", inner_blender)
+                        if inner_obj is None:
+                            continue
+
+                        bool_mod = outer_obj.modifiers.new(
+                            name=f"HoleDiff_{relation_id}_{i}_{h_idx}",
+                            type='BOOLEAN'
+                        )
+                        bool_mod.operation = 'DIFFERENCE'
+                        bool_mod.solver = 'EXACT'
+                        bool_mod.object = inner_obj
+                        bpy.context.view_layer.objects.active = outer_obj
+                        try:
+                            bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+                        except Exception as e:
+                            tp3d_log(f"Boolean apply failed for relation={relation_id} outer={i} hole={h_idx}: {e}")
+
+                        mesh_data = inner_obj.data
+                        bpy.data.objects.remove(inner_obj, do_unlink=True)
+                        bpy.data.meshes.remove(mesh_data)
+
+                    area_after = max(area_before - hole_area_total, 0.0)
+                    relation_stats[relation_id]["area_after"] += area_after
+
+                    if area_after > col_Area:
+                        created_objects.append(outer_obj)
                         waterCreated += 1
                     else:
+                        mesh_data = outer_obj.data
+                        bpy.data.objects.remove(outer_obj, do_unlink=True)
+                        bpy.data.meshes.remove(mesh_data)
                         waterDeleted += 1
+
+                for relation_id, stats in relation_stats.items():
+                    tp3d_log(
+                        f"Relation {relation_id}: outers={stats['outers']} inners={stats['inners']} "
+                        f"area_before={stats['area_before']:.3f} area_after={stats['area_after']:.3f}"
+                    )
 
                 for i, element in enumerate(data['elements']):
                     #print(i)
