@@ -401,6 +401,30 @@ class MyProperties(bpy.types.PropertyGroup):
     col_cArea: bpy.props.FloatProperty(name="City Size Treshold", default = 1, description = "Cities smaller than the treshold wont be included")
     col_glActive: bpy.props.BoolProperty(name="Include Glaciers", default=False, description = "Include Glaciers (If there are any)")
     col_glArea: bpy.props.FloatProperty(name="Glacier Size Treshold", default = 1, description = "Glaciers smaller than the treshold wont be included")
+    col_min_poly_area: bpy.props.FloatProperty(
+        name="Min Ring Area",
+        default=0.05,
+        min=0.0,
+        description="Drop tiny outer polygons/holes before creating Blender objects"
+    )
+    col_ring_decimate_distance: bpy.props.FloatProperty(
+        name="Ring Decimate Distance",
+        default=0.02,
+        min=0.0,
+        description="Distance-based simplification for polygon rings before object creation"
+    )
+    col_max_ring_vertices: bpy.props.IntProperty(
+        name="Max Ring Vertices",
+        default=2500,
+        min=3,
+        description="Skip/log polygons with more vertices than this cap"
+    )
+    col_relation_log_interval: bpy.props.IntProperty(
+        name="Relation Log Interval",
+        default=25,
+        min=1,
+        description="Emit progress logs every N processed relations"
+    )
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
     enableDetailedLogging: bpy.props.BoolProperty(
@@ -1536,6 +1560,12 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.label(text = "Glaciers")
             box.prop(props, "col_glActive")
             box.prop(props, "col_glArea")
+            box = boxer.box()
+            box.label(text="Relation Mesh Optimization")
+            box.prop(props, "col_min_poly_area")
+            box.prop(props, "col_ring_decimate_distance")
+            box.prop(props, "col_max_ring_vertices")
+            box.prop(props, "col_relation_log_interval")
 
             #layout.prop(props, "col_KeepManifold")
             boxer.prop(props,"col_PaintMap")
@@ -5106,6 +5136,33 @@ def ensure_ring_orientation(coords, clockwise=False):
         return list(reversed(coords))
     return coords
 
+def simplify_ring_by_distance(coords, min_distance):
+    if len(coords) < 4 or min_distance <= 0:
+        return coords
+
+    is_closed = coords[0] == coords[-1]
+    work_coords = coords[:-1] if is_closed else list(coords)
+    if len(work_coords) < 3:
+        return coords
+
+    simplified = [work_coords[0]]
+    min_distance_sq = min_distance * min_distance
+    for point in work_coords[1:-1]:
+        prev = simplified[-1]
+        dx = point[0] - prev[0]
+        dy = point[1] - prev[1]
+        dz = point[2] - prev[2]
+        if (dx * dx + dy * dy + dz * dz) >= min_distance_sq:
+            simplified.append(point)
+    simplified.append(work_coords[-1])
+
+    if len(simplified) < 3:
+        return coords
+
+    if is_closed:
+        simplified.append(simplified[0])
+    return simplified
+
 def build_osm_nodes(data):
     nodes = {}
     for element in data['elements']:
@@ -5158,8 +5215,15 @@ def coloring_main(map,kind = "WATER"):
     seen_relation_ids = set()
     seen_way_ids = set()
     aggregate_relation_stats = {}
+    relation_processed = 0
+    relation_skipped_vertex_cap = 0
+    relation_skipped_small = 0
     total_elements_processed = 0
     max_total_elements = int(getattr(bpy.context.scene.tp3d, "osm_max_total_elements", 250000))
+    min_poly_area = float(getattr(bpy.context.scene.tp3d, "col_min_poly_area", 0.05))
+    ring_decimate_distance = float(getattr(bpy.context.scene.tp3d, "col_ring_decimate_distance", 0.02))
+    max_ring_vertices = int(getattr(bpy.context.scene.tp3d, "col_max_ring_vertices", 2500))
+    relation_log_interval = max(1, int(getattr(bpy.context.scene.tp3d, "col_relation_log_interval", 25)))
     stop_due_to_element_limit = False
 
     #print(f"lats: {lats}, lons: {lons}")
@@ -5229,6 +5293,13 @@ def coloring_main(map,kind = "WATER"):
                 if relation_id in seen_relation_ids:
                     continue
                 seen_relation_ids.add(relation_id)
+                relation_processed += 1
+
+                if relation_processed % relation_log_interval == 0:
+                    tp3d_log(
+                        f"Relation progress ({kind}): processed={relation_processed}, created={waterCreated}, "
+                        f"ignored={waterDeleted}, skipped_small={relation_skipped_small}, skipped_vertex_cap={relation_skipped_vertex_cap}"
+                    )
 
                 outer = body.get("outer", [])
                 inners = body.get("inners", [])
@@ -5242,13 +5313,26 @@ def coloring_main(map,kind = "WATER"):
                     }
 
                 outer_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in outer]
+                outer_blender = simplify_ring_by_distance(outer_blender, ring_decimate_distance)
+                if len(outer_blender) > max_ring_vertices:
+                    relation_skipped_vertex_cap += 1
+                    tp3d_log(
+                        f"Skipping outer ring relation={relation_id} idx={i}: vertices={len(outer_blender)} cap={max_ring_vertices}"
+                    )
+                    waterDeleted += 1
+                    continue
+                if len(outer_blender) < 3:
+                    relation_skipped_small += 1
+                    waterDeleted += 1
+                    continue
                 outer_blender = ensure_ring_orientation(outer_blender, clockwise=False)
                 area_before = calculate_polygon_area_2d(outer_blender)
                 aggregate_relation_stats[relation_id]["outers"] += 1
                 aggregate_relation_stats[relation_id]["inners"] += len(inners)
                 aggregate_relation_stats[relation_id]["area_before"] += area_before
 
-                if area_before <= col_Area:
+                if area_before <= col_Area or area_before <= min_poly_area:
+                    relation_skipped_small += 1
                     waterDeleted += 1
                     continue
 
@@ -5260,12 +5344,24 @@ def coloring_main(map,kind = "WATER"):
                 hole_area_total = 0.0
                 for h_idx, inner in enumerate(inners):
                     inner_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in inner]
+                    inner_blender = simplify_ring_by_distance(inner_blender, ring_decimate_distance)
+                    if len(inner_blender) > max_ring_vertices:
+                        relation_skipped_vertex_cap += 1
+                        tp3d_log(
+                            f"Skipping inner ring relation={relation_id} outer={i} hole={h_idx}: "
+                            f"vertices={len(inner_blender)} cap={max_ring_vertices}"
+                        )
+                        continue
+                    if len(inner_blender) < 3:
+                        relation_skipped_small += 1
+                        continue
                     inner_blender = ensure_ring_orientation(inner_blender, clockwise=True)
                     inner_area = calculate_polygon_area_2d(inner_blender)
-                    hole_area_total += inner_area
 
-                    if inner_area <= 0:
+                    if inner_area <= min_poly_area:
+                        relation_skipped_small += 1
                         continue
+                    hole_area_total += inner_area
                     inner_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_inner_{h_idx}", inner_blender)
                     if inner_obj is None:
                         continue
@@ -5341,6 +5437,10 @@ def coloring_main(map,kind = "WATER"):
             f"Relation {relation_id}: outers={stats['outers']} inners={stats['inners']} "
             f"area_before={stats['area_before']:.3f} area_after={stats['area_after']:.3f}"
         )
+    tp3d_log(
+        f"Relation summary ({kind}): processed={relation_processed}, "
+        f"skipped_small={relation_skipped_small}, skipped_vertex_cap={relation_skipped_vertex_cap}"
+    )
             
     # --- Merge all created water meshes into one ---
 
