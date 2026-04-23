@@ -156,8 +156,10 @@ def tp3d_log(message, force=False):
                     export_dir = bpy.path.abspath(export_path_value)
                     os.makedirs(export_dir, exist_ok=True)
                     log_path = os.path.join(export_dir, "trailprint3d.log")
-                    with open(log_path, "a", encoding="utf-8") as logfile:
+                    with open(log_path, "a", encoding="utf-8", buffering=1) as logfile:
                         logfile.write(log_line + "\n")
+                        logfile.flush()
+                        os.fsync(logfile.fileno())
                 except Exception:
                     pass
 
