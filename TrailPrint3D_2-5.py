@@ -17,17 +17,21 @@
 #Map data © OpenStreetMap contributors
 
 '''
-Version 2.5
-- Added Icons to Buttons
-- Added Preset Feature
-- Bugfixes:
-    xTerrain/yTerrain Offset not working correctly with Text based Shapes
-    Shape Rotation not working correctly with Text based Shapes
-    Magnetholes/Dovetails not working correctly with Text based Shapes
-    Magnetholes/Dovetails not working correctly with Rotated Shapes
+TrailPrint3D update notes by @gigamosh57
+Original addon by EmGi
 
-
-
+Version 2.52
+- OSM updates:
+    Improved OpenStreetMap feature handling for map overlays and boundaries
+    Refined OSM data processing for more reliable terrain decoration output
+- Logging updates:
+    Added and improved detailed logging support for easier debugging and issue tracking
+    Logging output can now be written to a trailprint3d.log file in the export folder
+- Scaling updates:
+    Improved map and path scaling behavior for more consistent print sizing
+    Added scaling refinements for horizontal and elevation workflows
+- Lake updates:
+    Improved lake and water area handling to better represent water features on generated maps
 '''
 
 bl_info = {
@@ -35,7 +39,7 @@ bl_info = {
     "blender": (4, 5, 2),
     "category": "Object",
     "author": "EmGi",
-    "version": (2,51),
+    "version": (2,52),
     "description": "Create 3D Printable Miniature Maps of your Adventures",
     "warning": "",
     "doc_url": "",
@@ -44,7 +48,7 @@ bl_info = {
 }
 
 category = "TrailPrint3D"
-AddonVersion = (2, 51)
+AddonVersion = (2, 52)
 
 
 import bpy # type: ignore
