@@ -20,10 +20,13 @@
 TrailPrint3D update notes by @gigamosh57
 Original addon by EmGi
 
-Version 2.52
+Version 2.53
 - OSM updates:
     Improved OpenStreetMap feature handling for map overlays and boundaries
     Refined OSM data processing for more reliable terrain decoration output
+    Switched OSM fetching to always use smaller tile bboxes (including small map regions)
+    Added cross-tile relation/way deduplication and incremental tile processing
+    Added a configurable OSM element-count safeguard to stop runaway large-area requests
 - Logging updates:
     Added and improved detailed logging support for easier debugging and issue tracking
     Logging output can now be written to a trailprint3d.log file in the export folder
@@ -39,7 +42,7 @@ bl_info = {
     "blender": (4, 5, 2),
     "category": "Object",
     "author": "EmGi",
-    "version": (2,52),
+    "version": (2,53),
     "description": "Create 3D Printable Miniature Maps of your Adventures",
     "warning": "",
     "doc_url": "",
@@ -48,7 +51,7 @@ bl_info = {
 }
 
 category = "TrailPrint3D"
-AddonVersion = (2, 52)
+AddonVersion = (2, 53)
 
 
 import bpy # type: ignore
@@ -5152,164 +5155,192 @@ def coloring_main(map,kind = "WATER"):
     lons = math.ceil((maxLon - minLon) / lon_step)
 
     created_objects = []
+    seen_relation_ids = set()
+    seen_way_ids = set()
+    aggregate_relation_stats = {}
+    total_elements_processed = 0
+    max_total_elements = int(getattr(bpy.context.scene.tp3d, "osm_max_total_elements", 250000))
+    stop_due_to_element_limit = False
 
     #print(f"lats: {lats}, lons: {lons}")
-    if lats * lons < 20:
-        for k in range(lats):
-            for l in range(lons):
-                print(f"loop: {((k) * lons + l + 1)}/{lats * lons}")
-                south = minLat + k * lat_step
-                north = south + lat_step
-                west = minLon + l * lon_step
-                east = west + lon_step
+    for k in range(lats):
+        if stop_due_to_element_limit:
+            break
+        for l in range(lons):
+            print(f"loop: {((k) * lons + l + 1)}/{lats * lons}")
+            south = minLat + k * lat_step
+            north = min(south + lat_step, maxLat)
+            west = minLon + l * lon_step
+            east = min(west + lon_step, maxLon)
 
-                bbox = (south, west, north, east)
-                data = []
-                #data = fetch_osm_data(bbox, kind)
-                try:
-                    resp = fetch_osm_data(bbox, kind)
-                except Exception as e:
-                    tp3d_log(f"Unexpected OSM fetch error for kind={kind} bbox={bbox}: {e}")
-                    tp3d_log(traceback.format_exc())
-                    show_message_box(f"Something went wrong while fetching OSM data for {kind}. Enable detailed logging and check console.")
+            bbox = (south, west, north, east)
+            data = []
+            #data = fetch_osm_data(bbox, kind)
+            try:
+                resp = fetch_osm_data(bbox, kind)
+            except Exception as e:
+                tp3d_log(f"Unexpected OSM fetch error for kind={kind} bbox={bbox}: {e}")
+                tp3d_log(traceback.format_exc())
+                show_message_box(f"Something went wrong while fetching OSM data for {kind}. Enable detailed logging and check console.")
+                continue
+
+            if resp.get("status") != "ok":
+                tp3d_log(
+                    f"OSM fetch failed for kind={kind} bbox={bbox}. "
+                    f"status={resp.get('status')} reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} "
+                    f"http_status={resp.get('http_status')} request_id={resp.get('request_id')} error={resp.get('error_text')}"
+                )
+                show_message_box(
+                    f"OSM fetch failed for {kind}. "
+                    f"Reason: {resp.get('reason_code')} request_id={resp.get('request_id')} (see logs for endpoint/error details)."
+                )
+                continue
+
+            data = resp.get("response_json_or_none")
+            if data is None:
+                tp3d_log(
+                    f"OSM fetch result had no JSON payload for kind={kind} bbox={bbox}. "
+                    f"reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} request_id={resp.get('request_id')}"
+                )
+                show_message_box(f"OSM returned empty JSON payload for {kind}. Enable detailed logging for details.")
+                continue
+
+            tile_elements = len(data.get('elements', []))
+            total_elements_processed += tile_elements
+            if max_total_elements > 0 and total_elements_processed > max_total_elements:
+                stop_due_to_element_limit = True
+                tp3d_log(
+                    f"OSM element threshold exceeded for {kind}: total_elements={total_elements_processed} "
+                    f"limit={max_total_elements}. Stopping remaining tile processing."
+                )
+                show_message_box(
+                    f"Stopped OSM processing for {kind}: element limit exceeded "
+                    f"({total_elements_processed}/{max_total_elements})."
+                )
+                break
+
+            nodes = build_osm_nodes(data)
+            bodies = extract_multipolygon_bodies(data['elements'], nodes)
+            tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={tile_elements}, nodes={len(nodes)}, multipolygons={len(bodies)}")
+            #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
+
+            for i, body in enumerate(bodies):
+                relation_id = body.get("relation_id", "unknown")
+                if relation_id in seen_relation_ids:
+                    continue
+                seen_relation_ids.add(relation_id)
+
+                outer = body.get("outer", [])
+                inners = body.get("inners", [])
+
+                if relation_id not in aggregate_relation_stats:
+                    aggregate_relation_stats[relation_id] = {
+                        "outers": 0,
+                        "inners": 0,
+                        "area_before": 0.0,
+                        "area_after": 0.0
+                    }
+
+                outer_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in outer]
+                outer_blender = ensure_ring_orientation(outer_blender, clockwise=False)
+                area_before = calculate_polygon_area_2d(outer_blender)
+                aggregate_relation_stats[relation_id]["outers"] += 1
+                aggregate_relation_stats[relation_id]["inners"] += len(inners)
+                aggregate_relation_stats[relation_id]["area_before"] += area_before
+
+                if area_before <= col_Area:
+                    waterDeleted += 1
                     continue
 
-                if resp.get("status") != "ok":
-                    tp3d_log(
-                        f"OSM fetch failed for kind={kind} bbox={bbox}. "
-                        f"status={resp.get('status')} reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} "
-                        f"http_status={resp.get('http_status')} request_id={resp.get('request_id')} error={resp.get('error_text')}"
-                    )
-                    show_message_box(
-                        f"OSM fetch failed for {kind}. "
-                        f"Reason: {resp.get('reason_code')} request_id={resp.get('request_id')} (see logs for endpoint/error details)."
-                    )
+                outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_outer", outer_blender)
+                if outer_obj is None:
+                    waterDeleted += 1
                     continue
 
-                data = resp.get("response_json_or_none")
-                if data is None:
-                    tp3d_log(
-                        f"OSM fetch result had no JSON payload for kind={kind} bbox={bbox}. "
-                        f"reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} request_id={resp.get('request_id')}"
-                    )
-                    show_message_box(f"OSM returned empty JSON payload for {kind}. Enable detailed logging for details.")
-                    continue
-                nodes = build_osm_nodes(data)
-                bodies = extract_multipolygon_bodies(data['elements'], nodes)
-                tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={len(data.get('elements', []))}, nodes={len(nodes)}, multipolygons={len(bodies)}")
-                #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
+                hole_area_total = 0.0
+                for h_idx, inner in enumerate(inners):
+                    inner_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in inner]
+                    inner_blender = ensure_ring_orientation(inner_blender, clockwise=True)
+                    inner_area = calculate_polygon_area_2d(inner_blender)
+                    hole_area_total += inner_area
 
-                relation_stats = {}
-                for i, body in enumerate(bodies):
-                    relation_id = body.get("relation_id", "unknown")
-                    outer = body.get("outer", [])
-                    inners = body.get("inners", [])
-
-                    if relation_id not in relation_stats:
-                        relation_stats[relation_id] = {
-                            "outers": 0,
-                            "inners": 0,
-                            "area_before": 0.0,
-                            "area_after": 0.0
-                        }
-
-                    outer_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in outer]
-                    outer_blender = ensure_ring_orientation(outer_blender, clockwise=False)
-                    area_before = calculate_polygon_area_2d(outer_blender)
-                    relation_stats[relation_id]["outers"] += 1
-                    relation_stats[relation_id]["inners"] += len(inners)
-                    relation_stats[relation_id]["area_before"] += area_before
-
-                    if area_before <= col_Area:
-                        waterDeleted += 1
+                    if inner_area <= 0:
+                        continue
+                    inner_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_inner_{h_idx}", inner_blender)
+                    if inner_obj is None:
                         continue
 
-                    outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_outer", outer_blender)
-                    if outer_obj is None:
-                        waterDeleted += 1
-                        continue
+                    bool_mod = outer_obj.modifiers.new(
+                        name=f"HoleDiff_{relation_id}_{i}_{h_idx}",
+                        type='BOOLEAN'
+                    )
+                    bool_mod.operation = 'DIFFERENCE'
+                    bool_mod.solver = 'EXACT'
+                    bool_mod.object = inner_obj
+                    bpy.context.view_layer.objects.active = outer_obj
+                    try:
+                        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+                    except Exception as e:
+                        tp3d_log(f"Boolean apply failed for relation={relation_id} outer={i} hole={h_idx}: {e}")
 
-                    hole_area_total = 0.0
-                    for h_idx, inner in enumerate(inners):
-                        inner_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in inner]
-                        inner_blender = ensure_ring_orientation(inner_blender, clockwise=True)
-                        inner_area = calculate_polygon_area_2d(inner_blender)
-                        hole_area_total += inner_area
+                    mesh_data = inner_obj.data
+                    bpy.data.objects.remove(inner_obj, do_unlink=True)
+                    bpy.data.meshes.remove(mesh_data)
 
-                        if inner_area <= 0:
-                            continue
-                        inner_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_inner_{h_idx}", inner_blender)
-                        if inner_obj is None:
-                            continue
+                area_after = max(area_before - hole_area_total, 0.0)
+                aggregate_relation_stats[relation_id]["area_after"] += area_after
 
-                        bool_mod = outer_obj.modifiers.new(
-                            name=f"HoleDiff_{relation_id}_{i}_{h_idx}",
-                            type='BOOLEAN'
+                if area_after > col_Area:
+                    created_objects.append(outer_obj)
+                    waterCreated += 1
+                else:
+                    mesh_data = outer_obj.data
+                    bpy.data.objects.remove(outer_obj, do_unlink=True)
+                    bpy.data.meshes.remove(mesh_data)
+                    waterDeleted += 1
+
+            for i, element in enumerate(data['elements']):
+                #print(i)
+                if element['type'] != 'way':
+                    waterDeleted += 1
+                    continue
+
+                way_id = element.get('id')
+                if way_id in seen_way_ids:
+                    continue
+                seen_way_ids.add(way_id)
+
+                coords = []
+                for node_id in element.get('nodes', []):
+                    if node_id in nodes:
+                        node = nodes[node_id]
+                        coord = convert_to_blender_coordinates(
+                            node['lat'], node['lon'], 0,0
                         )
-                        bool_mod.operation = 'DIFFERENCE'
-                        bool_mod.solver = 'EXACT'
-                        bool_mod.object = inner_obj
-                        bpy.context.view_layer.objects.active = outer_obj
-                        try:
-                            bpy.ops.object.modifier_apply(modifier=bool_mod.name)
-                        except Exception as e:
-                            tp3d_log(f"Boolean apply failed for relation={relation_id} outer={i} hole={h_idx}: {e}")
+                        coords.append(coord)
+                tArea = calculate_polygon_area_2d(coords)
+                #print(f"tArea2: {tArea}")
+                if len(coords) < 2 or tArea < col_Area:
+                    waterDeleted += 1
+                    continue
+                
+                tags = element.get("tags", {})
+                if coords[0] == coords[-1]:
+                    tobj = col_create_face_mesh(f"coloredObject_{i}", coords)
+                    created_objects.append(tobj)
+                    waterCreated += 1
+                else:
+                    tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
+                    created_objects.append(tobj)
+                    waterCreated += 1
+                
+            time.sleep(5)  # Pause to prevent request throttling
 
-                        mesh_data = inner_obj.data
-                        bpy.data.objects.remove(inner_obj, do_unlink=True)
-                        bpy.data.meshes.remove(mesh_data)
-
-                    area_after = max(area_before - hole_area_total, 0.0)
-                    relation_stats[relation_id]["area_after"] += area_after
-
-                    if area_after > col_Area:
-                        created_objects.append(outer_obj)
-                        waterCreated += 1
-                    else:
-                        mesh_data = outer_obj.data
-                        bpy.data.objects.remove(outer_obj, do_unlink=True)
-                        bpy.data.meshes.remove(mesh_data)
-                        waterDeleted += 1
-
-                for relation_id, stats in relation_stats.items():
-                    tp3d_log(
-                        f"Relation {relation_id}: outers={stats['outers']} inners={stats['inners']} "
-                        f"area_before={stats['area_before']:.3f} area_after={stats['area_after']:.3f}"
-                    )
-
-                for i, element in enumerate(data['elements']):
-                    #print(i)
-                    if element['type'] != 'way':
-                        waterDeleted += 1
-                        continue
-
-                    coords = []
-                    for node_id in element.get('nodes', []):
-                        if node_id in nodes:
-                            node = nodes[node_id]
-                            coord = convert_to_blender_coordinates(
-                                node['lat'], node['lon'], 0,0
-                            )
-                            coords.append(coord)
-                    tArea = calculate_polygon_area_2d(coords)
-                    #print(f"tArea2: {tArea}")
-                    if len(coords) < 2 or tArea < col_Area:
-                        waterDeleted += 1
-                        continue
-                    
-                    tags = element.get("tags", {})
-                    if coords[0] == coords[-1]:
-                        tobj = col_create_face_mesh(f"coloredObject_{i}", coords)
-                        created_objects.append(tobj)
-                        waterCreated += 1
-                    else:
-                        tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
-                        created_objects.append(tobj)
-                        waterCreated += 1
-                    
-                time.sleep(5)  # Pause to prevent request throttling
-    else:
-        print("Region too big. Cant Fetch All Water Sources")
+    for relation_id, stats in aggregate_relation_stats.items():
+        tp3d_log(
+            f"Relation {relation_id}: outers={stats['outers']} inners={stats['inners']} "
+            f"area_before={stats['area_before']:.3f} area_after={stats['area_after']:.3f}"
+        )
             
     # --- Merge all created water meshes into one ---
 
