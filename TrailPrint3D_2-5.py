@@ -77,6 +77,8 @@ num_subdivisions = 4
 scaleElevation = 5
 pathThickness = 1.2
 pathScale = 0.8
+mapScaleMultiplier = 1.0
+exactGpxExtents = False
 shapeRotation = 0
 overwritePathElevation = False
 autoScale = 1
@@ -283,6 +285,8 @@ class MyProperties(bpy.types.PropertyGroup):
         default='FACTOR'
     )# type: ignore
     pathScale: bpy.props.FloatProperty(name = "Path Scale", default = 0.8, min = 0.01, max = 200, description = "Scale of Path in Relation to the Mapsize/GlobalScale (depending on scalemode)")
+    mapScaleMultiplier: bpy.props.FloatProperty(name = "Map Scale Multiplier", default = 1.0, min = 0.01, max = 100, description = "Scale the overall map relative to the GPX extents. Higher values show a larger map area around the GPX.")
+    exactGpxExtents: bpy.props.BoolProperty(name="Use exact GPX extents", default=False, description = "Force the map boundary to match the exact GPX bounding box (no additional margin from Path Scale)")
     scaleLon1: bpy.props.FloatProperty(name = "Lon1", default = 0, description = "The Longitude of the first coordinate")
     scaleLat1: bpy.props.FloatProperty(name = "Lat1", default = 0, description = "The Latitude of the first coordinate")
     scaleLon2: bpy.props.FloatProperty(name = "Lon2", default = 0, description = "The Longitude of the second coordinate")
@@ -1340,6 +1344,8 @@ class MY_PT_Generate(bpy.types.Panel):
         box.prop(props, "scaleElevation")
         box.prop(props, "pathThickness")
         box.prop(props, "scalemode")
+        box.prop(props, "mapScaleMultiplier")
+        box.prop(props, "exactGpxExtents")
         if props.scalemode == "FACTOR":
             box.prop(props, "pathScale")
         elif props.scalemode == "COORDINATES":
@@ -2655,12 +2661,18 @@ def calculate_scale(mapSize, coordinates, tp):
         print("scalemode1")
         scale = mapSize / maxer
     elif scalemode == "FACTOR":
-        scale = (mapSize * pathScale) / maxer
+        effective_path_scale = pathScale
+        if exactGpxExtents and tp != 2 and tp != 3:
+            effective_path_scale = 1
+        scale = (mapSize * effective_path_scale) / maxer
         print(scale)
         print("scalemode2")
     elif scalemode == "SCALE":
         scale = pathScale * mf
         print("scalemode3")
+
+    if mapScaleMultiplier > 0:
+        scale = scale / mapScaleMultiplier
 
     return scale
 
@@ -5832,6 +5844,10 @@ def runGeneration(type):
     scalemode = bpy.context.scene.tp3d.scalemode
     global pathScale
     pathScale = bpy.context.scene.tp3d.get('pathScale', 0.8)
+    global mapScaleMultiplier
+    mapScaleMultiplier = bpy.context.scene.tp3d.get('mapScaleMultiplier', 1.0)
+    global exactGpxExtents
+    exactGpxExtents = bpy.context.scene.tp3d.get('exactGpxExtents', False)
     global scaleLon1
     scaleLon1 = bpy.context.scene.tp3d.get('scaleLon1', 0)
     global scaleLat1
