@@ -152,3 +152,10 @@ UPDATELOG
 13.09.2025 Version 2.2
 
 03.12.2025 Version 2.5
+
+23.04.2026 Version 2.52
+Updated by @gigamosh57 (original addon by EmGi)
+- OSM updates: improved OpenStreetMap feature and boundary handling for cleaner generated overlays
+- Logging updates: improved detailed logging and log-file writing support for easier troubleshooting
+- Scaling updates: refined map/path scaling behavior for more consistent sizing and elevation workflows
+- Lake updates: improved water/lake area handling for better map water representation
