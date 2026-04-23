@@ -70,6 +70,7 @@ import zlib
 import struct
 import csv
 import traceback
+from functools import wraps
 
 
 gpx_file_path = ""
@@ -162,6 +163,34 @@ def tp3d_log(message, force=False):
                         os.fsync(logfile.fileno())
                 except Exception:
                     pass
+
+
+def tp3d_logged_function(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not tp3d_debug_logging_enabled():
+            return func(*args, **kwargs)
+
+        start_time = time.perf_counter()
+        arg_count = len(args)
+        kwarg_keys = sorted(kwargs.keys())
+        tp3d_log(
+            f"Function start name={func.__name__} args={arg_count} kwargs={kwarg_keys}."
+        )
+
+        try:
+            result = func(*args, **kwargs)
+            elapsed = time.perf_counter() - start_time
+            tp3d_log(f"Function end name={func.__name__} status=ok elapsed={elapsed:.2f}s.")
+            return result
+        except Exception as exc:
+            elapsed = time.perf_counter() - start_time
+            tp3d_log(
+                f"Function end name={func.__name__} status=error elapsed={elapsed:.2f}s error={exc}."
+            )
+            raise
+
+    return wrapper
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -374,7 +403,7 @@ class MyProperties(bpy.types.PropertyGroup):
     enableDetailedLogging: bpy.props.BoolProperty(
         name="Enable Detailed Logging",
         default=False,
-        description="Write detailed OSM request and parsing logs to trailprint3d.log in your Export Path folder"
+        description="Write detailed OSM and function execution logs to trailprint3d.log in your Export Path folder"
     )
 
     mountain_treshold:bpy.props.IntProperty(name="Mountain Treshold", default = 60, min = 0, max = 100,subtype='PERCENTAGE', description="Height Treshold to Color Mountians")
@@ -2152,6 +2181,7 @@ def read_igc(filepath):
     return segmentlist
 
 
+@tp3d_logged_function
 def read_gpx_directory(directory_path):
     """Reads all GPX files in a directory and extracts coordinates, elevation, and timestamps."""
     
@@ -2208,6 +2238,7 @@ def read_gpx_directory(directory_path):
     
     return coordinatesSeparate
 
+@tp3d_logged_function
 def read_gpx_file():
 
     gpx_file_path = bpy.context.scene.tp3d.get('file_path', None)
@@ -2865,6 +2896,7 @@ def get_elevation_single(lat, lon):
     return elevation  # Scale down elevation to match Blender terrain
 
 
+@tp3d_logged_function
 def get_elevation_openTopoData(coords, lenv = 0, pointsDone = 0):
     """Fetches real elevation for each vertex using OpenTopoData with request batching."""
 
@@ -2937,6 +2969,7 @@ def get_elevation_openTopoData(coords, lenv = 0, pointsDone = 0):
 
     return elevations
 
+@tp3d_logged_function
 def get_elevation_openElevation(coords, lenv = 0, pointsDone = 0):
     """Fetches real elevation for each vertex using Open-Elevation with request batching."""
     
@@ -3087,6 +3120,7 @@ def terrarium_pixel_to_elevation(r, g, b):
     """Convert Terrarium RGB pixel to elevation in meters."""
     return (r * 256 + g + b / 256) - 32768
 
+@tp3d_logged_function
 def get_elevation_TerrainTiles(coords, lenv=0, pointsDone=0, zoom=10):
 
     #Each Tile requested is a PNG that is 256x256 Pixels big
@@ -4585,6 +4619,7 @@ def single_color_mode(crv, mapName):
 
 # --- OSM FETCHING ---
 
+@tp3d_logged_function
 def fetch_osm_data(bbox, kind = "WATER"):
     south, west, north, east = bbox
     overpass_endpoints = [
@@ -5952,6 +5987,7 @@ def toggle_console():
     except Exception as e:
         print(f"Could not toggle console: {e}")
     
+@tp3d_logged_function
 def runGeneration(type):   
 
     #CHECK BLENDER VERSION
@@ -5963,6 +5999,7 @@ def runGeneration(type):
         return
     
     start_time = time.time()
+    tp3d_log(f"runGeneration pipeline started type={type}.")
 
     toggle_console()
     
@@ -6227,6 +6264,7 @@ def runGeneration(type):
         show_message_box(f"Something went Wrong reading the GPX. Type {type}")
         return
     coordinates = [item for sublist in separate_paths for item in sublist]
+    tp3d_log(f"runGeneration GPX load complete type={type} path_count={len(separate_paths)} point_count={len(coordinates)}.")
     #coordinates = separate_paths
 
     #print(f"separaite paits: {len(separate_paths)}")
@@ -6271,6 +6309,7 @@ def runGeneration(type):
 
             # Skip over the new point and the original next point
             i += 2
+    tp3d_log(f"runGeneration coordinate densify complete point_count={len(coordinates)}.")
     
 
     #CALCULATE biggest distance so you can calculate the value for the smoothing
@@ -6385,6 +6424,7 @@ def runGeneration(type):
     
 
     #fetch and apply the elevation
+    tp3d_log("runGeneration requesting terrain mesh elevation for map surface.")
     print("------------------------------------------------")
     print("FETCHING ELEVATION DATA FOR THE MAP")
     print("------------------------------------------------")
@@ -6392,6 +6432,7 @@ def runGeneration(type):
     global autoScale
     bpy.ops.object.transform_apply(location = False, rotation = True, scale = True)
     tileVerts, diff = get_tile_elevation(MapObject)
+    tp3d_log(f"runGeneration terrain mesh elevation complete vertex_count={len(tileVerts)} elevation_span_m={diff:.3f}.")
 
     if len(tileVerts) < 2000:
             show_message_box(f"Mesh has only {len(tileVerts)} Points. Add more Points to Increase Resolution (e.G Subdivision)", "INFO", "INFO")
@@ -6451,6 +6492,7 @@ def runGeneration(type):
 
     print("YES=")
     print(f"paths: {len(blender_coords_separate)}")
+    tp3d_log(f"runGeneration creating curve objects path_groups={len(blender_coords_separate)} type={type}.")
     #if 1 == 1:
     try:
         if (type == 0 and len(blender_coords_separate) <= 1) and type != 2 or type == 4:
@@ -6475,6 +6517,7 @@ def runGeneration(type):
     
     #APPLY TERRAIN ELEVATION
     mesh = MapObject.data
+    tp3d_log("runGeneration applying terrain elevations to map mesh.")
 
     global lowestZ
     global highestZ  
@@ -6613,12 +6656,16 @@ def runGeneration(type):
 
     #WATER MESH
     if col_wActive == 1:
+        tp3d_log("runGeneration coloring pass started kind=WATER.")
         objWater = coloring_main(obj, "WATER")
     if col_fActive == 1:
+        tp3d_log("runGeneration coloring pass started kind=FOREST.")
         objForest = coloring_main(obj, "FOREST")
     if col_cActive == 1:
+        tp3d_log("runGeneration coloring pass started kind=CITY.")
         objCity = coloring_main(obj, "CITY")
     if col_glActive == 1:
+        tp3d_log("runGeneration coloring pass started kind=GLACIER.")
         objGlacier = coloring_main(obj, "GLACIER")
 
 
@@ -6697,6 +6744,7 @@ def runGeneration(type):
     if buggyDataset != 0:
         show_message_box(f"API seems to have faulty Data. Try diffrent Resolution or API")
         
+    tp3d_log(f"runGeneration pipeline finished type={type} duration={duration:.2f}s.")
     print(f"Finished")
 
     toggle_console()
