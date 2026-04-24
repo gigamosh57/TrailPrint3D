@@ -35,6 +35,12 @@ Version 2.53
     Added scaling refinements for horizontal and elevation workflows
 - Lake updates:
     Improved lake and water area handling to better represent water features on generated maps
+
+Version 2.54
+- OSM updates:
+    Added adaptive OSM subtile processing for oversized responses
+    Replaced global OSM cutoff with per-tile element limits and configurable max subtile depth
+    Added OSM tiling summary diagnostics and clearer skip reporting for capped dense regions
 '''
 
 bl_info = {
@@ -42,7 +48,7 @@ bl_info = {
     "blender": (4, 5, 2),
     "category": "Object",
     "author": "EmGi",
-    "version": (2,53),
+    "version": (2,54),
     "description": "Create 3D Printable Miniature Maps of your Adventures",
     "warning": "",
     "doc_url": "",
@@ -51,7 +57,7 @@ bl_info = {
 }
 
 category = "TrailPrint3D"
-AddonVersion = (2, 53)
+AddonVersion = (2, 54)
 
 
 import bpy # type: ignore
@@ -74,6 +80,7 @@ import struct
 import csv
 import traceback
 from functools import wraps
+from collections import deque
 
 
 gpx_file_path = ""
@@ -424,6 +431,19 @@ class MyProperties(bpy.types.PropertyGroup):
         default=25,
         min=1,
         description="Emit progress logs every N processed relations"
+    )
+    osm_max_elements_per_tile: bpy.props.IntProperty(
+        name="OSM Max Elements/Tile",
+        default=250000,
+        min=0,
+        description="If a tile returns more elements than this, it gets subdivided recursively (0 disables)"
+    )
+    osm_subtile_max_depth: bpy.props.IntProperty(
+        name="OSM Subtile Max Depth",
+        default=3,
+        min=0,
+        max=8,
+        description="Maximum recursive subdivision depth for oversized OSM tiles"
     )
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
@@ -1566,6 +1586,8 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.prop(props, "col_ring_decimate_distance")
             box.prop(props, "col_max_ring_vertices")
             box.prop(props, "col_relation_log_interval")
+            box.prop(props, "osm_max_elements_per_tile")
+            box.prop(props, "osm_subtile_max_depth")
 
             #layout.prop(props, "col_KeepManifold")
             boxer.prop(props,"col_PaintMap")
@@ -5218,99 +5240,119 @@ def coloring_main(map,kind = "WATER"):
     relation_processed = 0
     relation_skipped_vertex_cap = 0
     relation_skipped_small = 0
-    total_elements_processed = 0
-    max_total_elements = int(getattr(bpy.context.scene.tp3d, "osm_max_total_elements", 250000))
+    max_elements_per_tile = int(getattr(bpy.context.scene.tp3d, "osm_max_elements_per_tile", 250000))
+    max_subtile_depth = int(getattr(bpy.context.scene.tp3d, "osm_subtile_max_depth", 3))
     min_poly_area = float(getattr(bpy.context.scene.tp3d, "col_min_poly_area", 0.05))
     ring_decimate_distance = float(getattr(bpy.context.scene.tp3d, "col_ring_decimate_distance", 0.02))
     max_ring_vertices = int(getattr(bpy.context.scene.tp3d, "col_max_ring_vertices", 2500))
     relation_log_interval = max(1, int(getattr(bpy.context.scene.tp3d, "col_relation_log_interval", 25)))
-    stop_due_to_element_limit = False
+    oversized_tiles_skipped = 0
+    subtile_splits = 0
 
-    #print(f"lats: {lats}, lons: {lons}")
+    tile_queue = deque()
     for k in range(lats):
-        if stop_due_to_element_limit:
-            break
         for l in range(lons):
-            print(f"loop: {((k) * lons + l + 1)}/{lats * lons}")
             south = minLat + k * lat_step
             north = min(south + lat_step, maxLat)
             west = minLon + l * lon_step
             east = min(west + lon_step, maxLon)
+            tile_queue.append(((south, west, north, east), 0))
 
-            bbox = (south, west, north, east)
-            data = []
-            #data = fetch_osm_data(bbox, kind)
-            try:
-                resp = fetch_osm_data(bbox, kind)
-            except Exception as e:
-                tp3d_log(f"Unexpected OSM fetch error for kind={kind} bbox={bbox}: {e}")
-                tp3d_log(traceback.format_exc())
-                show_message_box(f"Something went wrong while fetching OSM data for {kind}. Enable detailed logging and check console.")
+    processed_tiles = 0
+    while tile_queue:
+        bbox, depth = tile_queue.popleft()
+        processed_tiles += 1
+        print(f"loop: {processed_tiles} (queue={len(tile_queue)} depth={depth})")
+
+        data = []
+        #data = fetch_osm_data(bbox, kind)
+        try:
+            resp = fetch_osm_data(bbox, kind)
+        except Exception as e:
+            tp3d_log(f"Unexpected OSM fetch error for kind={kind} bbox={bbox}: {e}")
+            tp3d_log(traceback.format_exc())
+            show_message_box(f"Something went wrong while fetching OSM data for {kind}. Enable detailed logging and check console.")
+            continue
+
+        if resp.get("status") != "ok":
+            tp3d_log(
+                f"OSM fetch failed for kind={kind} bbox={bbox}. "
+                f"status={resp.get('status')} reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} "
+                f"http_status={resp.get('http_status')} request_id={resp.get('request_id')} error={resp.get('error_text')}"
+            )
+            show_message_box(
+                f"OSM fetch failed for {kind}. "
+                f"Reason: {resp.get('reason_code')} request_id={resp.get('request_id')} (see logs for endpoint/error details)."
+            )
+            continue
+
+        data = resp.get("response_json_or_none")
+        if data is None:
+            tp3d_log(
+                f"OSM fetch result had no JSON payload for kind={kind} bbox={bbox}. "
+                f"reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} request_id={resp.get('request_id')}"
+            )
+            show_message_box(f"OSM returned empty JSON payload for {kind}. Enable detailed logging for details.")
+            continue
+
+        tile_elements = len(data.get('elements', []))
+        if max_elements_per_tile > 0 and tile_elements > max_elements_per_tile:
+            south, west, north, east = bbox
+            lat_span = north - south
+            lon_span = east - west
+            if depth < max_subtile_depth and lat_span > 1e-6 and lon_span > 1e-6:
+                mid_lat = (south + north) * 0.5
+                mid_lon = (west + east) * 0.5
+                subtiles = [
+                    ((south, west, mid_lat, mid_lon), depth + 1),
+                    ((south, mid_lon, mid_lat, east), depth + 1),
+                    ((mid_lat, west, north, mid_lon), depth + 1),
+                    ((mid_lat, mid_lon, north, east), depth + 1),
+                ]
+                for subtile in reversed(subtiles):
+                    tile_queue.appendleft(subtile)
+                subtile_splits += 1
+                tp3d_log(
+                    f"OSM tile exceeded per-tile threshold for {kind}: bbox={bbox} elements={tile_elements} "
+                    f"limit={max_elements_per_tile}. Subdividing into 4 subtiles at depth={depth + 1}/{max_subtile_depth}."
+                )
                 continue
 
-            if resp.get("status") != "ok":
-                tp3d_log(
-                    f"OSM fetch failed for kind={kind} bbox={bbox}. "
-                    f"status={resp.get('status')} reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} "
-                    f"http_status={resp.get('http_status')} request_id={resp.get('request_id')} error={resp.get('error_text')}"
-                )
-                show_message_box(
-                    f"OSM fetch failed for {kind}. "
-                    f"Reason: {resp.get('reason_code')} request_id={resp.get('request_id')} (see logs for endpoint/error details)."
-                )
+            oversized_tiles_skipped += 1
+            tp3d_log(
+                f"OSM tile exceeded per-tile threshold for {kind}: bbox={bbox} elements={tile_elements} "
+                f"limit={max_elements_per_tile}. Max subtile depth reached ({depth}/{max_subtile_depth}); skipping tile."
+            )
+            continue
+
+        nodes = build_osm_nodes(data)
+        bodies = extract_multipolygon_bodies(data['elements'], nodes)
+        tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={tile_elements}, nodes={len(nodes)}, multipolygons={len(bodies)}")
+        #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
+
+        for i, body in enumerate(bodies):
+            relation_id = body.get("relation_id", "unknown")
+            if relation_id in seen_relation_ids:
                 continue
+            seen_relation_ids.add(relation_id)
+            relation_processed += 1
 
-            data = resp.get("response_json_or_none")
-            if data is None:
+            if relation_processed % relation_log_interval == 0:
                 tp3d_log(
-                    f"OSM fetch result had no JSON payload for kind={kind} bbox={bbox}. "
-                    f"reason={resp.get('reason_code')} endpoint={resp.get('endpoint')} request_id={resp.get('request_id')}"
+                    f"Relation progress ({kind}): processed={relation_processed}, created={waterCreated}, "
+                    f"ignored={waterDeleted}, skipped_small={relation_skipped_small}, skipped_vertex_cap={relation_skipped_vertex_cap}"
                 )
-                show_message_box(f"OSM returned empty JSON payload for {kind}. Enable detailed logging for details.")
-                continue
 
-            tile_elements = len(data.get('elements', []))
-            total_elements_processed += tile_elements
-            if max_total_elements > 0 and total_elements_processed > max_total_elements:
-                stop_due_to_element_limit = True
-                tp3d_log(
-                    f"OSM element threshold exceeded for {kind}: total_elements={total_elements_processed} "
-                    f"limit={max_total_elements}. Stopping remaining tile processing."
-                )
-                show_message_box(
-                    f"Stopped OSM processing for {kind}: element limit exceeded "
-                    f"({total_elements_processed}/{max_total_elements})."
-                )
-                break
+            outer = body.get("outer", [])
+            inners = body.get("inners", [])
 
-            nodes = build_osm_nodes(data)
-            bodies = extract_multipolygon_bodies(data['elements'], nodes)
-            tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={tile_elements}, nodes={len(nodes)}, multipolygons={len(bodies)}")
-            #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
-
-            for i, body in enumerate(bodies):
-                relation_id = body.get("relation_id", "unknown")
-                if relation_id in seen_relation_ids:
-                    continue
-                seen_relation_ids.add(relation_id)
-                relation_processed += 1
-
-                if relation_processed % relation_log_interval == 0:
-                    tp3d_log(
-                        f"Relation progress ({kind}): processed={relation_processed}, created={waterCreated}, "
-                        f"ignored={waterDeleted}, skipped_small={relation_skipped_small}, skipped_vertex_cap={relation_skipped_vertex_cap}"
-                    )
-
-                outer = body.get("outer", [])
-                inners = body.get("inners", [])
-
-                if relation_id not in aggregate_relation_stats:
-                    aggregate_relation_stats[relation_id] = {
-                        "outers": 0,
-                        "inners": 0,
-                        "area_before": 0.0,
-                        "area_after": 0.0
-                    }
+            if relation_id not in aggregate_relation_stats:
+                aggregate_relation_stats[relation_id] = {
+                    "outers": 0,
+                    "inners": 0,
+                    "area_before": 0.0,
+                    "area_after": 0.0
+                }
 
                 outer_blender = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in outer]
                 outer_blender = simplify_ring_by_distance(outer_blender, ring_decimate_distance)
@@ -5431,6 +5473,17 @@ def coloring_main(map,kind = "WATER"):
                     waterCreated += 1
                 
             time.sleep(5)  # Pause to prevent request throttling
+
+    tp3d_log(
+        f"OSM tiling summary ({kind}): processed_tiles={processed_tiles}, subtile_splits={subtile_splits}, "
+        f"oversized_tiles_skipped={oversized_tiles_skipped}, max_elements_per_tile={max_elements_per_tile}, "
+        f"max_subtile_depth={max_subtile_depth}"
+    )
+    if oversized_tiles_skipped > 0:
+        show_message_box(
+            f"Skipped {oversized_tiles_skipped} {kind} OSM tile(s) after adaptive subdivision "
+            f"(limit {max_elements_per_tile} elements/tile, depth {max_subtile_depth})."
+        )
 
     for relation_id, stats in aggregate_relation_stats.items():
         tp3d_log(
