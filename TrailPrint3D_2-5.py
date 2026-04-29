@@ -221,7 +221,7 @@ exportformat = "STL"
 
 def shape_callback(self,context):
     #print(f"Shape: {self.shape}")
-    if self.shape == "HEXAGON INNER TEXT" or self.shape == "HEXAGON OUTER TEXT" or self.shape =="OCTAGON OUTER TEXT" or self.shape == "HEXAGON FRONT TEXT":
+    if self.shape == "HEXAGON INNER TEXT" or self.shape == "HEXAGON OUTER TEXT" or self.shape =="OCTAGON OUTER TEXT" or self.shape == "HEXAGON FRONT TEXT" or self.shape == "CIRCLE OUTER TEXT":
         try:
             bpy.utils.register_class(MY_PT_Shapes)
         except:
@@ -290,7 +290,8 @@ class MyProperties(bpy.types.PropertyGroup):
             #("HEART", "Heart", "Heart Map"), #Premium
             ("HEXAGON INNER TEXT", "Hexagon inner text", "Hexagonal map with inserted Text"),
             ("HEXAGON OUTER TEXT", "Hexagon outer text", "Hexagonal map with backplate and text"),
-            ("HEXAGON FRONT TEXT", "Hexagon front text", "Hexagonal map with backplate and text on the front")
+            ("HEXAGON FRONT TEXT", "Hexagon front text", "Hexagonal map with backplate and text on the front"),
+            ("CIRCLE OUTER TEXT", "Circle outer text", "Circular map with backplate and text")
             #("OCTAGON OUTER TEXT", "Octagon outer text", "Octagon map with backplate and text") #Premium
         ],
         default = "HEXAGON",
@@ -372,6 +373,11 @@ class MyProperties(bpy.types.PropertyGroup):
     overwriteHeight: bpy.props.StringProperty(name="text2", default = "")
     overwriteTime: bpy.props.StringProperty(name="text3", default = "")
     outerBorderSize: bpy.props.IntProperty(name="BorderSize in %", default = 20, min = 0, max = 1000, description="Only for Shapes with Plate")
+    mirrorLowerCircleText: bpy.props.BoolProperty(
+        name="Mirror lower circle text",
+        default=False,
+        description="Rotate lower-half circle text to keep it readable from the outside",
+    )
     text_angle_preset: bpy.props.IntProperty(name="Text Angle", description="Rotate Text on Shape", default=0, min = 0, max = 260)
     plateThickness: bpy.props.FloatProperty(name="plateThickness", default = 5, description="Thickness of the Additional Plate")
     plateInsertValue: bpy.props.FloatProperty(name="plateInsertValue", default = 0, description="Depth of Cutout for the Map in the Plate, 0  to ignore")
@@ -1736,7 +1742,7 @@ class MY_PT_Shapes(bpy.types.Panel):
         props = context.scene.tp3d  # Get properties
         
         #print(f"shape: {props.shape}")
-        if props.shape == "HEXAGON INNER TEXT" or props.shape == "HEXAGON OUTER TEXT" or props.shape == "OCTAGON OUTER TEXT" or props.shape == "HEXAGON FRONT TEXT":
+        if props.shape == "HEXAGON INNER TEXT" or props.shape == "HEXAGON OUTER TEXT" or props.shape == "OCTAGON OUTER TEXT" or props.shape == "HEXAGON FRONT TEXT" or props.shape == "CIRCLE OUTER TEXT":
 
             #Add input fields
             layout.prop(props, "textFont")
@@ -1749,6 +1755,8 @@ class MY_PT_Shapes(bpy.types.Panel):
             layout.prop(props, "overwriteTime")
             layout.prop(props, "plateThickness")
             layout.prop(props, "outerBorderSize")
+            if props.shape == "CIRCLE OUTER TEXT":
+                layout.prop(props, "mirrorLowerCircleText")
             layout.prop(props, "plateInsertValue")
             layout.prop(props, "text_angle_preset")
 
@@ -2850,7 +2858,7 @@ def create_curve_from_coordinates(coordinates):
 
 
     # Convert to mesh
-    if shape == "HEXAGON INNER TEXT" or shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT":
+    if shape == "HEXAGON INNER TEXT" or shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT" or shape == "CIRCLE OUTER TEXT":
         #bpy.ops.object.convert(target='MESH')
         pass
 
@@ -2932,6 +2940,20 @@ def create_rectangle(width, height):
     obj.name = name
     obj.data.name = name
     
+    return obj
+
+def create_circle(radius):
+    """Creates a circular map base and subdivides it."""
+    num_subdivisions = bpy.context.scene.tp3d.num_subdivisions
+    bpy.ops.mesh.primitive_circle_add(vertices=96, radius=radius, fill_type='NGON', location=(0, 0, 0))
+    obj = bpy.context.active_object
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    for _ in range(num_subdivisions + 1):
+        bpy.ops.mesh.subdivide(number_cuts=1)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    obj.name = name
+    obj.data.name = name
     return obj
 
 
@@ -4152,6 +4174,117 @@ def HexagonFrontText():
 
     global plateobj
     plateobj = outerHex
+
+    global textobj
+    textobj = tName
+
+def CircleOuterText():
+    outersize = size * (1 + outerBorderSize / 100)
+    thickness = plateThickness
+    textSize = bpy.context.scene.tp3d.textSize
+    textSize2 = bpy.context.scene.tp3d.textSizeTitle
+    mirrorLowerText = bpy.context.scene.tp3d.mirrorLowerCircleText
+
+    if textSize2 == 0:
+        textSize2 = textSize
+
+    bpy.ops.mesh.primitive_cylinder_add(vertices=96, radius=outersize / 2, depth=thickness, location=(0, 0, -thickness / 2))
+    outerCircle = bpy.context.active_object
+    outerCircle.name = name
+    outerCircle.data.name = name
+
+    transform_MapObject(outerCircle, centerx, centery)
+
+    text_radius = (size / 2) + ((outersize - size) / 2)
+    text_slots = [
+        ("t_name", 90 + text_angle_preset, True),
+        ("t_length", 210 + text_angle_preset, False),
+        ("t_elevation", 270 + text_angle_preset, False),
+        ("t_duration", 330 + text_angle_preset, False),
+    ]
+
+    for text_name, angle, is_title in text_slots:
+        angle_centered = angle + 90
+        x = math.cos(math.radians(angle)) * text_radius
+        y = math.sin(math.radians(angle)) * text_radius
+        rot_z = math.radians(angle_centered)
+        if is_title:
+            rot_z += math.radians(180)
+        elif mirrorLowerText and (180 <= (angle % 360) <= 360):
+            rot_z += math.radians(180)
+        create_text(text_name, text_name.split("_")[1].capitalize(), (x, y, 1.4), 1, (0, 0, rot_z), 0.4)
+
+    tName = bpy.data.objects.get("t_name")
+    tElevation = bpy.data.objects.get("t_elevation")
+    tLength = bpy.data.objects.get("t_length")
+    tDuration = bpy.data.objects.get("t_duration")
+
+    transform_MapObject(tName, centerx, centery)
+    transform_MapObject(tElevation, centerx, centery)
+    transform_MapObject(tLength, centerx, centery)
+    transform_MapObject(tDuration, centerx, centery)
+
+    update_text_object("t_name", f"{name}")
+    update_text_object("t_elevation", f"{total_elevation:.2f} hm")
+    update_text_object("t_length", f"{total_length:.2f} km")
+    update_text_object("t_duration", f"{time_str}")
+
+    if overwriteLength != "":
+        update_text_object("t_length", overwriteLength)
+    if overwriteHeight != "":
+        update_text_object("t_elevation", overwriteHeight)
+    if overwriteTime != "":
+        update_text_object("t_duration", overwriteTime)
+
+    bpy.context.view_layer.update()
+    current_height = tName.dimensions.y
+    if current_height == 0:
+        current_height = tElevation.dimensions.y
+    if current_height == 0:
+        current_height = tLength.dimensions.y
+    if current_height == 0:
+        current_height = 5
+
+    scale_factor = textSize2 / current_height
+    tName.scale.x *= scale_factor
+    tName.scale.y *= scale_factor
+
+    scale_factor = textSize / current_height
+    tElevation.scale.x *= scale_factor
+    tLength.scale.x *= scale_factor
+    tDuration.scale.x *= scale_factor
+    tElevation.scale.y *= scale_factor
+    tLength.scale.y *= scale_factor
+    tDuration.scale.y *= scale_factor
+
+    convert_text_to_mesh("t_name", outerCircle.name, False)
+    convert_text_to_mesh("t_elevation", outerCircle.name, False)
+    convert_text_to_mesh("t_length", outerCircle.name, False)
+    convert_text_to_mesh("t_duration", outerCircle.name, False)
+
+    bpy.ops.object.select_all(action='DESELECT')
+    tName.select_set(True)
+    tElevation.select_set(True)
+    tLength.select_set(True)
+    tDuration.select_set(True)
+    bpy.context.view_layer.objects.active = tName
+    bpy.ops.object.join()
+    bpy.ops.object.origin_set(type='ORIGIN_CURSOR', center='MEDIAN')
+
+    tName.name = name + "_Text"
+    outerCircle.name = name + "_Plate"
+
+    tName.location.z += plateThickness
+    outerCircle.location.z += plateThickness
+
+    outerCircle.rotation_euler[2] += shapeRotation * (3.14159265 / 180)
+    outerCircle.select_set(True)
+    bpy.context.view_layer.objects.active = outerCircle
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+    bpy.ops.object.origin_set(type='ORIGIN_CURSOR', center='MEDIAN')
+
+    global plateobj
+    plateobj = outerCircle
 
     global textobj
     textobj = tName
@@ -6581,6 +6714,8 @@ def runGeneration(type):
         MapObject = create_hexagon(size/2)
     elif shape == "HEXAGON FRONT TEXT": #Hexagon with front text
         MapObject = create_hexagon(size/2)
+    elif shape == "CIRCLE OUTER TEXT": #Circle with outer text
+        MapObject = create_circle(size/2)
     else:
         MapObject = create_hexagon(size/2)
     
@@ -6796,6 +6931,10 @@ def runGeneration(type):
         HexagonFrontText()
         obj.location.z += plateThickness
         curveObj.location.z += plateThickness
+    if shape == "CIRCLE OUTER TEXT":
+        CircleOuterText()
+        obj.location.z += plateThickness
+        curveObj.location.z += plateThickness
     else:
         pass
         #BottomText()
@@ -6805,7 +6944,7 @@ def runGeneration(type):
     #PLATESHAPE INSERT
     bpy.ops.object.select_all(action='DESELECT')
     dist = bpy.context.scene.tp3d.plateInsertValue
-    if shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT":
+    if shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT" or shape == "CIRCLE OUTER TEXT":
         #plate = bpy.data.objects.get(name + "_Plate")
         #text = bpy.data.objects.get(name + "_Text")
         plate = plateobj
@@ -6883,7 +7022,7 @@ def runGeneration(type):
         export_to_STL(curveObj,exportformat)
     export_to_STL(obj, exportformat)
     
-    if shape == "HEXAGON INNER TEXT" or shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT":
+    if shape == "HEXAGON INNER TEXT" or shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT" or shape == "CIRCLE OUTER TEXT":
         tobj = textobj
         mat = bpy.data.materials.get("WHITE")
         if shape == "HEXAGON INNER TEXT":
@@ -6891,7 +7030,7 @@ def runGeneration(type):
         tobj.data.materials.clear()
         tobj.data.materials.append(mat)
         export_to_STL(tobj, exportformat)
-    if shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT":
+    if shape == "HEXAGON OUTER TEXT" or shape == "OCTAGON OUTER TEXT" or shape == "HEXAGON FRONT TEXT" or shape == "CIRCLE OUTER TEXT":
         plobj = plateobj
         mat = bpy.data.materials.get("BLACK")
         plobj.data.materials.clear()
