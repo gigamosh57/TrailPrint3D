@@ -64,6 +64,9 @@ import platform
 import zlib
 import struct
 import csv
+import functools
+import logging
+from logging.handlers import RotatingFileHandler
 
 
 gpx_file_path = ""
@@ -140,6 +143,62 @@ cacheSize = 100000
 
 buggyDataset = 0
 exportformat = "STL"
+module_logger = logging.getLogger("TrailPrint3D")
+module_logger.addHandler(logging.NullHandler())
+module_logger.propagate = False
+
+
+def _resolve_log_folder(props):
+    export_dir = bpy.path.abspath(props.export_path) if props and props.export_path else ""
+    if export_dir and os.path.isdir(export_dir):
+        return export_dir
+    temp_dir = bpy.app.tempdir or bpy.utils.user_resource('TEMP')
+    return bpy.path.abspath(temp_dir) if temp_dir else bpy.utils.user_resource('CONFIG')
+
+
+def init_module_logger(context=None):
+    props = getattr(context.scene, "tp3d", None) if context and getattr(context, "scene", None) else None
+    if props is None:
+        return module_logger
+    log_folder = _resolve_log_folder(props)
+    log_filename = (props.debug_log_filename or "trailprint3d.log").strip() or "trailprint3d.log"
+    log_path = os.path.join(log_folder, log_filename)
+    desired_level = getattr(logging, props.debug_log_level, logging.INFO)
+    enabled = props.debug_logging_enabled
+
+    for handler in list(module_logger.handlers):
+        if isinstance(handler, RotatingFileHandler):
+            module_logger.removeHandler(handler)
+            handler.close()
+
+    module_logger.setLevel(desired_level if enabled else logging.CRITICAL + 1)
+    if enabled:
+        file_handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        file_handler.setLevel(desired_level)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(funcName)s | %(message)s"))
+        module_logger.addHandler(file_handler)
+        module_logger.info("Logger initialized at %s", log_path)
+    return module_logger
+
+
+def logging_settings_update(self, context):
+    init_module_logger(context)
+
+
+def log_workflow(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if module_logger.isEnabledFor(logging.DEBUG):
+            module_logger.debug("ENTER %s", func.__name__)
+        try:
+            result = func(*args, **kwargs)
+            if module_logger.isEnabledFor(logging.DEBUG):
+                module_logger.debug("EXIT %s", func.__name__)
+            return result
+        except Exception:
+            module_logger.exception("EXCEPTION in %s", func.__name__)
+            raise
+    return wrapper
 
 #PANEL----------------------------------------------------------------------------------------------------------
 
@@ -313,6 +372,19 @@ class MyProperties(bpy.types.PropertyGroup):
     tolerance: bpy.props.FloatProperty(name="Tolerance", default = 0.2, description="Tolerance of the Trail for the SingleColorMode")
     disableCache: bpy.props.BoolProperty(name="disableCache", default = False, description = "disabling cache if you encounter random holes in your mesh")
     ccacheSize: bpy.props.IntProperty(name = "Cache Size", default = 50000, min = 0)
+    debug_logging_enabled: bpy.props.BoolProperty(name="Enable Logging", default=False, update=logging_settings_update, description="Write TrailPrint3D debug logs to file")
+    debug_log_level: bpy.props.EnumProperty(
+        name="Log Level",
+        items=[
+            ("DEBUG", "Debug", "Verbose logging"),
+            ("INFO", "Info", "Normal operation logging"),
+            ("WARNING", "Warning", "Warnings and errors only"),
+            ("ERROR", "Error", "Errors only")
+        ],
+        default="INFO",
+        update=logging_settings_update
+    )# type: ignore
+    debug_log_filename: bpy.props.StringProperty(name="Log Filename", default="trailprint3d.log", update=logging_settings_update)
     indipendendTiles : bpy.props.BoolProperty(name="IndipendendTiles", default = False, description = "Tile minThickness is indipendend from other tiles")
 
 
@@ -1344,6 +1416,14 @@ class MY_PT_Advanced(bpy.types.Panel):
         box.operator("wm.exportstl", icon="EXPORT")
         box.operator("wm.exportobj", icon = "EXPORT")
 
+        log_box = layout.box()
+        log_box.label(text="Logging")
+        log_box.prop(props, "debug_logging_enabled", text="Enable/Disable Logging", toggle=True)
+        if props.debug_logging_enabled:
+            log_box.prop(props, "debug_log_level")
+            log_box.prop(props, "debug_log_filename")
+            log_box.operator("wm.open_log_folder", icon="FILE_FOLDER")
+
 
         #MAP
         layout.prop(props,"show_map", icon="TRIA_DOWN" if props.show_map else "TRIA_RIGHT", emboss=True)
@@ -1668,6 +1748,23 @@ class OBJECT_OT_ShowCustomPropsPopup(bpy.types.Operator):
         width = self.DOUBLE_WIDTH if len(custom_props) > self.MAX_PER_COLUMN else self.NORMAL_WIDTH
         return context.window_manager.invoke_props_dialog(self, width=width)
 
+
+class MY_OT_OpenLogFolder(bpy.types.Operator):
+    bl_idname = "wm.open_log_folder"
+    bl_label = "Open Log Folder"
+    bl_description = "Open folder where TrailPrint3D logs are written"
+
+    def execute(self, context):
+        props = context.scene.tp3d
+        folder = _resolve_log_folder(props)
+        try:
+            webbrowser.open(folder)
+            return {'FINISHED'}
+        except Exception as e:
+            module_logger.exception("Failed to open log folder: %s", folder)
+            show_message_box(f"Failed to open log folder: {e}")
+            return {'CANCELLED'}
+
 # Register the classes and properties
 def register():
     bpy.utils.register_class(MyProperties)
@@ -1681,6 +1778,7 @@ def register():
     bpy.utils.register_class(MY_OT_OpenWebsite)
     bpy.utils.register_class(MY_OT_JoinDiscord)
     bpy.utils.register_class(MY_OT_Rescale)
+    bpy.utils.register_class(MY_OT_OpenLogFolder)
     bpy.utils.register_class(OBJECT_OT_ShowCustomPropsPopup)
     bpy.utils.register_class(MY_OT_PinCoords)
     bpy.utils.register_class(MY_OT_TerrainDummy)
@@ -1711,6 +1809,7 @@ def unregister():
     bpy.utils.unregister_class(MY_OT_OpenWebsite)
     bpy.utils.unregister_class(MY_OT_JoinDiscord)
     bpy.utils.unregister_class(MY_OT_Rescale)
+    bpy.utils.unregister_class(MY_OT_OpenLogFolder)
     bpy.utils.unregister_class(OBJECT_OT_ShowCustomPropsPopup)
     bpy.utils.unregister_class(MY_OT_PinCoords)
     bpy.utils.unregister_class(MY_OT_TerrainDummy)
@@ -1901,17 +2000,18 @@ def update_request_counter():
     
     return count_openTopodata, count_openElevation  # Return the updated count
 
+@log_workflow
 def send_api_request(addition = ""):
     
     global dataset
     request_count = update_request_counter()
     now = datetime.now()
     if api == 0:
-        print(f"{now.hour:02d}:{now.minute:02d} | Fetching: {addition} | API Usage: {request_count} | {dataset}")
+        module_logger.info("%02d:%02d | Fetching: %s | API Usage: %s | %s", now.hour, now.minute, addition, request_count, dataset)
     elif api == 1:
-        print(f"{now.hour:02d}:{now.minute:02d} | Fetching: {addition} | API Usage: {request_count}")
+        module_logger.info("%02d:%02d | Fetching: %s | API Usage: %s", now.hour, now.minute, addition, request_count)
     elif api == 2:
-        print(f"{now.hour:02d}:{now.minute:02d} | Fetching API")
+        module_logger.info("%02d:%02d | Fetching API", now.hour, now.minute)
     
 if __name__ == "__main__":
     
@@ -1927,6 +2027,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 import bpy
 
+@log_workflow
 def read_gpx_1_1(filepath):
     """
     Reads a GPX file and extracts the coordinates, elevation, and timestamps
@@ -1943,7 +2044,7 @@ def read_gpx_1_1(filepath):
     #find segments inside the file
     ammount = 0
     segments = root.findall('.//default:trkseg',ns)
-    print(f"Segments: {len(segments)}")
+    module_logger.info("read_gpx_1_1 segments=%s filepath=%s", len(segments), filepath)
     if segments:
         for seg in segments:
             # Try to find track points first
@@ -1981,13 +2082,14 @@ def read_gpx_1_1(filepath):
             segmentlist.append(segcoords)
 
     #coordinates.append(segcoords)
-    print(f"Ammount: {ammount}")
+    module_logger.info("read_gpx_1_1 points=%s", ammount)
     return segmentlist
 
 
 
 
 
+@log_workflow
 def read_gpx_1_0(filepath):
     """Reads a GPX 1.0 file and extracts the coordinates, elevation, and timestamps."""
     tree = ET.parse(filepath)
@@ -2002,7 +2104,7 @@ def read_gpx_1_0(filepath):
     lowestElevation = 10000
 
     segments = root.findall('.//gpx:trkseg',ns)
-    print(f"Segments in 1.0: {len(segments)}")
+    module_logger.info("read_gpx_1_0 segments=%s filepath=%s", len(segments), filepath)
     
                         
     if segments:
@@ -2031,6 +2133,7 @@ def read_gpx_1_0(filepath):
             
     return segmentlist
 
+@log_workflow
 def read_igc(filepath):
     """Reads an IGC file and extracts the coordinates, elevation, and timestamps."""
     segmentlist = []
@@ -2085,7 +2188,7 @@ def read_igc(filepath):
                         lowestElevation = elevation
                         
                 except (ValueError, IndexError) as e:
-                    print(f"Error parsing IGC line: {line.strip()}")
+                    module_logger.warning("IGC parse error in %s line=%s", filepath, line.strip())
                     continue
     
     global elevationOffset
@@ -2097,6 +2200,7 @@ def read_igc(filepath):
     return segmentlist
 
 
+@log_workflow
 def read_gpx_directory(directory_path):
     """Reads all GPX files in a directory and extracts coordinates, elevation, and timestamps."""
     
@@ -2118,7 +2222,7 @@ def read_gpx_directory(directory_path):
                 tree = ET.parse(filepath)
                 root = tree.getroot()
                 version = root.get("version")
-                print(f"File Name: {filename}, File Version: {version}")
+                module_logger.info("Processing GPX file=%s version=%s", filename, version)
                 if version == "1.0":
                     co= read_gpx_1_0(filepath)
                 if version == "1.1":
@@ -2732,6 +2836,7 @@ def simplify_curve(points_with_extra, min_distance=0.1000):
     print(f"Smooth curve: Removed {skipped} vertices")
     return simplified
 
+@log_workflow
 def create_hexagon(size):
     """Creates a hexagon at (0,0,0), subdivides it, and rotates it by 90 degrees."""
     verts = []
@@ -2760,6 +2865,7 @@ def create_hexagon(size):
     obj.data.name = name
     return obj
 
+@log_workflow
 def create_rectangle(width, height):
     """Creates a rectangle at (0,0,0), subdivides it, and rotates it by 90 degrees."""
 
@@ -4524,6 +4630,7 @@ def single_color_mode(crv, mapName):
 
 # --- OSM FETCHING ---
 
+@log_workflow
 def fetch_osm_data(bbox, kind = "WATER"):
     south, west, north, east = bbox
     overpass_url = "http://overpass-api.de/api/interpreter"
@@ -4602,19 +4709,18 @@ def fetch_osm_data(bbox, kind = "WATER"):
             response = requests.post(overpass_url, data={'data': query})
 
             #check if response is valid
-            print("Status:", response.status_code)
+            module_logger.debug("fetch_osm_data kind=%s bbox=%s status=%s", kind, bbox, response.status_code)
             if response.status_code != 200:
-                print("Content-Type:", response.headers.get("content-type"))
-                print("Response text preview:\n", response.text[:500])
+                module_logger.warning("OSM response invalid content_type=%s preview=%s", response.headers.get("content-type"), response.text[:200])
 
             #print(response.json())
             if response.status_code == 504:
-                print(f"Timeout (504), retrying... {attempt+1}/3")
+                module_logger.warning("OSM timeout 504 retry=%s/3 kind=%s", attempt + 1, kind)
             if response.status_code == 200:
                 return response
             
         except Exception as e:
-            print("Request failed:", e)
+            module_logger.exception("fetch_osm_data request failed kind=%s bbox=%s", kind, bbox)
             time.sleep(5)
 
     return None
@@ -4762,6 +4868,7 @@ def build_osm_nodes(data):
 
 
 
+@log_workflow
 def coloring_main(map,kind = "WATER"):
 
     col_KeepManifold = (bpy.context.scene.tp3d.col_KeepManifold)
@@ -5554,6 +5661,7 @@ def toggle_console():
     except Exception as e:
         print(f"Could not toggle console: {e}")
     
+@log_workflow
 def runGeneration(type):   
 
     #CHECK BLENDER VERSION
@@ -5565,6 +5673,7 @@ def runGeneration(type):
         return
     
     start_time = time.time()
+    init_module_logger(bpy.context)
 
     toggle_console()
     
@@ -5685,7 +5794,7 @@ def runGeneration(type):
     opentopoAdress = "https://api.opentopodata.org/v1/"
     if selfHosted != "" and selfHosted != None and api == 1:
         opentopoAdress = selfHosted
-        print(f"!!using {opentopoAdress} instead of Opentopodata!!")
+        module_logger.info("Using self-hosted OpenTopo endpoint: %s", opentopoAdress)
     
     
 
@@ -5766,19 +5875,19 @@ def runGeneration(type):
         
     #CONSOLE MESSAGES
     if disableCache == 1:
-        print("Cache Disabled (in Advanced Settings)")
+        module_logger.info("Cache Disabled (in Advanced Settings)")
     if overwritePathElevation == True and singleColorMode == False:
-        print("Overwrite Path Elevation enabled: Path Elevation will be overwritten")
+        module_logger.info("Overwrite Path Elevation enabled")
     if type == 0 or type == 1 or type == 4:
         if xTerrainOffset > 0:
-            print(f"Map will be moved in X by {xTerrainOffset} (Advanced Settings -> Map -> xTerrainOffset)")
+            module_logger.info("Map xTerrainOffset=%s", xTerrainOffset)
         if yTerrainOffset > 0:
-            print(f"Map will be moved in Y by {yTerrainOffset} (Advanced Settings -> Map -> yTerrainOffset)")
+            module_logger.info("Map yTerrainOffset=%s", yTerrainOffset)
 
     
     if singleColorMode == True:
         #overwritePathElevation = False
-        print("Overwrite path Elevation was disabled as its not needed in Single Color mode")
+        module_logger.info("SingleColorMode active")
 
     #STARTSETTINGS
     #Leave edit mode      
@@ -5983,9 +6092,7 @@ def runGeneration(type):
     
 
     #fetch and apply the elevation
-    print("------------------------------------------------")
-    print("FETCHING ELEVATION DATA FOR THE MAP")
-    print("------------------------------------------------")
+    module_logger.info("Fetching elevation data for map %s", MapObject.name if MapObject else "unknown")
     
     global autoScale
     bpy.ops.object.transform_apply(location = False, rotation = True, scale = True)
