@@ -2872,6 +2872,45 @@ def densify_path_segments(points, max_len):
 
     return densified
 
+
+def resample_path_spacing(points, target_spacing):
+    """Resample a polyline to near-uniform point spacing."""
+    if len(points) < 2 or target_spacing <= 0:
+        return points
+
+    vec_points = [Vector(pt[:3]) for pt in points]
+    cumulative = [0.0]
+    for a, b in zip(vec_points, vec_points[1:]):
+        cumulative.append(cumulative[-1] + (b - a).length)
+
+    total_length = cumulative[-1]
+    if total_length <= target_spacing:
+        return [points[0], points[-1]]
+
+    sample_count = max(2, int(round(total_length / target_spacing)) + 1)
+    step = total_length / (sample_count - 1)
+
+    out = []
+    seg_idx = 0
+    for i in range(sample_count):
+        dist = min(i * step, total_length)
+        while seg_idx < len(cumulative) - 2 and cumulative[seg_idx + 1] < dist:
+            seg_idx += 1
+
+        start_d = cumulative[seg_idx]
+        end_d = cumulative[seg_idx + 1]
+        start_v = vec_points[seg_idx]
+        end_v = vec_points[seg_idx + 1]
+        if end_d == start_d:
+            interp = start_v
+        else:
+            t = (dist - start_d) / (end_d - start_d)
+            interp = start_v.lerp(end_v, t)
+
+        out.append((interp.x, interp.y, interp.z))
+
+    return out
+
 def simplify_curve(points_with_extra, min_distance=0.1000):
     """
     Removes points that are too close to any previously accepted point.
@@ -6419,6 +6458,8 @@ def runGeneration(type):
     #RECALCULATE THE COORDS WITH AUTOSCALE APPLIED
     blender_coords = [convert_to_blender_coordinates(lat, lon, ele,timestamp) for lat, lon, ele, timestamp in coordinates]
 
+    target_spacing = max(0.12, 0.35 * pathThickness)
+    blender_coords = resample_path_spacing(blender_coords, target_spacing)
     blender_coords = simplify_curve(blender_coords, .12)
 
     #PREVENT CLIPPING OF IDENTICAL COORDINATES
@@ -6426,7 +6467,10 @@ def runGeneration(type):
     
     if (type == 1 or len(separate_paths) > 1) and type != 4:
         blender_coords_separate = [
-            [convert_to_blender_coordinates(lat, lon, ele, timestamp) for lat, lon, ele, timestamp in path]
+            resample_path_spacing(
+                [convert_to_blender_coordinates(lat, lon, ele, timestamp) for lat, lon, ele, timestamp in path],
+                target_spacing
+            )
             for path in separate_paths
             ]
     
