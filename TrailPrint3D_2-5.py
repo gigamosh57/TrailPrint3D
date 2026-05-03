@@ -4491,6 +4491,25 @@ def separate_duplicate_xy(coordinates, offset=0.05):
     
     return(coordinates)
 
+def apply_boolean_modifier_safely(obj, target_obj, operation, name="Boolean"):
+    """Apply a boolean modifier with an EXACT -> MANIFOLD fallback."""
+    bool_mod = obj.modifiers.new(name=name, type='BOOLEAN')
+    bool_mod.object = target_obj
+    bool_mod.operation = operation
+
+    # EXACT is more robust for thin features and near-coplanar geometry.
+    for solver in ("EXACT", "MANIFOLD"):
+        bool_mod.solver = solver
+        try:
+            bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+            return solver
+        except RuntimeError as exc:
+            module_logger.warning("Boolean failed on %s with solver=%s: %s", obj.name, solver, exc)
+            if bool_mod.name not in obj.modifiers:
+                break
+
+    raise RuntimeError(f"Boolean operation '{operation}' failed for object '{obj.name}'")
+
 def single_color_mode(crv, mapName):
 
 
@@ -4564,14 +4583,7 @@ def single_color_mode(crv, mapName):
 
     recalculateNormals(crv)
 
-    # Add boolean modifier
-    bool_mod = crv.modifiers.new(name="Boolean", type='BOOLEAN')
-    bool_mod.object = map
-    bool_mod.operation = 'INTERSECT'
-    bool_mod.solver = 'MANIFOLD'
-
-
-    bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+    apply_boolean_modifier_safely(crv, map, 'INTERSECT', name="TrailIntersect_1")
 
     for v in crv.data.vertices:
         pass
@@ -4581,16 +4593,9 @@ def single_color_mode(crv, mapName):
 
 
     #Adding another Intersect Modifier to make the path "Plane" with the Map
-    # Add boolean modifier
-    bool_mod = crv.modifiers.new(name="Boolean", type='BOOLEAN')
-    bool_mod.object = map
-    bool_mod.operation = 'INTERSECT'
-    bool_mod.solver = 'MANIFOLD'
-
     recalculateNormals(crv)
 
-
-    bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+    apply_boolean_modifier_safely(crv, map, 'INTERSECT', name="TrailIntersect_2")
 
     #doing the same for the duplicate
     bpy.ops.object.select_all(action='DESELECT')
@@ -4599,13 +4604,7 @@ def single_color_mode(crv, mapName):
     bpy.ops.object.convert(target='MESH')
 
 
-    # Add boolean modifier
-    bool_mod = crv_thick.modifiers.new(name="Boolean", type='BOOLEAN')
-    bool_mod.object = map
-    bool_mod.operation = 'INTERSECT'
-    bool_mod.solver = 'MANIFOLD'
-
-    bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+    apply_boolean_modifier_safely(crv_thick, map, 'INTERSECT', name="TrailIntersect_Thick")
     bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
     crv_thick.scale = (1.002,1.002,1)
 
@@ -4618,17 +4617,11 @@ def single_color_mode(crv, mapName):
     map.select_set(True)
     bpy.context.view_layer.objects.active = map
 
-    bool_mod = map.modifiers.new(name="Boolean", type="BOOLEAN")
-    bool_mod.object = crv_thick
-    bool_mod.operation = "DIFFERENCE"
-    bool_mod.solver = "MANIFOLD"
-
     #Remove the last material from the MAP as the boolean operation adds it to the list witout using it
     #Without removing it will color the next boolean operation in the color of the trail
     mats = map.data.materials
 
-
-    bpy.ops.object.modifier_apply(modifier = bool_mod.name)
+    apply_boolean_modifier_safely(map, crv_thick, "DIFFERENCE", name="TrailDifference")
     bpy.data.objects.remove(crv_thick, do_unlink = True)
 
 
