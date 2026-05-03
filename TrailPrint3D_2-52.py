@@ -35,7 +35,7 @@ bl_info = {
     "blender": (4, 5, 2),
     "category": "Object",
     "author": "EmGi",
-    "version": (2,51),
+    "version": (2,52),
     "description": "Create 3D Printable Miniature Maps of your Adventures",
     "warning": "",
     "doc_url": "",
@@ -44,7 +44,7 @@ bl_info = {
 }
 
 category = "TrailPrint3D"
-AddonVersion = (2, 51)
+AddonVersion = (2, 52)
 
 
 import bpy # type: ignore
@@ -1362,8 +1362,8 @@ class MY_PT_Generate(bpy.types.Panel):
         # Add input fields
         layout.operator("wm.open_website",text = "Support me on Patreon", icon='URL')  # Open website
         layout.operator("wm.join_discord",text = "Join Discord", icon='URL')  # Open website
-        layout.label(text = "Created by: EmGi")
-        layout.label(text = "Premium Version: 2.51")
+        layout.label(text = "Created by: EmGi, updated by gigamosh57")
+        layout.label(text = "Premium Version: 2.52")
         layout.separator()  # Adds a horizontal line
         # Add the script execution button
         layout.label(text = "Create the File")
