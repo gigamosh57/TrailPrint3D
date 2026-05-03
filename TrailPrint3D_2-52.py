@@ -5709,16 +5709,51 @@ def writeMetadata(obj, type = "MAP"):
     
 
 
+def _normalize_popup_icon(icon_name, fallback="ERROR"):
+    """Return a Blender-safe popup icon enum, with compatibility fallbacks."""
+    if not icon_name:
+        return fallback
+
+    icon = str(icon_name).upper()
+
+    # Compatibility aliases for historical values used across Blender versions.
+    legacy_aliases = {
+        "WARNING": "ERROR",
+        "WARN": "ERROR",
+        "INFO": "QUESTION",
+    }
+    icon = legacy_aliases.get(icon, icon)
+
+    # Prefer runtime validation against Blender's current enum set when available.
+    popup_fn = getattr(bpy.types.WindowManager, "popup_menu", None)
+    try:
+        if popup_fn and hasattr(popup_fn, "keywords") and "icon" in popup_fn.keywords:
+            enum_items = popup_fn.keywords["icon"].enum_items.keys()
+            if icon in enum_items:
+                return icon
+            if fallback in enum_items:
+                return fallback
+            if "NONE" in enum_items:
+                return "NONE"
+    except Exception:
+        pass
+
+    # Final defensive fallback for unexpected API changes.
+    return fallback
+
+
 def show_message_box(message, ic = "ERROR", ti = "ERROR"):
     #toggle_console()
     def draw(self, context):
         self.layout.label(text=message)
     print(message)
 
+    safe_icon = _normalize_popup_icon(ic)
+
     def _popup_in_valid_window():
         wm = getattr(bpy.context, "window_manager", None)
         if not wm:
-            module_logger.warning("Unable to open popup (no window manager). title=%s icon=%s message=%s", ti, ic, message)
+            module_logger.warning("Unable to open popup (no window manager). title=%s icon=%s message=%s", ti, safe_icon, message)
             return None
 
         # Use an actual UI window when current context has none (common in timers/background callbacks).
@@ -5730,21 +5765,21 @@ def show_message_box(message, ic = "ERROR", ti = "ERROR"):
                 win = None
 
         if not win:
-            module_logger.warning("Unable to open popup (no active window context). title=%s icon=%s message=%s", ti, ic, message)
+            module_logger.warning("Unable to open popup (no active window context). title=%s icon=%s message=%s", ti, safe_icon, message)
             return None
 
         try:
             with bpy.context.temp_override(window=win):
-                wm.popup_menu(draw, title=ti, icon=ic)
+                wm.popup_menu(draw, title=ti, icon=safe_icon)
         except Exception:
-            module_logger.exception("Failed to open popup message. title=%s icon=%s message=%s", ti, ic, message)
+            module_logger.exception("Failed to open popup message. title=%s icon=%s message=%s", ti, safe_icon, message)
         return None
 
     try:
         # Defer into Blender's UI loop so popups are executed on a safe UI context.
         bpy.app.timers.register(_popup_in_valid_window, first_interval=0.0)
     except Exception:
-        module_logger.exception("Failed to schedule popup message. title=%s icon=%s message=%s", ti, ic, message)
+        module_logger.exception("Failed to schedule popup message. title=%s icon=%s message=%s", ti, safe_icon, message)
 
 def toggle_console():
     try:
