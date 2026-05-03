@@ -403,6 +403,7 @@ class MyProperties(bpy.types.PropertyGroup):
     col_cArea: bpy.props.FloatProperty(name="City Size Treshold", default = 1, description = "Cities smaller than the treshold wont be included")
     col_glActive: bpy.props.BoolProperty(name="Include Glaciers", default=False, description = "Include Glaciers (If there are any)")
     col_glArea: bpy.props.FloatProperty(name="Glacier Size Treshold", default = 1, description = "Glaciers smaller than the treshold wont be included")
+    col_glMaxRequests: bpy.props.IntProperty(name="Glacier OSM Tile Budget", default = 300, min = 1, max = 5000, description = "Maximum number of OSM tile requests for glaciers before aborting")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
 
@@ -1531,6 +1532,7 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.label(text = "Glaciers")
             box.prop(props, "col_glActive")
             box.prop(props, "col_glArea")
+            box.prop(props, "col_glMaxRequests")
 
             #layout.prop(props, "col_KeepManifold")
             boxer.prop(props,"col_PaintMap")
@@ -4940,7 +4942,7 @@ def coloring_main(map,kind = "WATER"):
     max_elements = 35000
     max_bytes_estimate = 12 * 1024 * 1024
     max_polygons = 4000
-    max_requests = 40
+    max_requests = bpy.context.scene.tp3d.col_glMaxRequests if kind == "GLACIER" else 40
     max_cumulative_bytes = 40 * 1024 * 1024
     cumulative_bytes = 0
     request_count = 0
