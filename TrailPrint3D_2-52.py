@@ -2815,6 +2815,30 @@ def create_curve_from_coordinates(coordinates):
         #bpy.ops.object.convert(target='MESH')
         pass
 
+def densify_path_segments(points, max_len):
+    """Insert evenly spaced intermediate points for segments longer than max_len."""
+    if len(points) < 2 or max_len <= 0:
+        return points
+
+    densified = [points[0]]
+
+    for start, end in zip(points, points[1:]):
+        start_vec = Vector(start[:3])
+        end_vec = Vector(end[:3])
+        segment = end_vec - start_vec
+        segment_length = segment.length
+
+        if segment_length > max_len:
+            inserts = int(math.ceil(segment_length / max_len)) - 1
+            for i in range(1, inserts + 1):
+                t = i / (inserts + 1)
+                interp = start_vec.lerp(end_vec, t)
+                densified.append((interp.x, interp.y, interp.z))
+
+        densified.append(end)
+
+    return densified
+
 def simplify_curve(points_with_extra, min_distance=0.1000):
     """
     Removes points that are too close to any previously accepted point.
@@ -6284,6 +6308,14 @@ def runGeneration(type):
     mscale = (tdist/size) * 1000000
     #print(f"scale: {mscale}")
     bpy.context.scene.tp3d["o_mapScale"] = f"{mscale:.0f}"
+
+    path_max_len = 0.5 * pathThickness
+    blender_coords = densify_path_segments(blender_coords, path_max_len)
+
+    if blender_coords_separate:
+        blender_coords_separate = [
+            densify_path_segments(path_coords, path_max_len) for path_coords in blender_coords_separate
+        ]
 
     #------------------------------------------------------------------------------------------------------------------------
     #CREATE THE PATH
