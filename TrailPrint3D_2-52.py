@@ -5714,15 +5714,37 @@ def show_message_box(message, ic = "ERROR", ti = "ERROR"):
     def draw(self, context):
         self.layout.label(text=message)
     print(message)
-    window_manager = getattr(bpy.context, "window_manager", None)
-    has_window = bool(getattr(bpy.context, "window", None))
-    if not window_manager or not has_window:
-        module_logger.warning("Unable to open popup (no active window context). title=%s icon=%s message=%s", ti, ic, message)
-        return
+
+    def _popup_in_valid_window():
+        wm = getattr(bpy.context, "window_manager", None)
+        if not wm:
+            module_logger.warning("Unable to open popup (no window manager). title=%s icon=%s message=%s", ti, ic, message)
+            return None
+
+        # Use an actual UI window when current context has none (common in timers/background callbacks).
+        win = getattr(bpy.context, "window", None)
+        if not win and getattr(wm, "windows", None):
+            try:
+                win = wm.windows[0]
+            except Exception:
+                win = None
+
+        if not win:
+            module_logger.warning("Unable to open popup (no active window context). title=%s icon=%s message=%s", ti, ic, message)
+            return None
+
+        try:
+            with bpy.context.temp_override(window=win):
+                wm.popup_menu(draw, title=ti, icon=ic)
+        except Exception:
+            module_logger.exception("Failed to open popup message. title=%s icon=%s message=%s", ti, ic, message)
+        return None
+
     try:
-        window_manager.popup_menu(draw, title=ti, icon=ic)
+        # Defer into Blender's UI loop so popups are executed on a safe UI context.
+        bpy.app.timers.register(_popup_in_valid_window, first_interval=0.0)
     except Exception:
-        module_logger.exception("Failed to open popup message. title=%s icon=%s message=%s", ti, ic, message)
+        module_logger.exception("Failed to schedule popup message. title=%s icon=%s message=%s", ti, ic, message)
 
 def toggle_console():
     try:
