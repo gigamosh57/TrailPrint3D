@@ -66,6 +66,7 @@ import struct
 import csv
 import functools
 import logging
+import random
 from logging.handlers import RotatingFileHandler
 
 
@@ -4631,9 +4632,25 @@ def single_color_mode(crv, mapName):
 # --- OSM FETCHING ---
 
 @log_workflow
-def fetch_osm_data(bbox, kind = "WATER"):
+def fetch_osm_data(
+    bbox,
+    kind = "WATER",
+    overpass_endpoints=None,
+    connect_timeout=5,
+    read_timeout=30,
+    max_retries=3,
+    base_backoff_seconds=1.0,
+):
     south, west, north, east = bbox
-    overpass_url = "http://overpass-api.de/api/interpreter"
+    endpoints = overpass_endpoints or ["https://overpass-api.de/api/interpreter"]
+    result = {
+        "ok": False,
+        "status_code": None,
+        "error_type": None,
+        "payload_size_bytes": 0,
+        "json_data": None,
+        "endpoint": None,
+    }
     if kind == "WATER":
         query = f"""
         [out:json][timeout:25];
@@ -4703,27 +4720,84 @@ def fetch_osm_data(bbox, kind = "WATER"):
         way["waterway"="stream"]({south},{west},{north},{east});
 
     '''
-    #print(query)
-    for attempt in range(3):
-        try:
-            response = requests.post(overpass_url, data={'data': query})
+    for endpoint in endpoints:
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(endpoint, data={'data': query}, timeout=(connect_timeout, read_timeout))
+                result["status_code"] = response.status_code
+                result["payload_size_bytes"] = len(response.content or b"")
+                result["endpoint"] = endpoint
 
-            #check if response is valid
-            module_logger.debug("fetch_osm_data kind=%s bbox=%s status=%s", kind, bbox, response.status_code)
-            if response.status_code != 200:
-                module_logger.warning("OSM response invalid content_type=%s preview=%s", response.headers.get("content-type"), response.text[:200])
+                remark = None
+                response_json = None
+                try:
+                    response_json = response.json()
+                    if isinstance(response_json, dict):
+                        remark = response_json.get("remark")
+                except ValueError:
+                    result["error_type"] = "json_parse_error"
+                    module_logger.warning(
+                        "OSM json parse failed endpoint=%s status=%s kind=%s body_preview=%s",
+                        endpoint,
+                        response.status_code,
+                        kind,
+                        response.text[:300],
+                    )
 
-            #print(response.json())
-            if response.status_code == 504:
-                module_logger.warning("OSM timeout 504 retry=%s/3 kind=%s", attempt + 1, kind)
-            if response.status_code == 200:
-                return response
-            
-        except Exception as e:
-            module_logger.exception("fetch_osm_data request failed kind=%s bbox=%s", kind, bbox)
-            time.sleep(5)
+                if remark:
+                    module_logger.warning("OSM remark endpoint=%s kind=%s remark=%s", endpoint, kind, remark)
 
-    return None
+                if response.status_code == 200 and response_json is not None:
+                    result["ok"] = True
+                    result["json_data"] = response_json
+                    result["error_type"] = None
+                    return result
+
+                if response.status_code == 429 or response.status_code >= 500:
+                    result["error_type"] = f"http_{response.status_code}"
+                    sleep_for = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5)
+                    module_logger.warning(
+                        "OSM retryable HTTP endpoint=%s status=%s attempt=%s/%s sleep=%.2fs body_preview=%s",
+                        endpoint,
+                        response.status_code,
+                        attempt + 1,
+                        max_retries + 1,
+                        sleep_for,
+                        response.text[:300],
+                    )
+                    time.sleep(sleep_for)
+                    continue
+
+                if 400 <= response.status_code < 500:
+                    result["error_type"] = "http_4xx_non_retryable"
+                    module_logger.error(
+                        "OSM non-retryable HTTP endpoint=%s status=%s kind=%s body_preview=%s",
+                        endpoint,
+                        response.status_code,
+                        kind,
+                        response.text[:300],
+                    )
+                    return result
+
+                result["error_type"] = f"http_{response.status_code}"
+
+            except requests.exceptions.RequestException as exc:
+                result["error_type"] = "network_exception"
+                result["endpoint"] = endpoint
+                sleep_for = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5)
+                module_logger.warning(
+                    "OSM network exception endpoint=%s attempt=%s/%s sleep=%.2fs error=%s",
+                    endpoint,
+                    attempt + 1,
+                    max_retries + 1,
+                    sleep_for,
+                    exc,
+                )
+                if attempt >= max_retries:
+                    break
+                time.sleep(sleep_for)
+
+    return result
 
 
 def extract_multipolygon_bodies(elements, nodes):
@@ -4926,16 +5000,26 @@ def coloring_main(map,kind = "WATER"):
                 try:
                     #pass
                     resp = fetch_osm_data(bbox, kind)
-                    if resp.status_code != 200:
-                        print("OSM Timeout")
-                        return
-                    
+                    if not resp or not resp.get("ok"):
+                        module_logger.warning(
+                            "Skipping bbox=%s kind=%s due to OSM fetch failure status=%s error=%s endpoint=%s",
+                            bbox,
+                            kind,
+                            resp.get("status_code") if isinstance(resp, dict) else None,
+                            resp.get("error_type") if isinstance(resp, dict) else "unknown",
+                            resp.get("endpoint") if isinstance(resp, dict) else None,
+                        )
+                        continue
 
-                except:
+                except Exception:
+                    module_logger.exception("Unexpected error while fetching OSM data for bbox=%s kind=%s", bbox, kind)
                     show_message_box("Something went wrong with fetching OSM data, Try again maybe or idk")
                     continue
 
-                data = resp.json()
+                data = resp.get("json_data") or {}
+                if not isinstance(data, dict) or "elements" not in data:
+                    module_logger.warning("OSM response missing elements for bbox=%s kind=%s", bbox, kind)
+                    continue
                 nodes = build_osm_nodes(data)
                 bodies = extract_multipolygon_bodies(data['elements'], nodes)
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
