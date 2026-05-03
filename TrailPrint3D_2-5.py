@@ -3274,7 +3274,10 @@ def get_elevation_path_openTopoData(vertices):
     return coords
 
 def RaycastCurveToMesh(curve_obj, mesh_obj):
-    
+    if mesh_obj is None or mesh_obj.type != 'MESH' or mesh_obj.data is None or len(mesh_obj.data.polygons) == 0:
+        module_logger.warning("Skipping path elevation overwrite: invalid mesh target")
+        return
+
     print("---")
     print(mesh_obj.name)
     #MOVE EVERY POINT UP BY 100 SO ITS POSSIBLE TO RAYCAST IT DOWNARDS ONTO THE MESH
@@ -3290,6 +3293,7 @@ def RaycastCurveToMesh(curve_obj, mesh_obj):
             for p in spline.points:
                 p.co = (p.co.x, p.co.y, p.co.z + offset.z, p.co.w)
 
+    bpy.context.view_layer.update()
     depsgraph = bpy.context.evaluated_depsgraph_get()
     eval_mesh_obj = mesh_obj.evaluated_get(depsgraph)
 
@@ -6259,10 +6263,16 @@ def runGeneration(type):
     additionalExtrusion = lowestZ
 
     bpy.context.scene.tp3d["sAdditionalExtrusion"] = additionalExtrusion
+    bpy.context.view_layer.objects.active = MapObject
+    bpy.ops.object.transform_apply(location = False, rotation = True, scale = True)
+    bpy.context.view_layer.update()
     
     #Raycast the curve points onto the Mesh surface
     if overwritePathElevation == True and curveObj != None:
-        RaycastCurveToMesh(curveObj, MapObject)
+        if MapObject and MapObject.type == 'MESH' and MapObject.data and len(MapObject.data.polygons) > 0:
+            RaycastCurveToMesh(curveObj, MapObject)
+        else:
+            module_logger.warning("Skipping path elevation overwrite: map object is not a valid mesh")
 
     # Extrude hexagon to z=0 and scale bottom face
     #bpy.context.scene.tool_settings.transform_pivot_point = 'CURSOR'
