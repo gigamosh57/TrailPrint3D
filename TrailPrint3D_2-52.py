@@ -325,6 +325,7 @@ class MyProperties(bpy.types.PropertyGroup):
     num_subdivisions: bpy.props.IntProperty(name = "Resolution", default = 4, min = 1, max = 10, description = "(max reccomended 8) Higher Number = more detailed terrain but slower generation")
     scaleElevation: bpy.props.FloatProperty(name = "Elevation Scale", default = 10, min = 0, max = 10000, description = "Multiplier to the Elevation")
     pathThickness: bpy.props.FloatProperty(name = "Path Thickness", default = 1.2, min = 0.1, max = 5, description = "Thickness of the path in mm")
+    pathRemeshEnabled: bpy.props.BoolProperty(name="Path Remesh", default=True, description="Apply voxel remesh to trails before booleans")
     shapeRotation: bpy.props.IntProperty(name = "ShapeRotation", default = 0, min = -360, max = 360, description = "Rotation of the shape") 
     overwritePathElevation: bpy.props.BoolProperty(name="Overwrite Path Elevation", default=True, description = "Cast each point of the trail onto the Terrain Mesh")
     o_verticesPath: bpy.props.StringProperty(name="Path vertices ", default="")
@@ -1379,6 +1380,7 @@ class MY_PT_Generate(bpy.types.Panel):
         box.prop(props, "num_subdivisions")
         box.prop(props, "scaleElevation")
         box.prop(props, "pathThickness")
+        box.prop(props, "pathRemeshEnabled")
         box.prop(props, "scalemode")
         if props.scalemode == "FACTOR":
             box.prop(props, "pathScale")
@@ -2788,11 +2790,42 @@ def create_curve_from_coordinates(coordinates):
     curve_object.data.bevel_depth = pathThickness/2  # Set the thickness of the curve
     curve_object.data.bevel_resolution = 4  # Set the resolution for smoothness
     
-    mod = curve_object.modifiers.new(name="Remesh",type="REMESH")
-    mod.mode = "VOXEL"
-    mod.voxel_size = 0.05 * pathThickness * 10/2
-    mod.adaptivity = 0.0
     curve_object.data.use_fill_caps = True
+    props = bpy.context.scene.tp3d
+
+    if props.pathRemeshEnabled:
+        mod = curve_object.modifiers.new(name="Remesh",type="REMESH")
+        mod.mode = "VOXEL"
+        min_voxel = max(0.01, pathThickness / 24)
+        mod.voxel_size = max(min_voxel, pathThickness / 8)
+        mod.adaptivity = 0.0
+
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        eval_obj = curve_object.evaluated_get(depsgraph)
+        eval_mesh = eval_obj.to_mesh()
+        is_manifold = True
+        if eval_mesh is not None:
+            bm = bmesh.new()
+            bm.from_mesh(eval_mesh)
+            is_manifold = all(edge.is_manifold for edge in bm.edges)
+            bm.free()
+            eval_obj.to_mesh_clear()
+
+        if not curve_object.data.use_fill_caps:
+            curve_object.data.use_fill_caps = True
+
+        if not is_manifold:
+            mod.voxel_size = max(min_voxel, mod.voxel_size * 0.75)
+            eval_obj = curve_object.evaluated_get(depsgraph)
+            eval_mesh = eval_obj.to_mesh()
+            if eval_mesh is not None:
+                bm = bmesh.new()
+                bm.from_mesh(eval_mesh)
+                is_manifold = all(edge.is_manifold for edge in bm.edges)
+                bm.free()
+                eval_obj.to_mesh_clear()
+            if not is_manifold:
+                curve_object.modifiers.remove(mod)
         
     curve_object.data.name = name + "_Trail"
     curve_object.name = name + "_Trail"
