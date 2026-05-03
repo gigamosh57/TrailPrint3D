@@ -4692,12 +4692,20 @@ def _subdivide_bbox_grid(bbox, lat_step, lon_step):
 
 
 def fetch_osm_query(query, kind="WATER", overpass_endpoints=None, connect_timeout=5, read_timeout=30, max_retries=3, base_backoff_seconds=1.0):
-    endpoints = overpass_endpoints or ["https://overpass-api.de/api/interpreter"]
+    endpoints = overpass_endpoints or [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    ]
+    headers = {
+        "User-Agent": "TrailPrint3D/2.52 (OSM Overpass client)",
+        "Accept": "application/json,text/plain,*/*",
+    }
     result = {"ok": False, "status_code": None, "error_type": None, "payload_size_bytes": 0, "json_data": None, "endpoint": None}
     for endpoint in endpoints:
         for attempt in range(max_retries + 1):
             try:
-                response = requests.post(endpoint, data={'data': query}, timeout=(connect_timeout, read_timeout))
+                response = requests.post(endpoint, data={'data': query}, headers=headers, timeout=(connect_timeout, read_timeout))
                 result["status_code"] = response.status_code
                 result["payload_size_bytes"] = len(response.content or b"")
                 result["endpoint"] = endpoint
@@ -4711,7 +4719,7 @@ def fetch_osm_query(query, kind="WATER", overpass_endpoints=None, connect_timeou
                     result["json_data"] = response_json
                     result["error_type"] = None
                     return result
-                if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code in (406, 408, 425, 429) or response.status_code >= 500:
                     sleep_for = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5)
                     time.sleep(sleep_for)
                     continue
