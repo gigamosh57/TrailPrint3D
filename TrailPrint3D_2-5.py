@@ -5719,7 +5719,15 @@ def show_message_box(message, ic = "ERROR", ti = "ERROR"):
     def draw(self, context):
         self.layout.label(text=message)
     print(message)
-    bpy.context.window_manager.popup_menu(draw, title=ti, icon=ic)
+    window_manager = getattr(bpy.context, "window_manager", None)
+    has_window = bool(getattr(bpy.context, "window", None))
+    if not window_manager or not has_window:
+        module_logger.warning("Unable to open popup (no active window context). title=%s icon=%s message=%s", ti, ic, message)
+        return
+    try:
+        window_manager.popup_menu(draw, title=ti, icon=ic)
+    except Exception:
+        module_logger.exception("Failed to open popup message. title=%s icon=%s message=%s", ti, ic, message)
 
 def toggle_console():
     try:
