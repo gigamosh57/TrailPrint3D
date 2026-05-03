@@ -4537,6 +4537,96 @@ def apply_boolean_modifier_safely(obj, target_obj, operation, name="Boolean"):
 
     raise RuntimeError(f"Boolean operation '{operation}' failed for object '{obj.name}'")
 
+def _collect_trail_material_indices(mesh_obj):
+    trail_indices = set()
+    for idx, mat in enumerate(mesh_obj.data.materials):
+        if mat and mat.name.upper() == "TRAIL":
+            trail_indices.add(idx)
+    if not trail_indices and len(mesh_obj.data.materials) > 0:
+        trail_indices.add(0)
+    return trail_indices
+
+def _sample_trail_cross_sections(mesh_obj, samples=24):
+    if mesh_obj.type != "MESH" or len(mesh_obj.data.vertices) == 0:
+        return []
+    verts_world = [mesh_obj.matrix_world @ v.co for v in mesh_obj.data.vertices]
+    min_x = min(v.x for v in verts_world)
+    max_x = max(v.x for v in verts_world)
+    span = max_x - min_x
+    if span <= 1e-6:
+        return []
+    station_data = []
+    tol = max(0.02, span / 400.0)
+    for i in range(samples):
+        station_x = min_x + (span * i / max(1, samples - 1))
+        ys = [v.y for v in verts_world if abs(v.x - station_x) <= tol]
+        if len(ys) >= 2:
+            width = max(ys) - min(ys)
+            station_data.append((i, station_x, width))
+    return station_data
+
+def enforce_trail_minimum_width(mesh_obj, target_width, station_samples=24):
+    if mesh_obj.type != "MESH" or target_width <= 0:
+        return {"measured_min": 0.0, "expanded": False, "post_min": 0.0, "station_count": 0}
+
+    stations = _sample_trail_cross_sections(mesh_obj, samples=station_samples)
+    measured_min = min((w for _, _, w in stations), default=0.0)
+    trail_mat_indices = _collect_trail_material_indices(mesh_obj)
+    deficits = [max(0.0, target_width - w) for _, _, w in stations if w > 0]
+    max_deficit = max(deficits, default=0.0)
+    expanded = False
+
+    if max_deficit > 0.0:
+        expand_amount = (max_deficit * 0.5) + 0.01
+        bm = bmesh.new()
+        bm.from_mesh(mesh_obj.data)
+        bm.faces.ensure_lookup_table()
+        geom = []
+        for face in bm.faces:
+            if face.material_index in trail_mat_indices:
+                geom.append(face)
+                geom.extend(face.verts)
+                geom.extend(face.edges)
+        if geom:
+            trail_faces = [f for f in bm.faces if f.material_index in trail_mat_indices]
+            bmesh.ops.solidify(
+                bm,
+                geom=trail_faces,
+                thickness=expand_amount,
+            )
+            bm.to_mesh(mesh_obj.data)
+            expanded = True
+        bm.free()
+        if expanded:
+            recalculateNormals(mesh_obj)
+            try:
+                delete_non_manifold(mesh_obj)
+            except Exception as exc:
+                module_logger.warning("Non-manifold cleanup failed for %s: %s", mesh_obj.name, exc)
+
+    post_stations = _sample_trail_cross_sections(mesh_obj, samples=station_samples)
+    post_min = min((w for _, _, w in post_stations), default=0.0)
+    if post_min + 1e-6 < target_width:
+        module_logger.warning(
+            "Trail width safety net failed for %s: target=%.4f, measured=%.4f",
+            mesh_obj.name,
+            target_width,
+            post_min,
+        )
+    else:
+        module_logger.info(
+            "Trail width safety net ok for %s: target=%.4f, measured=%.4f",
+            mesh_obj.name,
+            target_width,
+            post_min,
+        )
+    return {
+        "measured_min": measured_min,
+        "expanded": expanded,
+        "post_min": post_min,
+        "station_count": len(post_stations),
+    }
+
 def single_color_mode(crv, mapName):
 
 
@@ -4623,6 +4713,17 @@ def single_color_mode(crv, mapName):
     recalculateNormals(crv)
 
     apply_boolean_modifier_safely(crv, map, 'INTERSECT', name="TrailIntersect_2")
+    safety_metrics = enforce_trail_minimum_width(crv, pathThickness, station_samples=28)
+    module_logger.info(
+        "Trail safety metrics for %s: sampled_stations=%d, pre_min=%.4f, post_min=%.4f, expanded=%s",
+        crv.name,
+        safety_metrics["station_count"],
+        safety_metrics["measured_min"],
+        safety_metrics["post_min"],
+        safety_metrics["expanded"],
+    )
+    if safety_metrics["expanded"]:
+        apply_boolean_modifier_safely(crv, map, 'INTERSECT', name="TrailIntersect_Safety")
 
     #doing the same for the duplicate
     bpy.ops.object.select_all(action='DESELECT')
