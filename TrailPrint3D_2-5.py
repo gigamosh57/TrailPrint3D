@@ -1209,7 +1209,8 @@ class MY_OT_ColorMountain(bpy.types.Operator):
 
         #Iterate objects and faces
         for obj in selected_objects:
-            if obj.type != 'MESH' or obj["Object type"] != "MAP" or max_z == 0:
+            object_type = obj.get("Object type")
+            if obj.type != 'MESH' or object_type != "MAP" or max_z in (None, 0):
                 print("Not Applied")
                 continue
             print("Apply Mountain Color")
