@@ -4976,7 +4976,7 @@ def extract_multipolygon_bodies(elements, nodes):
     def way_coords(way):
         return [ (nodes[nid]['lat'], nodes[nid]['lon'], nodes[nid].get('elevation', 0)) for nid in way['nodes'] if nid in nodes ]
 
-    # Store all multipolygon lakes as lists of outer rings (each ring = list of coords)
+    # Store multipolygons as records with outer and inner rings.
     multipolygon_lakes = []
 
     # Index ways by their id for quick lookup
@@ -5044,9 +5044,12 @@ def extract_multipolygon_bodies(elements, nodes):
             outer_loops = stitch_ways(outer_ways)
             inner_loops = stitch_ways(inner_ways)
 
-            # For now, just add outer loops as separate lakes (you could add inner loops for holes)
-            for loop in outer_loops:
-                multipolygon_lakes.append(loop)
+            if outer_loops or inner_loops:
+                multipolygon_lakes.append({
+                    "relation_id": el.get("id"),
+                    "outers": outer_loops,
+                    "inners": inner_loops,
+                })
 
     return multipolygon_lakes
 
@@ -5102,6 +5105,40 @@ def calculate_polygon_area_2d(coords):
             area += (x0 * y1) - (x1 * y0)
     
     return abs(area) * 0.5
+
+
+def _is_valid_ring(coords, min_area=0.0):
+    if not coords:
+        return False
+    if coords[0] != coords[-1]:
+        return False
+    if len(coords) < 4:
+        return False
+    return calculate_polygon_area_2d(coords) > min_area
+
+
+def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
+    holes_applied = 0
+    for i, hole_coords in enumerate(hole_rings):
+        hole_obj = col_create_face_mesh(f"{name_prefix}_{i}", hole_coords)
+        if not hole_obj:
+            continue
+        bool_mod = outer_obj.modifiers.new(name=f"hole_diff_{i}", type='BOOLEAN')
+        bool_mod.operation = 'DIFFERENCE'
+        bool_mod.solver = 'EXACT'
+        bool_mod.object = hole_obj
+
+        ctx = bpy.context
+        bpy.ops.object.select_all(action='DESELECT')
+        outer_obj.select_set(True)
+        ctx.view_layer.objects.active = outer_obj
+        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+
+        hole_mesh = hole_obj.data
+        bpy.data.objects.remove(hole_obj, do_unlink=True)
+        bpy.data.meshes.remove(hole_mesh)
+        holes_applied += 1
+    return holes_applied
 
 def build_osm_nodes(data):
     nodes = {}
@@ -5211,16 +5248,51 @@ def coloring_main(map,kind = "WATER"):
                 bodies = extract_multipolygon_bodies(filtered_elements, nodes)
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
 
-                for i, coords in enumerate(bodies):
-                    blender_coords = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in coords]
-                    calcArea = calculate_polygon_area_2d(blender_coords)
-                    #print(f"tArea1: {calcArea}")
-                    if calcArea > col_Area:
-                        tobj = col_create_face_mesh(f"Relation_{i}", blender_coords)
+                for i, body in enumerate(bodies):
+                    relation_id = body.get("relation_id")
+                    outer_rings = body.get("outers", [])
+                    inner_rings = body.get("inners", [])
+
+                    valid_outers = []
+                    for ring in outer_rings:
+                        blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
+                        if _is_valid_ring(blender_ring, col_Area):
+                            valid_outers.append(blender_ring)
+                        else:
+                            waterDeleted += 1
+
+                    valid_inners = []
+                    inner_area_threshold = max(1e-9, col_Area * 0.01)
+                    for ring in inner_rings:
+                        blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
+                        if _is_valid_ring(blender_ring, inner_area_threshold):
+                            valid_inners.append(blender_ring)
+
+                    holes_applied_total = 0
+                    for j, outer_coords in enumerate(valid_outers):
+                        tobj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}", outer_coords)
+                        if not tobj:
+                            waterDeleted += 1
+                            continue
+                        holes_applied = apply_hole_difference(
+                            tobj,
+                            valid_inners,
+                            name_prefix=f"Hole_{relation_id}_{i}_{j}"
+                        )
+                        holes_applied_total += holes_applied
                         created_objects.append(tobj)
                         waterCreated += 1
-                    else:
-                        waterDeleted += 1
+
+                    module_logger.info(
+                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s",
+                        relation_id,
+                        kind,
+                        len(outer_rings),
+                        len(inner_rings),
+                        len(valid_outers),
+                        len(valid_inners),
+                        holes_applied_total,
+                    )
 
                 for i, element in enumerate(filtered_elements):
                     #print(i)
