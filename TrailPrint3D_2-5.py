@@ -4631,6 +4631,117 @@ def single_color_mode(crv, mapName):
 
 # --- OSM FETCHING ---
 
+def _osm_selector_lines(kind, south, west, north, east):
+    if kind == "WATER":
+        return [
+            f'nwr["natural"="water"]({south},{west},{north},{east});',
+            f'nwr["water"="river"]({south},{west},{north},{east});',
+            f'nwr["water"="lake"]({south},{west},{north},{east});',
+        ]
+    if kind == "FOREST":
+        return [
+            f'nwr["natural"="wood"]({south},{west},{north},{east});',
+            f'nwr["landuse"="forest"]({south},{west},{north},{east});',
+        ]
+    if kind == "CITY":
+        return [f'nwr["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});']
+    if kind == "GLACIER":
+        return [f'nwr["natural"="glacier"]({south},{west},{north},{east});']
+    return []
+
+
+def _build_osm_data_query(kind, bbox):
+    south, west, north, east = bbox
+    selectors = "\n            ".join(_osm_selector_lines(kind, south, west, north, east))
+    return f"""
+        [out:json][timeout:25];
+        (
+            {selectors}
+        );
+        out body;
+        >;
+        out skel qt;
+        """
+
+
+def derive_osm_tile_size_from_scale(bbox, terrain_subdivisions=4, horizontal_scale=1.0):
+    south, west, north, east = bbox
+    lat_span = max(0.001, abs(north - south))
+    lon_span = max(0.001, abs(east - west))
+    subdiv_factor = max(1, int(terrain_subdivisions) + 1)
+    scale_factor = max(0.25, min(4.0, float(horizontal_scale) if horizontal_scale else 1.0))
+    target_lat = max(0.01, min(2.0, lat_span / math.sqrt(subdiv_factor) * (1.0 / scale_factor)))
+    target_lon = max(0.01, min(2.0, lon_span / math.sqrt(subdiv_factor) * (1.0 / scale_factor)))
+    return target_lat, target_lon
+
+
+def _subdivide_bbox_grid(bbox, lat_step, lon_step):
+    south, west, north, east = bbox
+    tiles = []
+    lat = south
+    while lat < north:
+        next_lat = min(north, lat + lat_step)
+        lon = west
+        while lon < east:
+            next_lon = min(east, lon + lon_step)
+            tiles.append((lat, lon, next_lat, next_lon))
+            lon = next_lon
+        lat = next_lat
+    return tiles
+
+
+def fetch_osm_query(query, kind="WATER", overpass_endpoints=None, connect_timeout=5, read_timeout=30, max_retries=3, base_backoff_seconds=1.0):
+    endpoints = overpass_endpoints or ["https://overpass-api.de/api/interpreter"]
+    result = {"ok": False, "status_code": None, "error_type": None, "payload_size_bytes": 0, "json_data": None, "endpoint": None}
+    for endpoint in endpoints:
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(endpoint, data={'data': query}, timeout=(connect_timeout, read_timeout))
+                result["status_code"] = response.status_code
+                result["payload_size_bytes"] = len(response.content or b"")
+                result["endpoint"] = endpoint
+                try:
+                    response_json = response.json()
+                except ValueError:
+                    result["error_type"] = "json_parse_error"
+                    response_json = None
+                if response.status_code == 200 and response_json is not None:
+                    result["ok"] = True
+                    result["json_data"] = response_json
+                    result["error_type"] = None
+                    return result
+                if response.status_code == 429 or response.status_code >= 500:
+                    sleep_for = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5)
+                    time.sleep(sleep_for)
+                    continue
+                result["error_type"] = f"http_{response.status_code}"
+                return result
+            except requests.exceptions.RequestException:
+                result["error_type"] = "network_exception"
+                if attempt >= max_retries:
+                    break
+                time.sleep(base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5))
+    return result
+
+
+def _probe_osm_payload(bbox, kind, overpass_endpoints=None, connect_timeout=5, read_timeout=15):
+    south, west, north, east = bbox
+    selectors = "\n            ".join(_osm_selector_lines(kind, south, west, north, east))
+    probe_query = f"""
+        [out:json][timeout:20];
+        (
+            {selectors}
+        );
+        out count;
+    """
+    resp = fetch_osm_query(probe_query, kind=f"{kind}_PROBE", overpass_endpoints=overpass_endpoints, connect_timeout=connect_timeout, read_timeout=read_timeout, max_retries=2)
+    total = 0
+    if resp.get("ok"):
+        elems = (resp.get("json_data") or {}).get("elements", [])
+        if elems and isinstance(elems[0], dict):
+            total = int((elems[0].get("tags") or {}).get("total", 0) or 0)
+    return {"ok": resp.get("ok", False), "element_count": total, "estimated_bytes": total * 350}
+
 @log_workflow
 def fetch_osm_data(
     bbox,
@@ -4641,163 +4752,16 @@ def fetch_osm_data(
     max_retries=3,
     base_backoff_seconds=1.0,
 ):
-    south, west, north, east = bbox
-    endpoints = overpass_endpoints or ["https://overpass-api.de/api/interpreter"]
-    result = {
-        "ok": False,
-        "status_code": None,
-        "error_type": None,
-        "payload_size_bytes": 0,
-        "json_data": None,
-        "endpoint": None,
-    }
-    if kind == "WATER":
-        query = f"""
-        [out:json][timeout:25];
-        (
-            nwr["natural"="water"]({south},{west},{north},{east});
-            nwr["water"="river"]({south},{west},{north},{east});
-            nwr["water"="lake"]({south},{west},{north},{east});
-
-        );
-        out body;
-        >;
-        out skel qt;
-        """
-    if kind == "FOREST":
-        query = f"""
-        [out:json][timeout:25];
-        (
-            nwr["natural"="wood"]({south},{west},{north},{east});
-            nwr["landuse"="forest"]({south},{west},{north},{east});
-
-        );
-        out body;
-        >;
-        out skel qt;
-        """
-    if kind == "CITY":
-        query = f"""
-        [out:json][timeout:25];
-        (
-            nwr["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
-
-
-        );
-        out body;
-        >;
-        out skel qt;
-        """
-    if kind == "GLACIER":
-        query = f"""
-        [out:json][timeout:25];
-        (
-            nwr["natural"="glacier"]({south},{west},{north},{east});
-
-
-        );
-        out body;
-        >;
-        out skel qt;
-        """
-
-    '''
-    #way["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
-    #relation["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});
-
-    nwr["natural"="water"]({south},{west},{north},{east});
-    nwr["water"="river"]({south},{west},{north},{east});
-    nwr["water"="lake"]({south},{west},{north},{east});
-    
-
-        way["natural"="water"]({south},{west},{north},{east});
-        relation["natural"="water"]({south},{west},{north},{east});
-
-        way["water"="river"]({south},{west},{north},{east});
-        relation["water"="river"]({south},{west},{north},{east});
-
-        way["waterway"="river"]({south},{west},{north},{east});
-        way["waterway"="stream"]({south},{west},{north},{east});
-
-    '''
-    for endpoint in endpoints:
-        for attempt in range(max_retries + 1):
-            try:
-                response = requests.post(endpoint, data={'data': query}, timeout=(connect_timeout, read_timeout))
-                result["status_code"] = response.status_code
-                result["payload_size_bytes"] = len(response.content or b"")
-                result["endpoint"] = endpoint
-
-                remark = None
-                response_json = None
-                try:
-                    response_json = response.json()
-                    if isinstance(response_json, dict):
-                        remark = response_json.get("remark")
-                except ValueError:
-                    result["error_type"] = "json_parse_error"
-                    module_logger.warning(
-                        "OSM json parse failed endpoint=%s status=%s kind=%s body_preview=%s",
-                        endpoint,
-                        response.status_code,
-                        kind,
-                        response.text[:300],
-                    )
-
-                if remark:
-                    module_logger.warning("OSM remark endpoint=%s kind=%s remark=%s", endpoint, kind, remark)
-
-                if response.status_code == 200 and response_json is not None:
-                    result["ok"] = True
-                    result["json_data"] = response_json
-                    result["error_type"] = None
-                    return result
-
-                if response.status_code == 429 or response.status_code >= 500:
-                    result["error_type"] = f"http_{response.status_code}"
-                    sleep_for = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5)
-                    module_logger.warning(
-                        "OSM retryable HTTP endpoint=%s status=%s attempt=%s/%s sleep=%.2fs body_preview=%s",
-                        endpoint,
-                        response.status_code,
-                        attempt + 1,
-                        max_retries + 1,
-                        sleep_for,
-                        response.text[:300],
-                    )
-                    time.sleep(sleep_for)
-                    continue
-
-                if 400 <= response.status_code < 500:
-                    result["error_type"] = "http_4xx_non_retryable"
-                    module_logger.error(
-                        "OSM non-retryable HTTP endpoint=%s status=%s kind=%s body_preview=%s",
-                        endpoint,
-                        response.status_code,
-                        kind,
-                        response.text[:300],
-                    )
-                    return result
-
-                result["error_type"] = f"http_{response.status_code}"
-
-            except requests.exceptions.RequestException as exc:
-                result["error_type"] = "network_exception"
-                result["endpoint"] = endpoint
-                sleep_for = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.5)
-                module_logger.warning(
-                    "OSM network exception endpoint=%s attempt=%s/%s sleep=%.2fs error=%s",
-                    endpoint,
-                    attempt + 1,
-                    max_retries + 1,
-                    sleep_for,
-                    exc,
-                )
-                if attempt >= max_retries:
-                    break
-                time.sleep(sleep_for)
-
-    return result
+    query = _build_osm_data_query(kind, bbox)
+    return fetch_osm_query(
+        query,
+        kind=kind,
+        overpass_endpoints=overpass_endpoints,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        max_retries=max_retries,
+        base_backoff_seconds=base_backoff_seconds,
+    )
 
 
 def extract_multipolygon_bodies(elements, nodes):
@@ -4968,38 +4932,44 @@ def coloring_main(map,kind = "WATER"):
 
     name = map.name
 
-    lat_step = 2
-    lon_step = 2
-
     waterDeleted = 0
     waterCreated = 0
-
-    if maxLat - minLat < lat_step:
-        lat_step = maxLat - minLat
-    if maxLon - minLon < lon_step:
-        lon_step = maxLon - minLon
-
-    lats = math.ceil((maxLat - minLat) / lat_step)
-    lons = math.ceil((maxLon - minLon) / lon_step)
-
     created_objects = []
+    global_bbox = (minLat, minLon, maxLat, maxLon)
+    tile_lat, tile_lon = derive_osm_tile_size_from_scale(global_bbox, num_subdivisions, scaleHor if scaleHor else 1.0)
+    probe = _probe_osm_payload(global_bbox, kind)
+    max_elements = 35000
+    max_bytes_estimate = 12 * 1024 * 1024
+    max_polygons = 4000
+    max_requests = 40
+    max_cumulative_bytes = 40 * 1024 * 1024
+    cumulative_bytes = 0
+    request_count = 0
+    seen_way_ids = set()
+    seen_relation_ids = set()
 
-    #print(f"lats: {lats}, lons: {lons}")
-    if lats * lons < 20:
-        for k in range(lats):
-            for l in range(lons):
-                print(f"loop: {((k) * lons + l + 1)}/{lats * lons}")
-                south = minLat + k * lat_step
-                north = south + lat_step
-                west = minLon + l * lon_step
-                east = west + lon_step
+    if probe.get("ok"):
+        module_logger.info("OSM probe kind=%s bbox=%s elements=%s estimated_bytes=%s", kind, global_bbox, probe["element_count"], probe["estimated_bytes"])
+    else:
+        module_logger.warning("OSM probe failed kind=%s bbox=%s", kind, global_bbox)
 
-                bbox = (south, west, north, east)
-                data = []
-                #data = fetch_osm_data(bbox, kind)
+    use_single = probe.get("ok") and probe["element_count"] <= max_elements and probe["estimated_bytes"] <= max_bytes_estimate and probe["element_count"] <= max_polygons
+    bboxes = [global_bbox] if use_single else _subdivide_bbox_grid(global_bbox, tile_lat, tile_lon)
+
+    for idx, bbox in enumerate(bboxes, 1):
+                if request_count >= max_requests or cumulative_bytes >= max_cumulative_bytes:
+                    warn = f"OSM request budget exceeded for {kind}. Processed {request_count} tiles. Try smaller region."
+                    module_logger.warning(warn)
+                    show_message_box(warn, "WARNING", "WARNING")
+                    break
+
+                started = time.perf_counter()
+                retries = 0
                 try:
-                    #pass
                     resp = fetch_osm_data(bbox, kind)
+                    request_count += 1
+                    retries = 0 if resp.get("ok") else 1
+                    cumulative_bytes += int(resp.get("payload_size_bytes") or 0)
                     if not resp or not resp.get("ok"):
                         module_logger.warning(
                             "Skipping bbox=%s kind=%s due to OSM fetch failure status=%s error=%s endpoint=%s",
@@ -5010,7 +4980,6 @@ def coloring_main(map,kind = "WATER"):
                             resp.get("endpoint") if isinstance(resp, dict) else None,
                         )
                         continue
-
                 except Exception:
                     module_logger.exception("Unexpected error while fetching OSM data for bbox=%s kind=%s", bbox, kind)
                     show_message_box("Something went wrong with fetching OSM data, Try again maybe or idk")
@@ -5020,8 +4989,20 @@ def coloring_main(map,kind = "WATER"):
                 if not isinstance(data, dict) or "elements" not in data:
                     module_logger.warning("OSM response missing elements for bbox=%s kind=%s", bbox, kind)
                     continue
-                nodes = build_osm_nodes(data)
-                bodies = extract_multipolygon_bodies(data['elements'], nodes)
+                filtered_elements = []
+                for el in data["elements"]:
+                    if el.get("type") == "way":
+                        if el["id"] in seen_way_ids:
+                            continue
+                        seen_way_ids.add(el["id"])
+                    elif el.get("type") == "relation":
+                        if el["id"] in seen_relation_ids:
+                            continue
+                        seen_relation_ids.add(el["id"])
+                    filtered_elements.append(el)
+                module_logger.info("OSM tile telemetry kind=%s tile=%s/%s bbox=%s count=%s elapsed=%.3fs retries=%s", kind, idx, len(bboxes), bbox, len(filtered_elements), time.perf_counter() - started, retries)
+                nodes = build_osm_nodes({"elements": filtered_elements})
+                bodies = extract_multipolygon_bodies(filtered_elements, nodes)
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
 
                 for i, coords in enumerate(bodies):
@@ -5035,7 +5016,7 @@ def coloring_main(map,kind = "WATER"):
                     else:
                         waterDeleted += 1
 
-                for i, element in enumerate(data['elements']):
+                for i, element in enumerate(filtered_elements):
                     #print(i)
                     if element['type'] != 'way':
                         waterDeleted += 1
@@ -5065,9 +5046,7 @@ def coloring_main(map,kind = "WATER"):
                         created_objects.append(tobj)
                         waterCreated += 1
                     
-                time.sleep(5)  # Pause to prevent request throttling
-    else:
-        print("Region too big. Cant Fetch All Water Sources")
+                time.sleep(1)  # Pause to prevent request throttling
             
     # --- Merge all created water meshes into one ---
 
