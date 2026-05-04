@@ -5546,6 +5546,8 @@ def coloring_main(map,kind = "WATER"):
                                 hole_telemetry["candidate_holes"],
                             )
                         created_objects.append(tobj)
+                        for island_obj in island_objects:
+                            relation_debug_pairs.append((relation_id, island_obj, tobj))
                         waterCreated += 1
 
                     if holes_applied_total > 0 and island_objects_created == 0:
@@ -5602,11 +5604,15 @@ def coloring_main(map,kind = "WATER"):
                     if coords[0] == coords[-1]:
                         tobj = col_create_face_mesh(f"coloredObject_{i}", coords)
                         created_objects.append(tobj)
+                        for island_obj in island_objects:
+                            relation_debug_pairs.append((relation_id, island_obj, tobj))
                         waterCreated += 1
                         standalone_ways_rendered += 1
                     else:
                         tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
                         created_objects.append(tobj)
+                        for island_obj in island_objects:
+                            relation_debug_pairs.append((relation_id, island_obj, tobj))
                         waterCreated += 1
                         standalone_ways_rendered += 1
                     
