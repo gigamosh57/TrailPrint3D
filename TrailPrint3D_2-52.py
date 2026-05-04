@@ -334,6 +334,7 @@ class MyProperties(bpy.types.PropertyGroup):
     o_time: bpy.props.StringProperty(name="TimeTook",default="")
     o_apiCounter_OpenTopoData: bpy.props.StringProperty(name="apiCounter_OpenTopodata", default = "API Limit: ---/1000 daily")
     o_apiCounter_OpenElevation: bpy.props.StringProperty(name="apiCounter_OpenElevation", default = "API Limit: ---/1000 monthly")
+    o_elevationApiStatus: bpy.props.StringProperty(name="elevationApiStatus", default = "Status: not tested")
     o_centerx: bpy.props.FloatProperty(name = "Center X", default = 0, description = "X Center of the Path")
     o_centery: bpy.props.FloatProperty(name = "Center Y", default = 0, description = "y Center of the Path")
 
@@ -544,6 +545,46 @@ class MY_OT_ExportOBJ(bpy.types.Operator):
         export_selected_to_STL("OBJ")
 
         
+        return {'FINISHED'}
+
+class MY_OT_TestElevationAPI(bpy.types.Operator):
+    bl_idname = "wm.test_elevation_api"
+    bl_label = "Test Elevation API"
+    bl_description = "Run a simple request to verify if the configured elevation server is reachable"
+
+    def execute(self, context):
+        props = context.scene.tp3d
+        lat = props.jMapLat
+        lon = props.jMapLon
+
+        if props.api == "OPEN-ELEVATION":
+            url = "https://api.open-elevation.com/api/v1/lookup"
+            payload = {"locations": [{"latitude": lat, "longitude": lon}]}
+            try:
+                response = requests.post(url, json=payload, timeout=12)
+                response.raise_for_status()
+                results = response.json().get("results", [])
+                elevation = results[0].get("elevation") if results else None
+                props.o_elevationApiStatus = f"Status: OK ({response.status_code}) Open-Elevation | elev={elevation}"
+            except requests.exceptions.RequestException as e:
+                code = getattr(getattr(e, "response", None), "status_code", "no_response")
+                props.o_elevationApiStatus = f"Status: ERROR ({code}) Open-Elevation | {str(e)}"
+        elif props.api == "OPENTOPODATA":
+            base = props.selfHosted.strip() if props.selfHosted.strip() else "https://api.opentopodata.org/v1/"
+            url = f"{base}{props.dataset}?locations={lat},{lon}"
+            try:
+                response = requests.get(url, timeout=12)
+                response.raise_for_status()
+                results = response.json().get("results", [])
+                elevation = results[0].get("elevation") if results else None
+                props.o_elevationApiStatus = f"Status: OK ({response.status_code}) OpenTopoData | elev={elevation}"
+            except requests.exceptions.RequestException as e:
+                code = getattr(getattr(e, "response", None), "status_code", "no_response")
+                props.o_elevationApiStatus = f"Status: ERROR ({code}) OpenTopoData | {str(e)}"
+        else:
+            props.o_elevationApiStatus = "Status: Terrain-Tiles uses AWS tile server (no API test endpoint here)"
+
+        self.report({'INFO'}, props.o_elevationApiStatus)
         return {'FINISHED'}
 
 
@@ -1633,6 +1674,8 @@ class MY_PT_Advanced(bpy.types.Panel):
         if props.show_api:
             box = layout.box()
             box.prop(props,"api", icon = "INTERNET")
+            box.operator("wm.test_elevation_api", icon="URL")
+            box.label(text=props.o_elevationApiStatus)
             if props.api == "OPENTOPODATA":
                 box.prop(props, "dataset")
                 box.separator()  # Adds a horizontal line
@@ -1779,6 +1822,7 @@ def register():
     bpy.utils.register_class(MY_OT_runGeneration)
     bpy.utils.register_class(MY_OT_ExportSTL)
     bpy.utils.register_class(MY_OT_ExportOBJ)
+    bpy.utils.register_class(MY_OT_TestElevationAPI)
     bpy.utils.register_class(MY_PT_Generate)
     bpy.utils.register_class(MY_PT_Advanced)
     bpy.utils.register_class(MY_OT_OpenWebsite)
@@ -1810,6 +1854,7 @@ def unregister():
     bpy.utils.unregister_class(MY_OT_runGeneration)
     bpy.utils.unregister_class(MY_OT_ExportSTL)
     bpy.utils.unregister_class(MY_OT_ExportOBJ)
+    bpy.utils.unregister_class(MY_OT_TestElevationAPI)
     bpy.utils.unregister_class(MY_PT_Generate)
     bpy.utils.unregister_class(MY_PT_Advanced)
     bpy.utils.unregister_class(MY_OT_OpenWebsite)
