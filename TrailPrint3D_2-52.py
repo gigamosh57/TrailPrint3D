@@ -5152,14 +5152,22 @@ def calculate_polygon_area_2d(coords):
     return abs(area) * 0.5
 
 
-def _is_valid_ring(coords, min_area=0.0):
+def classify_ring_validity(coords, min_area=0.0):
     if not coords:
-        return False
+        return False, "empty"
     if coords[0] != coords[-1]:
-        return False
+        return False, "not_closed"
     if len(coords) < 4:
-        return False
-    return calculate_polygon_area_2d(coords) > min_area
+        return False, "too_few_points"
+    area = calculate_polygon_area_2d(coords)
+    if area <= min_area:
+        return False, "area_below_threshold"
+    return True, "ok"
+
+
+def _is_valid_ring(coords, min_area=0.0):
+    is_valid, _ = classify_ring_validity(coords, min_area=min_area)
+    return is_valid
 
 
 def _get_or_create_hole_temp_collection():
@@ -5350,19 +5358,56 @@ def coloring_main(map,kind = "WATER"):
                     inner_rings = body.get("inners", [])
 
                     valid_outers = []
-                    for ring in outer_rings:
+                    outer_rejections_by_reason = {
+                        "empty": 0,
+                        "not_closed": 0,
+                        "too_few_points": 0,
+                        "area_below_threshold": 0,
+                    }
+                    for outer_idx, ring in enumerate(outer_rings):
                         blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
-                        if _is_valid_ring(blender_ring, col_Area):
+                        is_valid_outer, rejection_reason = classify_ring_validity(blender_ring, col_Area)
+                        if is_valid_outer:
                             valid_outers.append(blender_ring)
                         else:
+                            outer_rejections_by_reason[rejection_reason] = outer_rejections_by_reason.get(rejection_reason, 0) + 1
                             waterDeleted += 1
+                            module_logger.info(
+                                "Outer ring rejected relation=%s kind=%s outer_idx=%s reason=%s ring_points=%s area=%.8f threshold=%.8f",
+                                relation_id,
+                                kind,
+                                outer_idx,
+                                rejection_reason,
+                                len(blender_ring),
+                                calculate_polygon_area_2d(blender_ring),
+                                col_Area,
+                            )
 
                     valid_inners = []
+                    inner_rejections_by_reason = {
+                        "empty": 0,
+                        "not_closed": 0,
+                        "too_few_points": 0,
+                        "area_below_threshold": 0,
+                    }
                     inner_area_threshold = max(1e-9, col_Area * 0.01)
-                    for ring in inner_rings:
+                    for inner_idx, ring in enumerate(inner_rings):
                         blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
-                        if _is_valid_ring(blender_ring, inner_area_threshold):
+                        is_valid_inner, rejection_reason = classify_ring_validity(blender_ring, inner_area_threshold)
+                        if is_valid_inner:
                             valid_inners.append(blender_ring)
+                        else:
+                            inner_rejections_by_reason[rejection_reason] = inner_rejections_by_reason.get(rejection_reason, 0) + 1
+                            module_logger.info(
+                                "Inner ring rejected relation=%s kind=%s inner_idx=%s reason=%s ring_points=%s area=%.8f threshold=%.8f",
+                                relation_id,
+                                kind,
+                                inner_idx,
+                                rejection_reason,
+                                len(blender_ring),
+                                calculate_polygon_area_2d(blender_ring),
+                                inner_area_threshold,
+                            )
 
                     holes_applied_total = 0
                     for j, outer_coords in enumerate(valid_outers):
@@ -5377,19 +5422,28 @@ def coloring_main(map,kind = "WATER"):
                         )
                         holes_applied_total += holes_applied
                         module_logger.info(
-                            "Hole boolean timing relation=%s outer_idx=%s kind=%s prep=%.4fs apply=%.4fs holes=%s",
+                            "Hole boolean timing relation=%s outer_idx=%s kind=%s prep=%.4fs apply=%.4fs holes=%s candidate_inners=%s",
                             relation_id,
                             j,
                             kind,
                             hole_prep_time,
                             hole_apply_time,
                             holes_applied,
+                            len(valid_inners),
                         )
+                        if holes_applied == 0 and valid_inners:
+                            module_logger.warning(
+                                "Hole boolean yielded zero holes despite valid inner rings relation=%s kind=%s outer_idx=%s valid_inners=%s",
+                                relation_id,
+                                kind,
+                                j,
+                                len(valid_inners),
+                            )
                         created_objects.append(tobj)
                         waterCreated += 1
 
                     module_logger.info(
-                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s",
+                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s outer_rejections_by_reason=%s inner_rejections_by_reason=%s inner_area_threshold=%.8f",
                         relation_id,
                         kind,
                         len(outer_rings),
@@ -5397,6 +5451,9 @@ def coloring_main(map,kind = "WATER"):
                         len(valid_outers),
                         len(valid_inners),
                         holes_applied_total,
+                        outer_rejections_by_reason,
+                        inner_rejections_by_reason,
+                        inner_area_threshold,
                     )
 
                 for i, element in enumerate(filtered_elements):
