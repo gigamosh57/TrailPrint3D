@@ -2517,6 +2517,9 @@ def setupColors():
     
     # Set base color
     bsdf.inputs["Base Color"].default_value = (0.0, 0.0, 0.8, 1.0)
+    bsdf.inputs["Alpha"].default_value = 0.75
+    mat.blend_method = 'BLEND'
+    mat.shadow_method = 'NONE'
     
     #-------------------------------------------------------------------------------------------------------------------
 
@@ -5355,6 +5358,7 @@ def coloring_main(map,kind = "WATER"):
     render_standalone_ways_only = True  # Debug fallback: keep standalone way rendering while suppressing relation-member duplicates.
     relation_member_ways_skipped = 0
     standalone_ways_rendered = 0
+    affected_relation_ids = set()
 
     if probe.get("ok"):
         module_logger.info("OSM probe kind=%s bbox=%s elements=%s estimated_bytes=%s", kind, global_bbox, probe["element_count"], probe["estimated_bytes"])
@@ -5418,6 +5422,8 @@ def coloring_main(map,kind = "WATER"):
 
                 for i, body in enumerate(bodies):
                     relation_id = body.get("relation_id")
+                    if relation_id is not None:
+                        affected_relation_ids.add(relation_id)
                     outer_rings = body.get("outers", [])
                     inner_rings = body.get("inners", [])
                     outer_rejections_by_reason = {
@@ -5734,6 +5740,9 @@ def coloring_main(map,kind = "WATER"):
 
         #recalculate normals again after the Boolean operation
         recalculateNormals(merged_object)
+        if merged_object.type == 'MESH':
+            merged_object.data.calc_normals()
+        module_logger.info("Post-boolean normals recalculated object=%s kind=%s", merged_object.name, kind)
 
         #Disabled for now
         if col_KeepManifold == 0 and 1 == 0:
@@ -5760,6 +5769,14 @@ def coloring_main(map,kind = "WATER"):
             mat = bpy.data.materials.get(kind)
             merged_object.data.materials.clear()
             merged_object.data.materials.append(mat)
+            _apply_surface_z_offset_policy(map, merged_object, kind)
+            _fix_water_material_settings(merged_object, kind)
+            _log_object_z_and_material(merged_object, f"{kind}_final", affected_relation_ids)
+            _log_object_z_and_material(map, "MAP_final", affected_relation_ids)
+            map_range = _mesh_world_z_range(map)
+            water_range = _mesh_world_z_range(merged_object)
+            if kind == "WATER" and map_range and water_range and water_range[1] >= map_range[0]:
+                module_logger.warning("Coplanar/overlap check kind=%s map_z=%s water_z=%s", kind, map_range, water_range)
         
         if col_PaintMap == False:
             export_to_STL(merged_object)
@@ -5783,6 +5800,55 @@ def coloring_main(map,kind = "WATER"):
         return merged_object
     else:
         return None
+
+
+
+def _mesh_world_z_range(obj):
+    if not obj or obj.type != 'MESH' or not obj.data or len(obj.data.vertices) == 0:
+        return None
+    zs = [(obj.matrix_world @ v.co).z for v in obj.data.vertices]
+    return (min(zs), max(zs))
+
+
+def _log_object_z_and_material(obj, label, relation_ids=None):
+    z_range = _mesh_world_z_range(obj)
+    mats = [slot.material.name for slot in obj.material_slots if slot.material]
+    module_logger.info(
+        "%s debug relation_ids=%s object=%s z_range=%s materials=%s",
+        label,
+        sorted(relation_ids) if relation_ids else [],
+        obj.name if obj else None,
+        z_range,
+        mats,
+    )
+
+
+def _apply_surface_z_offset_policy(map_obj, water_obj, kind):
+    """Apply deterministic non-coplanar separation between land(map) and water surfaces."""
+    if not map_obj or not water_obj or kind != "WATER":
+        return
+    epsilon = 0.02
+    # Keep water just below the land surface to avoid z-fighting/overdraw flicker.
+    for vert in water_obj.data.vertices:
+        vert.co.z -= epsilon
+    module_logger.info("Applied z-offset policy kind=%s object=%s epsilon=%.5f direction=water_below_land", kind, water_obj.name, epsilon)
+
+
+def _fix_water_material_settings(obj, kind):
+    if not obj or kind != "WATER":
+        return
+    for mat in obj.data.materials:
+        if not mat:
+            continue
+        # Stable defaults that reduce transparent overdraw masking artifacts.
+        mat.blend_method = 'BLEND'
+        mat.shadow_method = 'NONE'
+        mat.use_backface_culling = False
+        if hasattr(mat, 'show_transparent_back'):
+            mat.show_transparent_back = False
+        if hasattr(mat, 'use_depth_prepass'):
+            mat.use_depth_prepass = True
+        module_logger.info("Water material debug material=%s blend_method=%s shadow_method=%s", mat.name, mat.blend_method, mat.shadow_method)
 
 def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05):
     """
