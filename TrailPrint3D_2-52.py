@@ -5117,28 +5117,72 @@ def _is_valid_ring(coords, min_area=0.0):
     return calculate_polygon_area_2d(coords) > min_area
 
 
-def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
-    holes_applied = 0
-    for i, hole_coords in enumerate(hole_rings):
-        hole_obj = col_create_face_mesh(f"{name_prefix}_{i}", hole_coords)
-        if not hole_obj:
+def _get_or_create_hole_temp_collection():
+    coll_name = "_TP3D_HoleTemp"
+    coll = bpy.data.collections.get(coll_name)
+    if not coll:
+        coll = bpy.data.collections.new(coll_name)
+    scene_coll = bpy.context.scene.collection
+    if coll.name not in scene_coll.children:
+        scene_coll.children.link(coll)
+    return coll
+
+
+def _create_combined_hole_cutter(name, hole_rings, temp_collection):
+    bm = bmesh.new()
+    valid_count = 0
+    for ring in hole_rings:
+        if not _is_valid_ring(ring):
             continue
-        bool_mod = outer_obj.modifiers.new(name=f"hole_diff_{i}", type='BOOLEAN')
-        bool_mod.operation = 'DIFFERENCE'
-        bool_mod.solver = 'EXACT'
-        bool_mod.object = hole_obj
+        ring_no_close = ring[:-1]
+        if len(ring_no_close) < 3:
+            continue
+        verts = [bm.verts.new(c) for c in ring_no_close]
+        try:
+            bm.faces.new(verts)
+            valid_count += 1
+        except ValueError:
+            pass
 
-        ctx = bpy.context
-        bpy.ops.object.select_all(action='DESELECT')
-        outer_obj.select_set(True)
-        ctx.view_layer.objects.active = outer_obj
-        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+    if valid_count == 0:
+        bm.free()
+        return None, 0
 
-        hole_mesh = hole_obj.data
-        bpy.data.objects.remove(hole_obj, do_unlink=True)
-        bpy.data.meshes.remove(hole_mesh)
-        holes_applied += 1
-    return holes_applied
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
+    bm.free()
+
+    hole_obj = bpy.data.objects.new(name, mesh)
+    temp_collection.objects.link(hole_obj)
+    return hole_obj, valid_count
+
+
+def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
+    prep_started = time.perf_counter()
+    temp_collection = _get_or_create_hole_temp_collection()
+    hole_obj, holes_applied = _create_combined_hole_cutter(f"{name_prefix}_combined", hole_rings, temp_collection)
+    prep_elapsed = time.perf_counter() - prep_started
+
+    if not hole_obj:
+        return 0, prep_elapsed, 0.0
+
+    apply_started = time.perf_counter()
+    bool_mod = outer_obj.modifiers.new(name=f"{name_prefix}_diff", type='BOOLEAN')
+    bool_mod.operation = 'DIFFERENCE'
+    bool_mod.solver = 'EXACT'
+    bool_mod.object = hole_obj
+
+    ctx = bpy.context
+    bpy.ops.object.select_all(action='DESELECT')
+    outer_obj.select_set(True)
+    ctx.view_layer.objects.active = outer_obj
+    bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+    apply_elapsed = time.perf_counter() - apply_started
+
+    hole_mesh = hole_obj.data
+    bpy.data.objects.remove(hole_obj, do_unlink=True)
+    bpy.data.meshes.remove(hole_mesh)
+    return holes_applied, prep_elapsed, apply_elapsed
 
 def build_osm_nodes(data):
     nodes = {}
@@ -5281,12 +5325,21 @@ def coloring_main(map,kind = "WATER"):
                         if not tobj:
                             waterDeleted += 1
                             continue
-                        holes_applied = apply_hole_difference(
+                        holes_applied, hole_prep_time, hole_apply_time = apply_hole_difference(
                             tobj,
                             valid_inners,
                             name_prefix=f"Hole_{relation_id}_{i}_{j}"
                         )
                         holes_applied_total += holes_applied
+                        module_logger.info(
+                            "Hole boolean timing relation=%s outer_idx=%s kind=%s prep=%.4fs apply=%.4fs holes=%s",
+                            relation_id,
+                            j,
+                            kind,
+                            hole_prep_time,
+                            hole_apply_time,
+                            holes_applied,
+                        )
                         created_objects.append(tobj)
                         waterCreated += 1
 
