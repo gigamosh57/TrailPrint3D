@@ -5501,7 +5501,7 @@ def coloring_main(map,kind = "WATER"):
                             island_obj.data.materials.clear()
                             island_obj.data.materials.append(island_mat)
                         island_objects.append(island_obj)
-                        relation_debug_pairs.append((relation_id, island_obj, None))
+                        relation_debug_pairs.append((relation_id, island_obj.name, None))
                         island_objects_created += 1
 
                     for j, outer_coords in enumerate(valid_outers):
@@ -5786,8 +5786,11 @@ def coloring_main(map,kind = "WATER"):
             bpy.data.meshes.remove(mesh_data)
 
     if kind == "WATER":
-        for relation_id, land_obj, water_obj in relation_debug_pairs:
-            if water_obj is None:
+        for relation_id, land_obj_name, water_obj_name in relation_debug_pairs:
+            land_obj = bpy.data.objects.get(land_obj_name) if land_obj_name else None
+            if water_obj_name:
+                water_obj = bpy.data.objects.get(water_obj_name)
+            else:
                 water_obj = merged_object if "merged_object" in locals() else None
             _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=0.0005, water_offset=0.0)
 
@@ -5806,8 +5809,20 @@ def coloring_main(map,kind = "WATER"):
         return None
 
 
+
+def _is_valid_blender_object(obj):
+    if obj is None:
+        return False
+    try:
+        _ = obj.name
+        _ = obj.type
+        return True
+    except ReferenceError:
+        return False
+
+
 def _mesh_z_range(obj):
-    if not obj or obj.type != 'MESH' or not obj.data.vertices:
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data.vertices:
         return None, None
     zs = [v.co.z for v in obj.data.vertices]
     return min(zs), max(zs)
@@ -5815,11 +5830,11 @@ def _mesh_z_range(obj):
 
 def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=0.0005, water_offset=0.0):
     """Apply stable z-offsets so land/water are not coplanar after booleans."""
-    if land_obj and land_obj.type == 'MESH':
+    if _is_valid_blender_object(land_obj) and land_obj.type == 'MESH':
         for v in land_obj.data.vertices:
             v.co.z += land_offset
         land_obj.data.update()
-    if water_obj and water_obj.type == 'MESH' and water_offset != 0.0:
+    if _is_valid_blender_object(water_obj) and water_obj.type == 'MESH' and water_offset != 0.0:
         for v in water_obj.data.vertices:
             v.co.z += water_offset
         water_obj.data.update()
@@ -5842,8 +5857,8 @@ def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=
         coplanar,
         land_offset,
         water_offset,
-        [m.name for m in land_obj.data.materials] if land_obj and land_obj.type == 'MESH' else [],
-        [m.name for m in water_obj.data.materials] if water_obj and water_obj.type == 'MESH' else [],
+        [m.name for m in land_obj.data.materials] if _is_valid_blender_object(land_obj) and land_obj.type == 'MESH' else [],
+        [m.name for m in water_obj.data.materials] if _is_valid_blender_object(water_obj) and water_obj.type == 'MESH' else [],
     )
 
 
