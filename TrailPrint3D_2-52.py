@@ -5162,6 +5162,41 @@ def _is_valid_ring(coords, min_area=0.0):
     return calculate_polygon_area_2d(coords) > min_area
 
 
+def _normalize_ring_for_validation(coords, close_tolerance=1e-5):
+    if not coords:
+        return []
+
+    deduped = [coords[0]]
+    for pt in coords[1:]:
+        if pt != deduped[-1]:
+            deduped.append(pt)
+
+    if len(deduped) >= 2:
+        x0, y0, z0 = deduped[0]
+        x1, y1, z1 = deduped[-1]
+        if deduped[0] != deduped[-1]:
+            dx = x1 - x0
+            dy = y1 - y0
+            dz = z1 - z0
+            if (dx * dx + dy * dy + dz * dz) <= (close_tolerance * close_tolerance):
+                deduped.append(deduped[0])
+
+    return deduped
+
+
+def _validate_ring_with_reason(coords, min_area=0.0):
+    if not coords:
+        return False, 0.0, "too_few_points"
+    if coords[0] != coords[-1]:
+        return False, 0.0, "not_closed"
+    if len(coords) < 4:
+        return False, 0.0, "too_few_points"
+    area = calculate_polygon_area_2d(coords)
+    if area <= min_area:
+        return False, area, "area_below_threshold"
+    return True, area, None
+
+
 def _get_or_create_hole_temp_collection():
     coll_name = "_TP3D_HoleTemp"
     coll = bpy.data.collections.get(coll_name)
@@ -5348,14 +5383,34 @@ def coloring_main(map,kind = "WATER"):
                     relation_id = body.get("relation_id")
                     outer_rings = body.get("outers", [])
                     inner_rings = body.get("inners", [])
+                    outer_rejections_by_reason = {
+                        "not_closed": 0,
+                        "too_few_points": 0,
+                        "area_below_threshold": 0,
+                    }
+                    multipolygon_outer_area_threshold = max(1e-9, col_Area * 0.1)
 
                     valid_outers = []
                     for ring in outer_rings:
                         blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
-                        if _is_valid_ring(blender_ring, col_Area):
-                            valid_outers.append(blender_ring)
+                        normalized_ring = _normalize_ring_for_validation(blender_ring)
+                        is_valid, ring_area, rejection_reason = _validate_ring_with_reason(
+                            normalized_ring,
+                            multipolygon_outer_area_threshold,
+                        )
+                        if is_valid:
+                            valid_outers.append(normalized_ring)
                         else:
                             waterDeleted += 1
+                            if rejection_reason in outer_rejections_by_reason:
+                                outer_rejections_by_reason[rejection_reason] += 1
+                            module_logger.debug(
+                                "Rejected outer ring relation=%s points=%s area=%.9f reason=%s",
+                                relation_id,
+                                len(normalized_ring),
+                                ring_area,
+                                rejection_reason,
+                            )
 
                     valid_inners = []
                     inner_area_threshold = max(1e-9, col_Area * 0.01)
@@ -5389,7 +5444,7 @@ def coloring_main(map,kind = "WATER"):
                         waterCreated += 1
 
                     module_logger.info(
-                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s",
+                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s outer_rejections_by_reason=%s",
                         relation_id,
                         kind,
                         len(outer_rings),
@@ -5397,6 +5452,7 @@ def coloring_main(map,kind = "WATER"):
                         len(valid_outers),
                         len(valid_inners),
                         holes_applied_total,
+                        outer_rejections_by_reason,
                     )
 
                 for i, element in enumerate(filtered_elements):
