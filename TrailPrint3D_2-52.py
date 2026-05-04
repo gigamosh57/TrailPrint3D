@@ -5190,6 +5190,10 @@ def coloring_main(map,kind = "WATER"):
     request_count = 0
     seen_way_ids = set()
     seen_relation_ids = set()
+    relation_member_way_ids = set()
+    render_standalone_ways_only = True  # Debug fallback: keep standalone way rendering while suppressing relation-member duplicates.
+    relation_member_ways_skipped = 0
+    standalone_ways_rendered = 0
 
     if probe.get("ok"):
         module_logger.info("OSM probe kind=%s bbox=%s elements=%s estimated_bytes=%s", kind, global_bbox, probe["element_count"], probe["estimated_bytes"])
@@ -5242,6 +5246,9 @@ def coloring_main(map,kind = "WATER"):
                         if el["id"] in seen_relation_ids:
                             continue
                         seen_relation_ids.add(el["id"])
+                        for member in el.get("members", []):
+                            if member.get("type") == "way" and "ref" in member:
+                                relation_member_way_ids.add(member["ref"])
                     filtered_elements.append(el)
                 module_logger.info("OSM tile telemetry kind=%s tile=%s/%s bbox=%s count=%s elapsed=%.3fs retries=%s", kind, idx, len(bboxes), bbox, len(filtered_elements), time.perf_counter() - started, retries)
                 nodes = build_osm_nodes({"elements": filtered_elements})
@@ -5299,6 +5306,11 @@ def coloring_main(map,kind = "WATER"):
                     if element['type'] != 'way':
                         waterDeleted += 1
                         continue
+                    if element.get("id") in relation_member_way_ids:
+                        relation_member_ways_skipped += 1
+                        continue
+                    if not render_standalone_ways_only:
+                        continue
 
                     coords = []
                     for node_id in element.get('nodes', []):
@@ -5319,16 +5331,25 @@ def coloring_main(map,kind = "WATER"):
                         tobj = col_create_face_mesh(f"coloredObject_{i}", coords)
                         created_objects.append(tobj)
                         waterCreated += 1
+                        standalone_ways_rendered += 1
                     else:
                         tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
                         created_objects.append(tobj)
                         waterCreated += 1
+                        standalone_ways_rendered += 1
                     
                 time.sleep(1)  # Pause to prevent request throttling
             
     # --- Merge all created water meshes into one ---
 
     print(f"{kind} Objects Created: {waterCreated}, Objects Ignored: {waterDeleted}")
+    module_logger.info(
+        "Duplicate fill telemetry kind=%s relation_member_ways_skipped=%s standalone_ways_rendered=%s relation_member_way_ids=%s",
+        kind,
+        relation_member_ways_skipped,
+        standalone_ways_rendered,
+        len(relation_member_way_ids),
+    )
 
     #print(f"Creating {kind} Objects")
     if created_objects:
