@@ -5247,12 +5247,28 @@ def _create_combined_hole_cutter(name, hole_rings, temp_collection):
 
 def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
     prep_started = time.perf_counter()
+    candidate_holes = len(hole_rings)
     temp_collection = _get_or_create_hole_temp_collection()
     hole_obj, holes_applied = _create_combined_hole_cutter(f"{name_prefix}_combined", hole_rings, temp_collection)
     prep_elapsed = time.perf_counter() - prep_started
 
+    telemetry = {
+        "candidate_holes": candidate_holes,
+        "cutter_faces_created": holes_applied,
+        "boolean_changed_mesh": False,
+        "delta_faces": 0,
+        "delta_edges": 0,
+        "prep": prep_elapsed,
+        "apply": 0.0,
+    }
+
     if not hole_obj:
-        return 0, prep_elapsed, 0.0
+        return telemetry
+
+    outer_mesh = outer_obj.data
+    pre_faces = len(outer_mesh.polygons)
+    pre_edges = len(outer_mesh.edges)
+    pre_verts = len(outer_mesh.vertices)
 
     apply_started = time.perf_counter()
     bool_mod = outer_obj.modifiers.new(name=f"{name_prefix}_diff", type='BOOLEAN')
@@ -5267,10 +5283,23 @@ def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
     bpy.ops.object.modifier_apply(modifier=bool_mod.name)
     apply_elapsed = time.perf_counter() - apply_started
 
+    post_faces = len(outer_mesh.polygons)
+    post_edges = len(outer_mesh.edges)
+    post_verts = len(outer_mesh.vertices)
+
+    telemetry["delta_faces"] = post_faces - pre_faces
+    telemetry["delta_edges"] = post_edges - pre_edges
+    telemetry["boolean_changed_mesh"] = (
+        telemetry["delta_faces"] != 0 or
+        telemetry["delta_edges"] != 0 or
+        (post_verts - pre_verts) != 0
+    )
+    telemetry["apply"] = apply_elapsed
+
     hole_mesh = hole_obj.data
     bpy.data.objects.remove(hole_obj, do_unlink=True)
     bpy.data.meshes.remove(hole_mesh)
-    return holes_applied, prep_elapsed, apply_elapsed
+    return telemetry
 
 def build_osm_nodes(data):
     nodes = {}
@@ -5456,29 +5485,41 @@ def coloring_main(map,kind = "WATER"):
                         if not tobj:
                             waterDeleted += 1
                             continue
-                        holes_applied, hole_prep_time, hole_apply_time = apply_hole_difference(
+                        hole_telemetry = apply_hole_difference(
                             tobj,
                             valid_inners,
                             name_prefix=f"Hole_{relation_id}_{i}_{j}"
                         )
-                        holes_applied_total += holes_applied
+                        holes_applied_total += hole_telemetry["cutter_faces_created"]
                         module_logger.info(
-                            "Hole boolean timing relation=%s outer_idx=%s kind=%s prep=%.4fs apply=%.4fs holes=%s candidate_inners=%s",
+                            "Hole boolean telemetry relation=%s outer_idx=%s kind=%s prep=%.4fs apply=%.4fs candidate_holes=%s cutter_faces_created=%s boolean_changed_mesh=%s delta_faces=%s delta_edges=%s",
                             relation_id,
                             j,
                             kind,
-                            hole_prep_time,
-                            hole_apply_time,
-                            holes_applied,
-                            len(valid_inners),
+                            hole_telemetry["prep"],
+                            hole_telemetry["apply"],
+                            hole_telemetry["candidate_holes"],
+                            hole_telemetry["cutter_faces_created"],
+                            hole_telemetry["boolean_changed_mesh"],
+                            hole_telemetry["delta_faces"],
+                            hole_telemetry["delta_edges"],
                         )
-                        if holes_applied == 0 and valid_inners:
+                        if hole_telemetry["cutter_faces_created"] == 0 and valid_inners:
                             module_logger.warning(
                                 "Hole boolean yielded zero holes despite valid inner rings relation=%s kind=%s outer_idx=%s valid_inners=%s",
                                 relation_id,
                                 kind,
                                 j,
                                 len(valid_inners),
+                            )
+                        if hole_telemetry["cutter_faces_created"] > 0 and not hole_telemetry["boolean_changed_mesh"]:
+                            module_logger.warning(
+                                "Hole boolean created cutter faces but did not change outer mesh relation=%s kind=%s outer_idx=%s cutter_faces_created=%s candidate_holes=%s",
+                                relation_id,
+                                kind,
+                                j,
+                                hole_telemetry["cutter_faces_created"],
+                                hole_telemetry["candidate_holes"],
                             )
                         created_objects.append(tobj)
                         waterCreated += 1
