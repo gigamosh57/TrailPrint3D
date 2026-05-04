@@ -5480,6 +5480,28 @@ def coloring_main(map,kind = "WATER"):
                             )
 
                     holes_applied_total = 0
+                    island_objects_created = 0
+                    island_objects_failed = 0
+
+                    # Explicitly create visible island meshes from valid inner rings so islands remain
+                    # present even when hole visibility is affected by viewport/render filtering.
+                    island_objects = []
+                    for inner_idx, inner_coords in enumerate(valid_inners):
+                        island_obj = col_create_face_mesh(f"Island_{relation_id}_{i}_{inner_idx}", inner_coords)
+                        if not island_obj:
+                            island_objects_failed += 1
+                            continue
+                        island_obj.hide_set(False)
+                        island_obj.hide_viewport = False
+                        island_obj.hide_render = False
+                        writeMetadata(island_obj, "MAP")
+                        island_mat = bpy.data.materials.get("MAP") or bpy.data.materials.get("CITY") or bpy.data.materials.get("FOREST")
+                        if island_mat:
+                            island_obj.data.materials.clear()
+                            island_obj.data.materials.append(island_mat)
+                        island_objects.append(island_obj)
+                        island_objects_created += 1
+
                     for j, outer_coords in enumerate(valid_outers):
                         tobj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}", outer_coords)
                         if not tobj:
@@ -5524,8 +5546,17 @@ def coloring_main(map,kind = "WATER"):
                         created_objects.append(tobj)
                         waterCreated += 1
 
+                    if holes_applied_total > 0 and island_objects_created == 0:
+                        module_logger.warning(
+                            "Holes were applied but no island objects were created relation=%s kind=%s holes_applied=%s valid_inners=%s",
+                            relation_id,
+                            kind,
+                            holes_applied_total,
+                            len(valid_inners),
+                        )
+
                     module_logger.info(
-                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s outer_rejections_by_reason=%s inner_rejections_by_reason=%s inner_area_threshold=%.8f",
+                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s island_objects_created=%s island_objects_failed=%s outer_rejections_by_reason=%s inner_rejections_by_reason=%s inner_area_threshold=%.8f",
                         relation_id,
                         kind,
                         len(outer_rings),
@@ -5533,6 +5564,8 @@ def coloring_main(map,kind = "WATER"):
                         len(valid_outers),
                         len(valid_inners),
                         holes_applied_total,
+                        island_objects_created,
+                        island_objects_failed,
                         outer_rejections_by_reason,
                         inner_rejections_by_reason,
                         inner_area_threshold,
