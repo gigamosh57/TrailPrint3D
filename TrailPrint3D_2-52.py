@@ -5170,6 +5170,41 @@ def _is_valid_ring(coords, min_area=0.0):
     return is_valid
 
 
+def _normalize_ring_for_validation(coords, close_tolerance=1e-5):
+    if not coords:
+        return []
+
+    deduped = [coords[0]]
+    for pt in coords[1:]:
+        if pt != deduped[-1]:
+            deduped.append(pt)
+
+    if len(deduped) >= 2:
+        x0, y0, z0 = deduped[0]
+        x1, y1, z1 = deduped[-1]
+        if deduped[0] != deduped[-1]:
+            dx = x1 - x0
+            dy = y1 - y0
+            dz = z1 - z0
+            if (dx * dx + dy * dy + dz * dz) <= (close_tolerance * close_tolerance):
+                deduped.append(deduped[0])
+
+    return deduped
+
+
+def _validate_ring_with_reason(coords, min_area=0.0):
+    if not coords:
+        return False, 0.0, "too_few_points"
+    if coords[0] != coords[-1]:
+        return False, 0.0, "not_closed"
+    if len(coords) < 4:
+        return False, 0.0, "too_few_points"
+    area = calculate_polygon_area_2d(coords)
+    if area <= min_area:
+        return False, area, "area_below_threshold"
+    return True, area, None
+
+
 def _get_or_create_hole_temp_collection():
     coll_name = "_TP3D_HoleTemp"
     coll = bpy.data.collections.get(coll_name)
@@ -5356,6 +5391,12 @@ def coloring_main(map,kind = "WATER"):
                     relation_id = body.get("relation_id")
                     outer_rings = body.get("outers", [])
                     inner_rings = body.get("inners", [])
+                    outer_rejections_by_reason = {
+                        "not_closed": 0,
+                        "too_few_points": 0,
+                        "area_below_threshold": 0,
+                    }
+                    multipolygon_outer_area_threshold = max(1e-9, col_Area * 0.1)
 
                     valid_outers = []
                     outer_rejections_by_reason = {
