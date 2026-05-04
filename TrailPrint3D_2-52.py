@@ -5354,6 +5354,7 @@ def coloring_main(map,kind = "WATER"):
     relation_member_way_ids = set()
     render_standalone_ways_only = True  # Debug fallback: keep standalone way rendering while suppressing relation-member duplicates.
     relation_member_ways_skipped = 0
+    relation_debug_pairs = []
     standalone_ways_rendered = 0
 
     if probe.get("ok"):
@@ -5500,6 +5501,7 @@ def coloring_main(map,kind = "WATER"):
                             island_obj.data.materials.clear()
                             island_obj.data.materials.append(island_mat)
                         island_objects.append(island_obj)
+                        relation_debug_pairs.append((relation_id, island_obj.name, None))
                         island_objects_created += 1
 
                     for j, outer_coords in enumerate(valid_outers):
@@ -5760,6 +5762,13 @@ def coloring_main(map,kind = "WATER"):
             mat = bpy.data.materials.get(kind)
             merged_object.data.materials.clear()
             merged_object.data.materials.append(mat)
+            recalculateNormals(merged_object)
+            module_logger.info(
+                "Post-boolean water normals refreshed object=%s kind=%s material_slots=%s",
+                merged_object.name,
+                kind,
+                [m.name for m in merged_object.data.materials],
+            )
         
         if col_PaintMap == False:
             export_to_STL(merged_object)
@@ -5769,6 +5778,15 @@ def coloring_main(map,kind = "WATER"):
             mesh_data = merged_object.data
             bpy.data.objects.remove(merged_object, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
+
+    if kind == "WATER":
+        for relation_id, land_obj_name, water_obj_name in relation_debug_pairs:
+            land_obj = bpy.data.objects.get(land_obj_name) if land_obj_name else None
+            if water_obj_name:
+                water_obj = bpy.data.objects.get(water_obj_name)
+            else:
+                water_obj = merged_object if "merged_object" in locals() else None
+            _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=0.0005, water_offset=0.0)
 
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':  # make sure it's a 3D Viewport
@@ -5783,6 +5801,60 @@ def coloring_main(map,kind = "WATER"):
         return merged_object
     else:
         return None
+
+
+
+def _is_valid_blender_object(obj):
+    if obj is None:
+        return False
+    try:
+        _ = obj.name
+        _ = obj.type
+        return True
+    except ReferenceError:
+        return False
+
+
+def _mesh_z_range(obj):
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data.vertices:
+        return None, None
+    zs = [v.co.z for v in obj.data.vertices]
+    return min(zs), max(zs)
+
+
+def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=0.0005, water_offset=0.0):
+    """Apply stable z-offsets so land/water are not coplanar after booleans."""
+    if _is_valid_blender_object(land_obj) and land_obj.type == 'MESH':
+        for v in land_obj.data.vertices:
+            v.co.z += land_offset
+        land_obj.data.update()
+    if _is_valid_blender_object(water_obj) and water_obj.type == 'MESH' and water_offset != 0.0:
+        for v in water_obj.data.vertices:
+            v.co.z += water_offset
+        water_obj.data.update()
+
+    land_min, land_max = _mesh_z_range(land_obj)
+    water_min, water_max = _mesh_z_range(water_obj)
+    coplanar = (
+        land_min is not None and water_min is not None and
+        abs(land_min - water_min) < 1e-7 and abs(land_max - water_max) < 1e-7
+    )
+    module_logger.info(
+        "Relation final z-range relation=%s land_obj=%s water_obj=%s land_range=(%s,%s) water_range=(%s,%s) coplanar=%s land_offset=%.7f water_offset=%.7f land_mats=%s water_mats=%s",
+        relation_id,
+        getattr(land_obj, 'name', None),
+        getattr(water_obj, 'name', None),
+        land_min,
+        land_max,
+        water_min,
+        water_max,
+        coplanar,
+        land_offset,
+        water_offset,
+        [m.name for m in land_obj.data.materials] if _is_valid_blender_object(land_obj) and land_obj.type == 'MESH' else [],
+        [m.name for m in water_obj.data.materials] if _is_valid_blender_object(water_obj) and water_obj.type == 'MESH' else [],
+    )
+
 
 def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05):
     """
