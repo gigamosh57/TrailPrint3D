@@ -5407,7 +5407,7 @@ def coloring_main(map,kind = "WATER"):
                     }
                     for outer_idx, ring in enumerate(outer_rings):
                         blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
-                        is_valid_outer, rejection_reason = classify_ring_validity(blender_ring, col_Area)
+                        is_valid_outer, rejection_reason = classify_ring_validity(blender_ring, multipolygon_outer_area_threshold)
                         if is_valid_outer:
                             valid_outers.append(blender_ring)
                         else:
@@ -5421,7 +5421,7 @@ def coloring_main(map,kind = "WATER"):
                                 rejection_reason,
                                 len(blender_ring),
                                 calculate_polygon_area_2d(blender_ring),
-                                col_Area,
+                                multipolygon_outer_area_threshold,
                             )
 
                     valid_inners = []
