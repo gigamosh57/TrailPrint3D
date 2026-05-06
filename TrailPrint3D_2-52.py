@@ -5120,20 +5120,43 @@ def col_create_face_mesh(name, coords):
 
     if len(coords) < 3:
         return  # Need at least 3 points for a face
-    
+
 
     mesh = bpy.data.meshes.new(name)
     tobj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(tobj)
 
     bm = bmesh.new()
-    verts = [bm.verts.new(c) for c in coords]
+    # Multipolygon rings are often explicitly closed (first point == last point).
+    # Remove duplicate closing vertex before face creation to avoid invalid ngons.
+    face_coords = list(coords)
+    if len(face_coords) > 1 and face_coords[0] == face_coords[-1]:
+        face_coords = face_coords[:-1]
+
+    if len(face_coords) < 3:
+        bm.free()
+        return tobj
+
+    verts = [bm.verts.new(c) for c in face_coords]
     try:
         bm.faces.new(verts)
-        pass
     except ValueError:
-        print(ValueError)
-        pass  # face might already exist or be invalid
+        # Fallback for concave/complex rings where direct ngon creation fails.
+        # Build boundary edges and let Blender triangulate/fill the polygon.
+        edges = []
+        for i in range(len(verts)):
+            v0 = verts[i]
+            v1 = verts[(i + 1) % len(verts)]
+            try:
+                edges.append(bm.edges.new((v0, v1)))
+            except ValueError:
+                # Edge may already exist.
+                pass
+        if edges:
+            try:
+                bmesh.ops.triangle_fill(bm, edges=edges, use_beauty=True, use_dissolve=True)
+            except Exception:
+                pass
     bm.to_mesh(mesh)
     bm.free()
     return tobj
