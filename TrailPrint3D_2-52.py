@@ -5886,6 +5886,9 @@ def _mesh_z_range(obj):
 
 def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=0.0005, water_offset=0.0):
     """Apply stable z-offsets so land/water are not coplanar after booleans."""
+    def _safe_obj_name(obj):
+        return obj.name if _is_valid_blender_object(obj) else None
+
     if _is_valid_blender_object(land_obj) and land_obj.type == 'MESH':
         for v in land_obj.data.vertices:
             v.co.z += land_offset
@@ -5904,8 +5907,8 @@ def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=
     module_logger.info(
         "Relation final z-range relation=%s land_obj=%s water_obj=%s land_range=(%s,%s) water_range=(%s,%s) coplanar=%s land_offset=%.7f water_offset=%.7f land_mats=%s water_mats=%s",
         relation_id,
-        getattr(land_obj, 'name', None),
-        getattr(water_obj, 'name', None),
+        _safe_obj_name(land_obj),
+        _safe_obj_name(water_obj),
         land_min,
         land_max,
         water_min,
