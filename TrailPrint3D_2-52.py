@@ -5854,14 +5854,46 @@ def coloring_main(map,kind = "WATER"):
 def paint_pending_islands_on_map(map_obj):
     global pending_island_paint_objects
     if not pending_island_paint_objects:
+        module_logger.info("Island paint pass skipped: no pending islands for map=%s", map_obj.name if map_obj else None)
         return
 
     for island_obj in pending_island_paint_objects:
         if _is_valid_blender_object(island_obj) and island_obj.type == 'MESH':
+            island_min_z, island_max_z = _mesh_z_range(island_obj)
+            map_min_z, map_max_z = _mesh_z_range(map_obj)
+            island_mat_names = [m.name for m in island_obj.data.materials] if island_obj.data else []
+            map_mat_names = [m.name for m in map_obj.data.materials] if map_obj and map_obj.data else []
+            module_logger.info(
+                "Island final paint debug: map=%s island=%s island_obj_type=%s island_verts=%s island_polys=%s island_z_range=(%s,%s) map_z_range=(%s,%s) island_loc=(%.6f,%.6f,%.6f) map_loc=(%.6f,%.6f,%.6f) island_mats=%s map_mats=%s",
+                map_obj.name if map_obj else None,
+                island_obj.name,
+                island_obj.get("Object type") if "Object type" in island_obj else None,
+                len(island_obj.data.vertices) if island_obj.data else 0,
+                len(island_obj.data.polygons) if island_obj.data else 0,
+                island_min_z,
+                island_max_z,
+                map_min_z,
+                map_max_z,
+                island_obj.location.x,
+                island_obj.location.y,
+                island_obj.location.z,
+                map_obj.location.x if map_obj else 0.0,
+                map_obj.location.y if map_obj else 0.0,
+                map_obj.location.z if map_obj else 0.0,
+                island_mat_names,
+                map_mat_names,
+            )
             color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE")
             mesh_data = island_obj.data
             bpy.data.objects.remove(island_obj, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
+        else:
+            module_logger.warning(
+                "Island final paint skipped invalid island object: island=%s valid=%s type=%s",
+                getattr(island_obj, "name", None),
+                _is_valid_blender_object(island_obj),
+                getattr(island_obj, "type", None),
+            )
     pending_island_paint_objects = []
 
 
