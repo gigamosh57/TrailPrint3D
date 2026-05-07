@@ -5858,7 +5858,7 @@ def paint_pending_islands_on_map(map_obj):
 
     for island_obj in pending_island_paint_objects:
         if _is_valid_blender_object(island_obj) and island_obj.type == 'MESH':
-            color_map_faces_by_terrain(map_obj, island_obj)
+            color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE")
             mesh_data = island_obj.data
             bpy.data.objects.remove(island_obj, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
@@ -5921,7 +5921,7 @@ def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=
     )
 
 
-def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05):
+def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_material_name=None):
     """
     Loops through every face of map_obj.
     If face is facing upwards, raycasts upwards to see if terrain_obj is above.
@@ -5952,11 +5952,19 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05):
     bvh = bvhtree.BVHTree.FromPolygons(verts, polys)
 
     # Get or create a material for terrain color
-    if terrain_obj.active_material:
-        mat = terrain_obj.active_material
+    if paint_material_name:
+        mat = bpy.data.materials.get(paint_material_name)
+        if mat is None:
+            print(f"Paint override material '{paint_material_name}' not found. Falling back to terrain material.")
     else:
-        mat = bpy.data.materials.new(name="TerrainColor")
-        terrain_obj.data.materials.append(mat)
+        mat = None
+
+    if mat is None:
+        if terrain_obj.active_material:
+            mat = terrain_obj.active_material
+        else:
+            mat = bpy.data.materials.new(name="TerrainColor")
+            terrain_obj.data.materials.append(mat)
 
     # Make sure Map has material slots
     if mat.name not in [m.name for m in map_mesh.materials]:
