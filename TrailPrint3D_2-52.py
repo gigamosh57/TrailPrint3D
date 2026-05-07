@@ -5978,8 +5978,9 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     bm.from_mesh(map_mesh)
     bm.faces.ensure_lookup_table()
 
-    # Build BVH tree for Terrain
-    verts = [v.co for v in terrain_mesh.vertices]
+    # Build BVH tree for Terrain in world space
+    terrain_world = terrain_obj.matrix_world
+    verts = [terrain_world @ v.co for v in terrain_mesh.vertices]
     polys = [p.vertices for p in terrain_mesh.polygons]
     bvh = bvhtree.BVHTree.FromPolygons(verts, polys)
 
@@ -6005,14 +6006,27 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
 
     up = Vector((0, 0, 1))
     colored_count = 0
+    debug_samples = 5
+    debug_every = max(1, len(bm.faces) // debug_samples)
+    map_world = map_obj.matrix_world
+    map_normal_matrix = map_world.to_3x3().inverted().transposed()
 
-    for f in bm.faces:
-        normal = f.normal.normalized()
+    for i, f in enumerate(bm.faces):
+        normal = (map_normal_matrix @ f.normal).normalized()
         dot = normal.dot(up)
         # Only consider faces facing upward
         if dot > up_threshold:
             center = f.calc_center_median()
-            loc, norm, idx, dist = bvh.ray_cast(center, up,1000)
+            center_world = map_world @ center
+            ray_dir = normal
+            loc, norm, idx, dist = bvh.ray_cast(center_world, ray_dir, 1000)
+
+            if i % debug_every == 0:
+                print(
+                    f"[terrain paint debug] face={i} center_world={tuple(round(v, 4) for v in center_world)} "
+                    f"ray_dir={tuple(round(v, 4) for v in ray_dir)} "
+                    f"hit={'yes' if loc is not None else 'no'} dist={round(dist, 4) if dist is not None else None}"
+                )
 
             if loc is not None and dist > 0:
                 # Assign terrain material to this face
