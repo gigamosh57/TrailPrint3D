@@ -129,6 +129,7 @@ objWater = None
 objForest = None
 objCity = None
 objGlacier = None
+pending_island_paint_objects = []
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -5362,6 +5363,7 @@ def coloring_main(map,kind = "WATER"):
     waterDeleted = 0
     waterCreated = 0
     created_objects = []
+    island_objects_to_paint = []
     global_bbox = (minLat, minLon, maxLat, maxLon)
     tile_lat, tile_lon = derive_osm_tile_size_from_scale(global_bbox, num_subdivisions, scaleHor if scaleHor else 1.0)
     probe = _probe_osm_payload(global_bbox, kind)
@@ -5524,6 +5526,7 @@ def coloring_main(map,kind = "WATER"):
                             island_obj.data.materials.clear()
                             island_obj.data.materials.append(island_mat)
                         island_objects.append(island_obj)
+                        island_objects_to_paint.append(island_obj)
                         relation_debug_pairs.append((relation_id, island_obj.name, None))
                         island_objects_created += 1
 
@@ -5808,6 +5811,10 @@ def coloring_main(map,kind = "WATER"):
             bpy.data.objects.remove(merged_object, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
 
+    global pending_island_paint_objects
+    if kind == "WATER" and col_PaintMap == True and island_objects_to_paint:
+        pending_island_paint_objects.extend(island_objects_to_paint)
+
     if kind == "WATER":
         for relation_id, land_obj_name, water_obj_name in relation_debug_pairs:
             land_obj = bpy.data.objects.get(land_obj_name) if land_obj_name else None
@@ -5830,6 +5837,20 @@ def coloring_main(map,kind = "WATER"):
         return merged_object
     else:
         return None
+
+
+def paint_pending_islands_on_map(map_obj):
+    global pending_island_paint_objects
+    if not pending_island_paint_objects:
+        return
+
+    for island_obj in pending_island_paint_objects:
+        if _is_valid_blender_object(island_obj) and island_obj.type == 'MESH':
+            color_map_faces_by_terrain(map_obj, island_obj)
+            mesh_data = island_obj.data
+            bpy.data.objects.remove(island_obj, do_unlink=True)
+            bpy.data.meshes.remove(mesh_data)
+    pending_island_paint_objects = []
 
 
 
@@ -7142,6 +7163,10 @@ def runGeneration(type):
         objCity = coloring_main(obj, "CITY")
     if col_glActive == 1:
         objGlacier = coloring_main(obj, "GLACIER")
+
+    # Paint islands after all other map features so islands keep base land color.
+    if bpy.context.scene.tp3d.col_PaintMap == 1:
+        paint_pending_islands_on_map(obj)
 
 
     
