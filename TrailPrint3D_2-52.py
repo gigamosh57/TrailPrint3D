@@ -5176,6 +5176,79 @@ def calculate_polygon_area_2d(coords):
     return abs(area) * 0.5
 
 
+
+
+def _compute_effective_min_area(kind, base_area):
+    threshold = max(1e-9, float(base_area or 0.0))
+    if kind != "WATER":
+        return threshold
+
+    try:
+        bbox = (minLat, minLon, maxLat, maxLon)
+        south_west = convert_to_blender_coordinates(bbox[0], bbox[1], 0, 0)
+        north_east = convert_to_blender_coordinates(bbox[2], bbox[3], 0, 0)
+        width = abs(north_east[0] - south_west[0])
+        height = abs(north_east[1] - south_west[1])
+        map_extent_area = max(1e-9, width * height)
+    except Exception:
+        map_extent_area = 0.0
+
+    # Dynamic floor for tiny sliver polygons. Scales with map extent and horizontal scaling.
+    scale_factor = max(1.0, float(scaleHor) if scaleHor else 1.0)
+    extent_floor = (map_extent_area / (35000.0 * scale_factor)) if map_extent_area > 0 else 0.0
+    return max(threshold, extent_floor)
+
+
+def _remove_small_mesh_islands(obj, min_area_threshold):
+    if not obj or obj.type != 'MESH' or not obj.data:
+        return 0, None
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+
+    face_tags = set()
+    dropped = 0
+    kept_areas = []
+
+    for face in bm.faces:
+        face.tag = False
+
+    for face in bm.faces:
+        if face.index in face_tags:
+            continue
+        stack = [face]
+        island_faces = []
+        island_face_area = 0.0
+        while stack:
+            f = stack.pop()
+            if f.index in face_tags:
+                continue
+            face_tags.add(f.index)
+            island_faces.append(f)
+            fa = f.calc_area()
+            island_face_area += fa
+            for edge in f.edges:
+                for linked in edge.link_faces:
+                    if linked.index not in face_tags:
+                        stack.append(linked)
+
+        if island_face_area < min_area_threshold:
+            dropped += 1
+            for f in island_faces:
+                f.tag = True
+        else:
+            kept_areas.append(island_face_area)
+
+    if any(f.tag for f in bm.faces):
+        bmesh.ops.delete(bm, geom=[f for f in bm.faces if f.tag], context='FACES')
+        bm.to_mesh(obj.data)
+        obj.data.update()
+
+    bm.free()
+    return dropped, (min(kept_areas) if kept_areas else None)
+
 def classify_ring_validity(coords, min_area=0.0):
     if not coords:
         return False, "empty"
@@ -5348,6 +5421,7 @@ def coloring_main(map,kind = "WATER"):
         col_Area = (bpy.context.scene.tp3d.col_glArea)
     
     col_PaintMap = (bpy.context.scene.tp3d.col_PaintMap)
+    min_area_effective = _compute_effective_min_area(kind, col_Area)
 
     global exportformat
     if col_PaintMap == True:
@@ -5451,7 +5525,7 @@ def coloring_main(map,kind = "WATER"):
                         "too_few_points": 0,
                         "area_below_threshold": 0,
                     }
-                    multipolygon_outer_area_threshold = max(1e-9, col_Area * 0.1)
+                    multipolygon_outer_area_threshold = min_area_effective
 
                     valid_outers = []
                     outer_rejections_by_reason = {
@@ -5486,7 +5560,7 @@ def coloring_main(map,kind = "WATER"):
                         "too_few_points": 0,
                         "area_below_threshold": 0,
                     }
-                    inner_area_threshold = max(1e-9, col_Area * 0.01)
+                    inner_area_threshold = min_area_effective
                     for inner_idx, ring in enumerate(inner_rings):
                         blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
                         is_valid_inner, rejection_reason = classify_ring_validity(blender_ring, inner_area_threshold)
@@ -5626,7 +5700,7 @@ def coloring_main(map,kind = "WATER"):
                             coords.append(coord)
                     tArea = calculate_polygon_area_2d(coords)
                     #print(f"tArea2: {tArea}")
-                    if len(coords) < 2 or tArea < col_Area:
+                    if len(coords) < 2 or tArea < min_area_effective:
                         waterDeleted += 1
                         continue
                     
@@ -5682,7 +5756,7 @@ def coloring_main(map,kind = "WATER"):
             #print(f"Area: {area}")
             if area > biggestArea:
                 biggestArea = area
-            if area >= col_Area:
+            if area >= min_area_effective:
                 found = 1
                 tobj.select_set(True)
                 ctx.view_layer.objects.active = tobj
@@ -5696,6 +5770,23 @@ def coloring_main(map,kind = "WATER"):
             if found == 0:
                 continue
         
+        dropped_fragment_count = 0
+        smallest_kept_area = None
+        if kind == "WATER":
+            for tobj in created_objects:
+                if _is_valid_blender_object(tobj):
+                    dropped, smallest = _remove_small_mesh_islands(tobj, min_area_effective)
+                    dropped_fragment_count += dropped
+                    if smallest is not None:
+                        smallest_kept_area = smallest if smallest_kept_area is None else min(smallest_kept_area, smallest)
+            module_logger.info(
+                "WATER area gate debug kind=%s min_area_effective=%.8f dropped_fragment_count=%s smallest_kept_area=%s",
+                kind,
+                min_area_effective,
+                dropped_fragment_count,
+                f"{smallest_kept_area:.8f}" if smallest_kept_area is not None else "None",
+            )
+
         print(f"Biggest {kind} Found has a Area of: {biggestArea}")
 
         if biggestArea == 0:
