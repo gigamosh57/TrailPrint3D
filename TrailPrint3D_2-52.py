@@ -5193,7 +5193,8 @@ def _compute_effective_min_area(kind, base_area):
     except Exception:
         map_extent_area = 0.0
 
-    # Dynamic floor for tiny sliver polygons. Scales with map extent and horizontal scaling.
+    # Dynamic floor for tiny sliver polygons. Scales with map extent and horizontal scale.
+    # Higher detail scales (larger scaleHor) permit proportionally smaller features.
     scale_factor = max(1.0, float(scaleHor) if scaleHor else 1.0)
     extent_floor = (map_extent_area / (35000.0 * scale_factor)) if map_extent_area > 0 else 0.0
     return max(threshold, extent_floor)
@@ -5700,31 +5701,23 @@ def coloring_main(map,kind = "WATER"):
                             coords.append(coord)
                     tArea = calculate_polygon_area_2d(coords)
                     #print(f"tArea2: {tArea}")
-                    if len(coords) < 2 or tArea < min_area_effective:
+                    is_closed_way = len(coords) >= 3 and coords[0] == coords[-1]
+                    if len(coords) < 2:
+                        waterDeleted += 1
+                        continue
+                    if is_closed_way and tArea < min_area_effective:
                         waterDeleted += 1
                         continue
                     
                     tags = element.get("tags", {})
-                    if coords[0] == coords[-1]:
+                    if is_closed_way:
                         tobj = col_create_face_mesh(f"coloredObject_{i}", coords)
                         created_objects.append(tobj)
-                        for island_obj in island_objects:
-                            relation_debug_pairs.append((
-                                relation_id,
-                                island_obj.name if island_obj else None,
-                                tobj.name if tobj else None,
-                            ))
                         waterCreated += 1
                         standalone_ways_rendered += 1
                     else:
                         tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
                         created_objects.append(tobj)
-                        for island_obj in island_objects:
-                            relation_debug_pairs.append((
-                                relation_id,
-                                island_obj.name if island_obj else None,
-                                tobj.name if tobj else None,
-                            ))
                         waterCreated += 1
                         standalone_ways_rendered += 1
                     
@@ -5747,7 +5740,10 @@ def coloring_main(map,kind = "WATER"):
         bpy.ops.object.select_all(action='DESELECT')
         found = 0
         biggestArea = 0
+        kept_objects = []
         for tobj in created_objects:
+            if not _is_valid_blender_object(tobj):
+                continue
             
             bm = bmesh.new()
             bm.from_mesh(tobj.data)
@@ -5760,6 +5756,7 @@ def coloring_main(map,kind = "WATER"):
                 found = 1
                 tobj.select_set(True)
                 ctx.view_layer.objects.active = tobj
+                kept_objects.append(tobj)
                 #print(f"Area: {area}")
             else:
                 mesh_data = tobj.data
@@ -5770,6 +5767,7 @@ def coloring_main(map,kind = "WATER"):
             if found == 0:
                 continue
         
+        created_objects = kept_objects
         dropped_fragment_count = 0
         smallest_kept_area = None
         if kind == "WATER":
