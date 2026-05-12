@@ -5888,6 +5888,26 @@ def coloring_main(map,kind = "WATER"):
 
         #bpy.ops.object.transform_apply(location=True, rotation=False, scale=False)
         
+        if kind == "WATER" and _is_valid_blender_object(merged_object):
+            post_merge_dropped, post_merge_smallest = _remove_small_mesh_islands(merged_object, min_area_effective)
+            module_logger.info(
+                "WATER post-merge area gate kind=%s min_area_effective=%.8f dropped_fragment_count=%s smallest_kept_area=%s",
+                kind,
+                min_area_effective,
+                post_merge_dropped,
+                f"{post_merge_smallest:.8f}" if post_merge_smallest is not None else "None",
+            )
+            if len(merged_object.data.polygons) == 0:
+                module_logger.warning(
+                    "WATER post-merge cleanup removed all polygons object=%s min_area_effective=%.8f",
+                    merged_object.name,
+                    min_area_effective,
+                )
+                mesh_data = merged_object.data
+                bpy.data.objects.remove(merged_object, do_unlink=True)
+                bpy.data.meshes.remove(mesh_data)
+                return
+            recalculateNormals(merged_object)
 
         if merged_object:
             #print(f"Merged obj: {merged_object}, Kind: {kind}")
