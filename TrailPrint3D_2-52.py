@@ -6126,11 +6126,34 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     water_areas_before = sorted((a for _, a in water_clusters_before), reverse=True)
     largest_before = water_areas_before[0] if water_areas_before else 0.0
     median_before = water_areas_before[len(water_areas_before)//2] if water_areas_before else 0.0
+    smallest_before = water_areas_before[-1] if water_areas_before else 0.0
+    removal_candidates = sorted((area for _, area in water_clusters_before if area < tiny_cluster_threshold))
+    keep_candidates = sorted((area for _, area in water_clusters_before if area >= tiny_cluster_threshold))
+    sample_limit = 20
+    module_logger.info(
+        "WATER spot cleanup candidates map=%s total_clusters=%s tiny_cluster_threshold=%.8f smallest_cluster_before=%.8f "
+        "removal_candidate_count=%s keep_candidate_count=%s removal_candidate_areas_sample=%s keep_candidate_areas_sample=%s",
+        map_obj.name,
+        len(water_clusters_before),
+        tiny_cluster_threshold,
+        smallest_before,
+        len(removal_candidates),
+        len(keep_candidates),
+        [round(v, 8) for v in removal_candidates[:sample_limit]],
+        [round(v, 8) for v in keep_candidates[:sample_limit]],
+    )
 
     removed_area = 0.0
     removed_clusters = 0
     for faces, area in water_clusters_before:
         if area < tiny_cluster_threshold:
+            module_logger.debug(
+                "WATER spot cleanup removing cluster map=%s cluster_area=%.8f threshold=%.8f face_count=%s",
+                map_obj.name,
+                area,
+                tiny_cluster_threshold,
+                len(faces),
+            )
             removed_clusters += 1
             removed_area += area
             for f in faces:
