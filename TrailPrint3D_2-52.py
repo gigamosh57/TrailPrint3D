@@ -409,6 +409,9 @@ class MyProperties(bpy.types.PropertyGroup):
     col_glMaxRequests: bpy.props.IntProperty(name="Glacier OSM Tile Budget", default = 300, min = 1, max = 5000, description = "Maximum number of OSM tile requests for glaciers before aborting")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
+    col_WaterSpotCleanup: bpy.props.BoolProperty(name="Water Spot Cleanup", default=True, description = "Remove tiny WATER paint spots and optionally fill tiny BASE holes")
+    col_WaterSpotCleanupMul: bpy.props.FloatProperty(name="Water Cleanup Threshold Mult", default=2.0, min=0.0, description="Cluster threshold in multiples of median map face area")
+    col_WaterHoleFillMul: bpy.props.FloatProperty(name="Water Hole Fill Mult", default=1.0, min=0.0, description="BASE hole-fill threshold in multiples of median map face area")
 
     mountain_treshold:bpy.props.IntProperty(name="Mountain Treshold", default = 60, min = 0, max = 100,subtype='PERCENTAGE', description="Height Treshold to Color Mountians")
     cl_thickness: bpy.props.FloatProperty(name="Contour Line Thickness", default = 0.2, description = "Thickness of the Contour Line")
@@ -1580,6 +1583,11 @@ class MY_PT_Advanced(bpy.types.Panel):
 
             #layout.prop(props, "col_KeepManifold")
             boxer.prop(props,"col_PaintMap")
+            if props.col_wActive and props.col_PaintMap:
+                boxer.prop(props, "col_WaterSpotCleanup")
+                if props.col_WaterSpotCleanup:
+                    boxer.prop(props, "col_WaterSpotCleanupMul")
+                    boxer.prop(props, "col_WaterHoleFillMul")
             
         
         #PIN
@@ -5928,6 +5936,14 @@ def coloring_main(map,kind = "WATER"):
 
         if col_PaintMap == True:
             color_map_faces_by_terrain(map, merged_object)
+            if kind == "WATER" and bpy.context.scene.tp3d.col_WaterSpotCleanup:
+                _cleanup_water_paint_clusters(
+                    map,
+                    water_material_name="WATER",
+                    base_material_name="BASE",
+                    tiny_cluster_mul=bpy.context.scene.tp3d.col_WaterSpotCleanupMul,
+                    hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
+                )
             mesh_data = merged_object.data
             bpy.data.objects.remove(merged_object, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
@@ -6059,6 +6075,119 @@ def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=
         water_offset,
         [m.name for m in land_obj.data.materials] if _is_valid_blender_object(land_obj) and land_obj.type == 'MESH' else [],
         [m.name for m in water_obj.data.materials] if _is_valid_blender_object(water_obj) and water_obj.type == 'MESH' else [],
+    )
+
+
+
+def _face_clusters_by_material(bm, material_index):
+    visited = set()
+    clusters = []
+    for face in bm.faces:
+        if face.index in visited or face.material_index != material_index:
+            continue
+        stack = [face]
+        visited.add(face.index)
+        cluster_faces = []
+        area = 0.0
+        while stack:
+            current = stack.pop()
+            cluster_faces.append(current)
+            area += current.calc_area()
+            for edge in current.edges:
+                for other in edge.link_faces:
+                    if other.index not in visited and other.material_index == material_index:
+                        visited.add(other.index)
+                        stack.append(other)
+        clusters.append((cluster_faces, area))
+    return clusters
+
+
+def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_material_name="BASE", tiny_cluster_mul=2.0, hole_fill_mul=1.0):
+    if not _is_valid_blender_object(map_obj) or map_obj.type != 'MESH':
+        return
+
+    mesh = map_obj.data
+    water_index = mesh.materials.find(water_material_name)
+    base_index = mesh.materials.find(base_material_name)
+    if water_index < 0 or base_index < 0:
+        module_logger.info("WATER spot cleanup skipped map=%s water_index=%s base_index=%s", map_obj.name, water_index, base_index)
+        return
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+
+    map_face_areas = sorted(f.calc_area() for f in bm.faces if f.calc_area() > 0)
+    median_face_area = map_face_areas[len(map_face_areas)//2] if map_face_areas else 0.0
+    tiny_cluster_threshold = median_face_area * max(0.0, tiny_cluster_mul)
+    hole_fill_threshold = median_face_area * max(0.0, hole_fill_mul)
+
+    water_clusters_before = _face_clusters_by_material(bm, water_index)
+    water_areas_before = sorted((a for _, a in water_clusters_before), reverse=True)
+    largest_before = water_areas_before[0] if water_areas_before else 0.0
+    median_before = water_areas_before[len(water_areas_before)//2] if water_areas_before else 0.0
+
+    removed_area = 0.0
+    removed_clusters = 0
+    for faces, area in water_clusters_before:
+        if area < tiny_cluster_threshold:
+            removed_clusters += 1
+            removed_area += area
+            for f in faces:
+                f.material_index = base_index
+
+    filled_holes = 0
+    filled_area = 0.0
+    if hole_fill_threshold > 0.0:
+        base_clusters = _face_clusters_by_material(bm, base_index)
+        for faces, area in base_clusters:
+            if area >= hole_fill_threshold:
+                continue
+            boundary_touches_non_water = False
+            for f in faces:
+                for e in f.edges:
+                    link_faces = e.link_faces
+                    if len(link_faces) == 1:
+                        boundary_touches_non_water = True
+                        break
+                    for lf in link_faces:
+                        if lf not in faces and lf.material_index != water_index:
+                            boundary_touches_non_water = True
+                            break
+                    if boundary_touches_non_water:
+                        break
+                if boundary_touches_non_water:
+                    break
+            if not boundary_touches_non_water:
+                filled_holes += 1
+                filled_area += area
+                for f in faces:
+                    f.material_index = water_index
+
+    water_clusters_after = _face_clusters_by_material(bm, water_index)
+    water_areas_after = sorted((a for _, a in water_clusters_after), reverse=True)
+    largest_after = water_areas_after[0] if water_areas_after else 0.0
+    median_after = water_areas_after[len(water_areas_after)//2] if water_areas_after else 0.0
+
+    bm.to_mesh(mesh)
+    bm.free()
+
+    module_logger.info(
+        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_threshold=%.8f clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f",
+        map_obj.name,
+        median_face_area,
+        tiny_cluster_threshold,
+        hole_fill_threshold,
+        len(water_clusters_before),
+        len(water_clusters_after),
+        removed_clusters,
+        removed_area,
+        filled_holes,
+        filled_area,
+        largest_before,
+        median_before,
+        largest_after,
+        median_after,
     )
 
 
