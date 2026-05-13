@@ -4434,7 +4434,10 @@ def intersect_alltrails_with_existing_box(cutobject):
                 if robj.type == 'CURVE':
                     bpy.context.view_layer.objects.active = robj
                     bpy.ops.object.select_all(action='DESELECT')
-                    robj2 = _debug_preserve_object_if_enabled(robj, "intersect_alltrails_curve_to_mesh")
+                    robj2 = _debug_preserve_object_if_enabled(
+                        robj,
+                        _format_debug_step_name("INTERSECT", "CURVE_TO_MESH", "ALLTRAILS"),
+                    )
                     if robj2 is None:
                         robj2 = robj.copy()
                         robj2.data = robj.data.copy()
@@ -4483,7 +4486,10 @@ def intersect_alltrails_with_existing_box(cutobject):
         #Copy objects
         for obj in boolObjects:
             print(f"Copy obj {obj.name}")
-            obj_copy = _debug_preserve_object_if_enabled(obj, "intersect_alltrails_boolean_sources")
+            obj_copy = _debug_preserve_object_if_enabled(
+                obj,
+                _format_debug_step_name("INTERSECT", "BOOLEAN_SOURCES", "ALLTRAILS"),
+            )
             if obj_copy is None:
                 obj_copy = obj.copy()
                 obj_copy.data = obj.data.copy()
@@ -4558,7 +4564,10 @@ def intersect_trail_with_existing_box(cutobject,trail):
     if trail.type == 'CURVE':
         bpy.context.view_layer.objects.active = trail
         bpy.ops.object.select_all(action='DESELECT')
-        robj2 = _debug_preserve_object_if_enabled(trail, "intersect_singletrail_curve_to_mesh")
+        robj2 = _debug_preserve_object_if_enabled(
+            trail,
+            _format_debug_step_name("INTERSECT", "CURVE_TO_MESH", "SINGLETRAIL"),
+        )
         if robj2 is None:
             robj2 = trail.copy()
             robj2.data = trail.data.copy()
@@ -4602,7 +4611,10 @@ def intersect_trail_with_existing_box(cutobject,trail):
         #Copy objects
         for obj in boolObjects:
             print(f"Copy obj {obj.name}")
-            obj_copy = _debug_preserve_object_if_enabled(obj, "intersect_singletrail_boolean_sources")
+            obj_copy = _debug_preserve_object_if_enabled(
+                obj,
+                _format_debug_step_name("INTERSECT", "BOOLEAN_SOURCES", "SINGLETRAIL"),
+            )
             if obj_copy is None:
                 obj_copy = obj.copy()
                 obj_copy.data = obj.data.copy()
@@ -5348,6 +5360,18 @@ def _sanitize_temp_debug_collection_name(step_name: str, max_len: int = 63):
     return (safe_name or "step")[:max_len]
 
 
+def _format_debug_step_name(phase: str, action: str, variant: str = ""):
+    tokens = [phase, action, variant]
+    normalized_tokens = []
+    for token in tokens:
+        if not token:
+            continue
+        clean = bpy.path.clean_name(str(token)).upper()
+        if clean:
+            normalized_tokens.append(clean)
+    return "_".join(normalized_tokens) or "STEP_UNSPECIFIED"
+
+
 def _get_or_create_temp_debug_step_collection(step_name: str):
     root_coll = _get_or_create_temp_debug_root_collection()
     coll_name = _sanitize_temp_debug_collection_name(step_name)
@@ -5364,7 +5388,11 @@ def _get_or_create_temp_debug_step_collection(step_name: str):
     return step_coll
 
 
-def _snapshot_object_to_temp_collection(obj, step_name: str, suffix: str = ""):
+_TP3D_DEBUG_SNAPSHOT_COUNTER = 0
+
+
+def _snapshot_object_to_temp_collection(obj, step_name: str, suffix: str = "", kind: str = ""):
+    global _TP3D_DEBUG_SNAPSHOT_COUNTER
     if not _is_valid_blender_object(obj):
         return None
 
@@ -5378,17 +5406,23 @@ def _snapshot_object_to_temp_collection(obj, step_name: str, suffix: str = ""):
     if safe_suffix:
         dup_name = f"{dup_name}_{safe_suffix}"
     dup_obj.name = dup_name[:63]
+    _TP3D_DEBUG_SNAPSHOT_COUNTER += 1
+    dup_obj["tp3d_debug_source_object"] = obj.name
+    dup_obj["tp3d_debug_step"] = safe_step
+    dup_obj["tp3d_debug_timestamp"] = f"{int(time.time())}:{_TP3D_DEBUG_SNAPSHOT_COUNTER}"
+    if kind:
+        dup_obj["tp3d_debug_kind"] = str(kind)
 
     step_coll = _get_or_create_temp_debug_step_collection(step_name)
     step_coll.objects.link(dup_obj)
     return dup_obj
 
 
-def _debug_preserve_object_if_enabled(obj, step_name, suffix=""):
+def _debug_preserve_object_if_enabled(obj, step_name, suffix="", kind=""):
     props = getattr(bpy.context.scene, "tp3d", None)
     if not props or not getattr(props, "debug_keep_temporary_objects", False):
         return None
-    return _snapshot_object_to_temp_collection(obj, step_name, suffix=suffix)
+    return _snapshot_object_to_temp_collection(obj, step_name, suffix=suffix, kind=kind)
 def _get_or_create_hole_temp_collection():
     coll_name = "_TP3D_HoleTemp"
     coll = bpy.data.collections.get(coll_name)
@@ -5480,7 +5514,11 @@ def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
     )
     telemetry["apply"] = apply_elapsed
 
-    _debug_preserve_object_if_enabled(hole_obj, "HOLE_cutters_combined")
+    _debug_preserve_object_if_enabled(
+        hole_obj,
+        _format_debug_step_name("HOLE", "CUTTERS", "COMBINED"),
+        kind="HOLE",
+    )
     hole_mesh = hole_obj.data
     bpy.data.objects.remove(hole_obj, do_unlink=True)
     bpy.data.meshes.remove(hole_mesh)
@@ -5847,7 +5885,11 @@ def coloring_main(map,kind = "WATER"):
                 #print(f"Area: {area}")
             else:
                 mesh_data = tobj.data
-                _debug_preserve_object_if_enabled(tobj, "WATER_area_filtered_fragment")
+                _debug_preserve_object_if_enabled(
+                    tobj,
+                    _format_debug_step_name("WATER", "AREA_FILTERED", "FRAGMENT"),
+                    kind="WATER",
+                )
                 bpy.data.objects.remove(tobj, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
                 #print("Removed")
@@ -5992,7 +6034,11 @@ def coloring_main(map,kind = "WATER"):
                     min_area_effective,
                 )
                 mesh_data = merged_object.data
-                _debug_preserve_object_if_enabled(merged_object, "WATER_post_boolean_merged")
+                _debug_preserve_object_if_enabled(
+                    merged_object,
+                    _format_debug_step_name("WATER", "POST_BOOLEAN", "MERGED"),
+                    kind="WATER",
+                )
                 bpy.data.objects.remove(merged_object, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
                 return
@@ -6026,7 +6072,11 @@ def coloring_main(map,kind = "WATER"):
                     hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
                 )
             mesh_data = merged_object.data
-            _debug_preserve_object_if_enabled(merged_object, "WATER_post_paint_cleanup")
+            _debug_preserve_object_if_enabled(
+                merged_object,
+                _format_debug_step_name("WATER", "POST_PAINT", "CLEANUP"),
+                kind="WATER",
+            )
             bpy.data.objects.remove(merged_object, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
 
@@ -6092,7 +6142,11 @@ def paint_pending_islands_on_map(map_obj):
             )
             color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE")
             mesh_data = island_obj.data
-            _debug_preserve_object_if_enabled(island_obj, "WATER_island_paint_source")
+            _debug_preserve_object_if_enabled(
+                island_obj,
+                _format_debug_step_name("WATER", "ISLAND_PAINT", "SOURCE"),
+                kind="WATER",
+            )
             bpy.data.objects.remove(island_obj, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
         else:
