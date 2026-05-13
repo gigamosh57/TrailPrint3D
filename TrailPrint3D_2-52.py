@@ -4434,9 +4434,11 @@ def intersect_alltrails_with_existing_box(cutobject):
                 if robj.type == 'CURVE':
                     bpy.context.view_layer.objects.active = robj
                     bpy.ops.object.select_all(action='DESELECT')
-                    robj2 = robj.copy()
-                    robj2.data = robj.data.copy()
-                    bpy.context.collection.objects.link(robj2)
+                    robj2 = _debug_preserve_object_if_enabled(robj, "intersect_alltrails_curve_to_mesh")
+                    if robj2 is None:
+                        robj2 = robj.copy()
+                        robj2.data = robj.data.copy()
+                        bpy.context.collection.objects.link(robj2)
                     robj2.select_set(True)
                     bpy.ops.object.convert(target='MESH')
                     trail_mesh = robj2
@@ -4481,9 +4483,11 @@ def intersect_alltrails_with_existing_box(cutobject):
         #Copy objects
         for obj in boolObjects:
             print(f"Copy obj {obj.name}")
-            obj_copy = obj.copy()
-            obj_copy.data = obj.data.copy()
-            bpy.context.collection.objects.link(obj_copy)
+            obj_copy = _debug_preserve_object_if_enabled(obj, "intersect_alltrails_boolean_sources")
+            if obj_copy is None:
+                obj_copy = obj.copy()
+                obj_copy.data = obj.data.copy()
+                bpy.context.collection.objects.link(obj_copy)
             copied_objects.append(obj_copy)
         
         #Deselect all
@@ -4554,9 +4558,11 @@ def intersect_trail_with_existing_box(cutobject,trail):
     if trail.type == 'CURVE':
         bpy.context.view_layer.objects.active = trail
         bpy.ops.object.select_all(action='DESELECT')
-        robj2 = trail.copy()
-        robj2.data = trail.data.copy()
-        bpy.context.collection.objects.link(robj2)
+        robj2 = _debug_preserve_object_if_enabled(trail, "intersect_singletrail_curve_to_mesh")
+        if robj2 is None:
+            robj2 = trail.copy()
+            robj2.data = trail.data.copy()
+            bpy.context.collection.objects.link(robj2)
         robj2.select_set(True)
         bpy.ops.object.convert(target='MESH')
         trail_mesh = robj2
@@ -4596,9 +4602,11 @@ def intersect_trail_with_existing_box(cutobject,trail):
         #Copy objects
         for obj in boolObjects:
             print(f"Copy obj {obj.name}")
-            obj_copy = obj.copy()
-            obj_copy.data = obj.data.copy()
-            bpy.context.collection.objects.link(obj_copy)
+            obj_copy = _debug_preserve_object_if_enabled(obj, "intersect_singletrail_boolean_sources")
+            if obj_copy is None:
+                obj_copy = obj.copy()
+                obj_copy.data = obj.data.copy()
+                bpy.context.collection.objects.link(obj_copy)
             copied_objects.append(obj_copy)
         
         #Deselect all
@@ -5320,6 +5328,67 @@ def _validate_ring_with_reason(coords, min_area=0.0):
     return True, area, None
 
 
+
+
+def _get_or_create_temp_debug_root_collection():
+    coll_name = "Temporary objects"
+    coll = bpy.data.collections.get(coll_name)
+    if not coll:
+        coll = bpy.data.collections.new(coll_name)
+
+    scene_coll = bpy.context.scene.collection
+    if coll.name not in scene_coll.children:
+        scene_coll.children.link(coll)
+
+    return coll
+
+
+def _sanitize_temp_debug_collection_name(step_name: str, max_len: int = 63):
+    safe_name = bpy.path.clean_name(step_name or "step")
+    return (safe_name or "step")[:max_len]
+
+
+def _get_or_create_temp_debug_step_collection(step_name: str):
+    root_coll = _get_or_create_temp_debug_root_collection()
+    coll_name = _sanitize_temp_debug_collection_name(step_name)
+
+    step_coll = root_coll.children.get(coll_name)
+    if not step_coll:
+        step_coll = bpy.data.collections.get(coll_name)
+        if step_coll and step_coll.name not in root_coll.children:
+            root_coll.children.link(step_coll)
+        if not step_coll:
+            step_coll = bpy.data.collections.new(coll_name)
+            root_coll.children.link(step_coll)
+
+    return step_coll
+
+
+def _snapshot_object_to_temp_collection(obj, step_name: str, suffix: str = ""):
+    if not _is_valid_blender_object(obj):
+        return None
+
+    dup_obj = obj.copy()
+    if hasattr(obj, "data") and obj.data is not None and hasattr(obj.data, "copy"):
+        dup_obj.data = obj.data.copy()
+
+    safe_step = _sanitize_temp_debug_collection_name(step_name)
+    safe_suffix = bpy.path.clean_name(suffix) if suffix else ""
+    dup_name = f"{obj.name}_tmp_{safe_step}"
+    if safe_suffix:
+        dup_name = f"{dup_name}_{safe_suffix}"
+    dup_obj.name = dup_name[:63]
+
+    step_coll = _get_or_create_temp_debug_step_collection(step_name)
+    step_coll.objects.link(dup_obj)
+    return dup_obj
+
+
+def _debug_preserve_object_if_enabled(obj, step_name, suffix=""):
+    props = getattr(bpy.context.scene, "tp3d", None)
+    if not props or not getattr(props, "debug_keep_temporary_objects", False):
+        return None
+    return _snapshot_object_to_temp_collection(obj, step_name, suffix=suffix)
 def _get_or_create_hole_temp_collection():
     coll_name = "_TP3D_HoleTemp"
     coll = bpy.data.collections.get(coll_name)
