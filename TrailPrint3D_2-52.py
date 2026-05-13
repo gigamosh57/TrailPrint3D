@@ -389,6 +389,11 @@ class MyProperties(bpy.types.PropertyGroup):
         update=logging_settings_update
     )# type: ignore
     debug_log_filename: bpy.props.StringProperty(name="Log Filename", default="trailprint3d.log", update=logging_settings_update)
+    debug_keep_temporary_objects: bpy.props.BoolProperty(
+        name="Keep Temporary Objects",
+        default=False,
+        description="Preserve intermediate/generated temporary geometry for debugging"
+    )
     indipendendTiles : bpy.props.BoolProperty(name="IndipendendTiles", default = False, description = "Tile minThickness is indipendend from other tiles")
 
 
@@ -1469,6 +1474,10 @@ class MY_PT_Advanced(bpy.types.Panel):
         log_box = layout.box()
         log_box.label(text="Logging")
         log_box.prop(props, "debug_logging_enabled", text="Enable/Disable Logging", toggle=True)
+        log_box.prop(props, "debug_keep_temporary_objects", text="Keep Temporary Objects", toggle=True)
+        if props.debug_keep_temporary_objects:
+            warn_row = log_box.row()
+            warn_row.label(text="Warning: Keeping temporary objects may clutter the scene.", icon="ERROR")
         if props.debug_logging_enabled:
             log_box.prop(props, "debug_log_level")
             log_box.prop(props, "debug_log_filename")
