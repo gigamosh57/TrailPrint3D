@@ -5480,6 +5480,7 @@ def apply_hole_difference(outer_obj, hole_rings, name_prefix="Hole"):
     )
     telemetry["apply"] = apply_elapsed
 
+    _debug_preserve_object_if_enabled(hole_obj, "HOLE_cutters_combined")
     hole_mesh = hole_obj.data
     bpy.data.objects.remove(hole_obj, do_unlink=True)
     bpy.data.meshes.remove(hole_mesh)
@@ -5846,6 +5847,7 @@ def coloring_main(map,kind = "WATER"):
                 #print(f"Area: {area}")
             else:
                 mesh_data = tobj.data
+                _debug_preserve_object_if_enabled(tobj, "WATER_area_filtered_fragment")
                 bpy.data.objects.remove(tobj, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
                 #print("Removed")
@@ -5990,6 +5992,7 @@ def coloring_main(map,kind = "WATER"):
                     min_area_effective,
                 )
                 mesh_data = merged_object.data
+                _debug_preserve_object_if_enabled(merged_object, "WATER_post_boolean_merged")
                 bpy.data.objects.remove(merged_object, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
                 return
@@ -6023,6 +6026,7 @@ def coloring_main(map,kind = "WATER"):
                     hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
                 )
             mesh_data = merged_object.data
+            _debug_preserve_object_if_enabled(merged_object, "WATER_post_paint_cleanup")
             bpy.data.objects.remove(merged_object, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
 
@@ -6088,6 +6092,7 @@ def paint_pending_islands_on_map(map_obj):
             )
             color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE")
             mesh_data = island_obj.data
+            _debug_preserve_object_if_enabled(island_obj, "WATER_island_paint_source")
             bpy.data.objects.remove(island_obj, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
         else:
