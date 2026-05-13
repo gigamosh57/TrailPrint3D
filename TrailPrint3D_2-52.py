@@ -6102,6 +6102,54 @@ def _face_clusters_by_material(bm, material_index):
     return clusters
 
 
+
+
+def _cluster_shape_metrics(cluster_faces, material_index):
+    cluster_face_set = set(cluster_faces)
+    area = 0.0
+    boundary_length = 0.0
+    boundary_edges = 0
+    for f in cluster_faces:
+        face_area = f.calc_area()
+        area += face_area
+        for e in f.edges:
+            linked_same_cluster = any(lf in cluster_face_set for lf in e.link_faces if lf != f)
+            if not linked_same_cluster:
+                boundary_edges += 1
+                boundary_length += e.calc_length()
+
+    perimeter_area_ratio = (boundary_length / area) if area > 1e-12 else float('inf')
+    compactness = (4.0 * math.pi * area / (boundary_length * boundary_length)) if boundary_length > 1e-12 else 0.0
+    return {
+        "face_count": len(cluster_faces),
+        "area": area,
+        "boundary_length": boundary_length,
+        "boundary_edges": boundary_edges,
+        "perimeter_area_ratio": perimeter_area_ratio,
+        "compactness": compactness,
+    }
+
+
+def _extract_thin_bridge_faces(cluster_faces, area_scale):
+    cluster_face_set = set(cluster_faces)
+    bridge_faces = []
+    for f in cluster_faces:
+        internal_neighbors = 0
+        boundary_edges = 0
+        for e in f.edges:
+            has_internal = False
+            for lf in e.link_faces:
+                if lf != f and lf in cluster_face_set:
+                    has_internal = True
+                    internal_neighbors += 1
+                    break
+            if not has_internal:
+                boundary_edges += 1
+
+        if internal_neighbors <= 2 and boundary_edges >= max(2, len(f.edges) // 2):
+            if f.calc_area() <= area_scale:
+                bridge_faces.append(f)
+    return bridge_faces
 def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_material_name="BASE", tiny_cluster_mul=2.0, hole_fill_mul=1.0):
     if not _is_valid_blender_object(map_obj) or map_obj.type != 'MESH':
         return
@@ -6143,21 +6191,72 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
         [round(v, 8) for v in keep_candidates[:sample_limit]],
     )
 
+    bridge_face_threshold = median_face_area * 1.5 if median_face_area > 0.0 else 0.0
+    thin_ratio_threshold = 12.0
+    thin_compactness_threshold = 0.12
+    thin_area_gate = tiny_cluster_threshold * 1.8 if tiny_cluster_threshold > 0.0 else 0.0
+
     removed_area = 0.0
     removed_clusters = 0
+    flagged_thin_kept_clusters = 0
+    bridge_faces_reclassified = 0
     for faces, area in water_clusters_before:
+        metrics = _cluster_shape_metrics(faces, water_index)
+        thin_topology = (
+            metrics["area"] <= thin_area_gate and
+            (
+                metrics["perimeter_area_ratio"] >= thin_ratio_threshold or
+                metrics["compactness"] <= thin_compactness_threshold
+            )
+        )
+
         if area < tiny_cluster_threshold:
             module_logger.debug(
-                "WATER spot cleanup removing cluster map=%s cluster_area=%.8f threshold=%.8f face_count=%s",
+                "WATER spot cleanup removing cluster map=%s cluster_area=%.8f threshold=%.8f face_count=%s boundary_len=%.8f pa_ratio=%.8f compactness=%.8f",
                 map_obj.name,
                 area,
                 tiny_cluster_threshold,
-                len(faces),
+                metrics["face_count"],
+                metrics["boundary_length"],
+                metrics["perimeter_area_ratio"],
+                metrics["compactness"],
             )
             removed_clusters += 1
             removed_area += area
             for f in faces:
                 f.material_index = base_index
+            continue
+
+        if thin_topology and bridge_face_threshold > 0.0:
+            bridge_faces = _extract_thin_bridge_faces(faces, bridge_face_threshold)
+            if bridge_faces:
+                for bf in bridge_faces:
+                    bf.material_index = base_index
+                bridge_faces_reclassified += len(bridge_faces)
+                flagged_thin_kept_clusters += 1
+                module_logger.info(
+                    "WATER thin-bridge artifact map=%s cluster_area=%.8f threshold=%.8f face_count=%s bridge_faces_reclassified=%s boundary_len=%.8f pa_ratio=%.8f compactness=%.8f",
+                    map_obj.name,
+                    area,
+                    tiny_cluster_threshold,
+                    metrics["face_count"],
+                    len(bridge_faces),
+                    metrics["boundary_length"],
+                    metrics["perimeter_area_ratio"],
+                    metrics["compactness"],
+                )
+            else:
+                flagged_thin_kept_clusters += 1
+                module_logger.info(
+                    "WATER thin-bridge artifact kept for connectivity map=%s cluster_area=%.8f threshold=%.8f face_count=%s boundary_len=%.8f pa_ratio=%.8f compactness=%.8f",
+                    map_obj.name,
+                    area,
+                    tiny_cluster_threshold,
+                    metrics["face_count"],
+                    metrics["boundary_length"],
+                    metrics["perimeter_area_ratio"],
+                    metrics["compactness"],
+                )
 
     filled_holes = 0
     filled_area = 0.0
@@ -6196,7 +6295,7 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     bm.free()
 
     module_logger.info(
-        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_threshold=%.8f clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f",
+        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_threshold=%.8f clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f thin_kept_clusters=%s bridge_faces_reclassified=%s largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f",
         map_obj.name,
         median_face_area,
         tiny_cluster_threshold,
@@ -6207,6 +6306,8 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
         removed_area,
         filled_holes,
         filled_area,
+        flagged_thin_kept_clusters,
+        bridge_faces_reclassified,
         largest_before,
         median_before,
         largest_after,
