@@ -5151,6 +5151,7 @@ def col_create_line_mesh(name, coords):
         bm.edges.new((verts[i], verts[i + 1]))
     bm.to_mesh(mesh)
     bm.free()
+    _debug_preserve_created_object_if_enabled(tobj, creation_type="LINE")
     return tobj
 
 
@@ -5173,6 +5174,7 @@ def col_create_face_mesh(name, coords):
 
     if len(face_coords) < 3:
         bm.free()
+        _debug_preserve_created_object_if_enabled(tobj, creation_type="FACE")
         return tobj
 
     verts = [bm.verts.new(c) for c in face_coords]
@@ -5197,6 +5199,7 @@ def col_create_face_mesh(name, coords):
                 pass
     bm.to_mesh(mesh)
     bm.free()
+    _debug_preserve_created_object_if_enabled(tobj, creation_type="FACE")
     return tobj
 
 def calculate_polygon_area_2d(coords):
@@ -5423,6 +5426,16 @@ def _debug_preserve_object_if_enabled(obj, step_name, suffix="", kind=""):
     if not props or not getattr(props, "debug_keep_temporary_objects", False):
         return None
     return _snapshot_object_to_temp_collection(obj, step_name, suffix=suffix, kind=kind)
+
+
+def _debug_preserve_created_object_if_enabled(obj, creation_type="MESH"):
+    """Capture newly-created objects in the temporary debug collections."""
+    if not _is_valid_blender_object(obj):
+        return None
+    step_name = _format_debug_step_name("CREATE", creation_type, obj.name)
+    return _debug_preserve_object_if_enabled(obj, step_name, suffix="CREATED", kind=creation_type)
+
+
 def _get_or_create_hole_temp_collection():
     coll_name = "_TP3D_HoleTemp"
     coll = bpy.data.collections.get(coll_name)
