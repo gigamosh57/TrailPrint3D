@@ -5547,7 +5547,7 @@ def build_osm_nodes(data):
 
 
 @log_workflow
-def coloring_main(map,kind = "WATER"):
+def build_coloring_layer(map,kind = "WATER"):
 
     col_KeepManifold = (bpy.context.scene.tp3d.col_KeepManifold)
     if kind == "WATER":
@@ -6074,28 +6074,6 @@ def coloring_main(map,kind = "WATER"):
         if col_PaintMap == False:
             export_to_STL(merged_object)
 
-        if col_PaintMap == True:
-            color_map_faces_by_terrain(map, merged_object)
-            if kind == "WATER" and bpy.context.scene.tp3d.col_WaterSpotCleanup:
-                _cleanup_water_paint_clusters(
-                    map,
-                    water_material_name="WATER",
-                    base_material_name="BASE",
-                    tiny_cluster_mul=bpy.context.scene.tp3d.col_WaterSpotCleanupMul,
-                    hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
-                )
-            mesh_data = merged_object.data
-            _debug_preserve_object_if_enabled(
-                merged_object,
-                _format_debug_step_name("WATER", "POST_PAINT", "CLEANUP"),
-                kind="WATER",
-            )
-            bpy.data.objects.remove(merged_object, do_unlink=True)
-            bpy.data.meshes.remove(mesh_data)
-
-    global pending_island_paint_objects
-    if kind == "WATER" and col_PaintMap == True and island_objects_to_paint:
-        pending_island_paint_objects.extend(island_objects_to_paint)
 
     if kind == "WATER":
         for relation_id, land_obj_name, water_obj_name in relation_debug_pairs:
@@ -6115,11 +6093,61 @@ def coloring_main(map,kind = "WATER"):
                 
     bpy.context.preferences.edit.use_global_undo = True
 
-    if col_PaintMap == False:
-        return merged_object
-    else:
+    merged_ref = merged_object if "merged_object" in locals() else None
+    return {
+        "kind": kind,
+        "merged_object": merged_ref,
+        "island_objects": list(island_objects_to_paint),
+        "cleanup_telemetry": {
+            "objects_created": waterCreated,
+            "objects_ignored": waterDeleted,
+            "relation_member_ways_skipped": relation_member_ways_skipped,
+            "standalone_ways_rendered": standalone_ways_rendered,
+            "relation_member_way_ids": len(relation_member_way_ids),
+        },
+    }
+
+
+def paint_coloring_layer(map_obj, layer_artifact):
+    if not layer_artifact:
         return None
 
+    kind = layer_artifact.get("kind")
+    merged_object = layer_artifact.get("merged_object")
+    island_objects = layer_artifact.get("island_objects") or []
+    col_PaintMap = bpy.context.scene.tp3d.col_PaintMap
+
+    if col_PaintMap and _is_valid_blender_object(merged_object):
+        color_map_faces_by_terrain(map_obj, merged_object)
+        if kind == "WATER" and bpy.context.scene.tp3d.col_WaterSpotCleanup:
+            _cleanup_water_paint_clusters(
+                map_obj,
+                water_material_name="WATER",
+                base_material_name="BASE",
+                tiny_cluster_mul=bpy.context.scene.tp3d.col_WaterSpotCleanupMul,
+                hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
+            )
+        mesh_data = merged_object.data
+        _debug_preserve_object_if_enabled(
+            merged_object,
+            _format_debug_step_name("WATER", "POST_PAINT", "CLEANUP"),
+            kind="WATER",
+        )
+        bpy.data.objects.remove(merged_object, do_unlink=True)
+        bpy.data.meshes.remove(mesh_data)
+        layer_artifact["merged_object"] = None
+
+    if kind == "WATER" and col_PaintMap and island_objects:
+        global pending_island_paint_objects
+        pending_island_paint_objects.extend(island_objects)
+
+    return layer_artifact.get("merged_object")
+
+
+def coloring_main(map,kind = "WATER"):
+    layer_artifact = build_coloring_layer(map, kind)
+    paint_coloring_layer(map, layer_artifact)
+    return layer_artifact.get("merged_object")
 
 def paint_pending_islands_on_map(map_obj):
     global pending_island_paint_objects
@@ -6563,13 +6591,13 @@ def build_terrain_surface(map_obj):
 def collect_osm_layers(map_obj):
     layers = {}
     if col_wActive == 1:
-        layers["WATER"] = coloring_main(map_obj, "WATER")
+        layers["WATER"] = build_coloring_layer(map_obj, "WATER")
     if col_fActive == 1:
-        layers["FOREST"] = coloring_main(map_obj, "FOREST")
+        layers["FOREST"] = build_coloring_layer(map_obj, "FOREST")
     if col_cActive == 1:
-        layers["CITY"] = coloring_main(map_obj, "CITY")
+        layers["CITY"] = build_coloring_layer(map_obj, "CITY")
     if col_glActive == 1:
-        layers["GLACIER"] = coloring_main(map_obj, "GLACIER")
+        layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
     return layers
 
 
@@ -6585,8 +6613,9 @@ def apply_land_base(map_obj):
                     space.shading.type = 'MATERIAL'
 
 
-def apply_water_layer(layer_objects):
-    return layer_objects.get("WATER")
+def apply_water_layer(map_obj, layer_objects):
+    layer = layer_objects.get("WATER")
+    return paint_coloring_layer(map_obj, layer) if layer else None
 
 
 def apply_island_layer(map_obj):
@@ -6594,20 +6623,20 @@ def apply_island_layer(map_obj):
         paint_pending_islands_on_map(map_obj)
 
 
-def apply_overlay_layers(layer_objects):
+def apply_overlay_layers(map_obj, layer_objects):
     return {
-        "FOREST": layer_objects.get("FOREST"),
-        "CITY": layer_objects.get("CITY"),
-        "GLACIER": layer_objects.get("GLACIER"),
+        "FOREST": paint_coloring_layer(map_obj, layer_objects.get("FOREST")),
+        "CITY": paint_coloring_layer(map_obj, layer_objects.get("CITY")),
+        "GLACIER": paint_coloring_layer(map_obj, layer_objects.get("GLACIER")),
     }
 
 
 def run_layer_pipeline(map_obj):
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
-    water_obj = apply_water_layer(layer_objects)
+    water_obj = apply_water_layer(map_obj, layer_objects)
+    overlay_objs = apply_overlay_layers(map_obj, layer_objects)
     apply_island_layer(map_obj)
-    overlay_objs = apply_overlay_layers(layer_objects)
     return {
         "water": water_obj,
         "overlays": overlay_objs,
