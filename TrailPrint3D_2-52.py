@@ -1753,6 +1753,7 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.label(text = "Attribution")
             box.label(text = "Elevation data from OpenTopoData, using the SRTM and other datasets.")
             box.label(text = "Elevation data from Open-Elevation, based on Shuttle Radar Topography Mission (SRTM) data © NASA.")
+            box.label(text = "Elevation data from USGS TNM, The National Map elevation query service (USGS).")
             box.label(text = "Water, Forests, City data © OpenStreetMap contributors")
             box.label(text = "Terrain data from Mapzen, based on data © OpenStreetMap contributors, NASA SRTM, and USGS.")
             layout.separator()  # Adds a horizontal line
