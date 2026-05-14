@@ -6665,13 +6665,20 @@ def build_terrain_surface(map_obj):
 
 def collect_osm_layers(map_obj):
     layers = {}
-    if col_wActive == 1:
+
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    include_water = bool(getattr(props, "col_wActive", False))
+    include_forest = bool(getattr(props, "col_fActive", False))
+    include_city = bool(getattr(props, "col_cActive", False))
+    include_glacier = bool(getattr(props, "col_glActive", False))
+
+    if include_water:
         layers["WATER"] = build_coloring_layer(map_obj, "WATER")
-    if col_fActive == 1:
+    if include_forest:
         layers["FOREST"] = build_coloring_layer(map_obj, "FOREST")
-    if col_cActive == 1:
+    if include_city:
         layers["CITY"] = build_coloring_layer(map_obj, "CITY")
-    if col_glActive == 1:
+    if include_glacier:
         layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
     return layers
 
