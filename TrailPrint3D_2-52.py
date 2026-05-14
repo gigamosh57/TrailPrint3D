@@ -3647,13 +3647,13 @@ def get_tile_elevation(obj):
 
     mesh = obj.data
     global api
-    api = bpy.context.scene.tp3d.get('api',2)
-
+    elevationApi = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
+    api = elevationApi
 
     # Set chunk size based on API
-    if api == 0 or api == 1:
+    if elevationApi in {"OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM"}:
         chunk_size = 100000
-    elif api == 2:
+    elif elevationApi in {"TERRARIUM", "TERRAIN-TILES"}:
         chunk_size = 50000000
     else:
         chunk_size = 100000  # fallback
@@ -3695,11 +3695,13 @@ def get_tile_elevation(obj):
 
         coords = [convert_to_geo(v.x, v.y) for v in chunk]
 
-        if api == 0:
+        if elevationApi == "OPENTOPODATA":
             chunk_elevations = get_elevation_openTopoData(coords, len(vertices), i)
-        elif api == 1:
+        elif elevationApi == "OPEN-ELEVATION":
             chunk_elevations = get_elevation_openElevation(coords, len(vertices), i)
-        elif api == 2:
+        elif elevationApi == "USGS_TNM":
+            chunk_elevations = get_elevation_usgs_tnm(coords, len(vertices), i)
+        elif elevationApi in {"TERRARIUM", "TERRAIN-TILES"}:
             #print(f"Loading {i}/{len(vertices)}")
             chunk_elevations = get_elevation_TerrainTiles(coords, len(vertices), i)
         else:
