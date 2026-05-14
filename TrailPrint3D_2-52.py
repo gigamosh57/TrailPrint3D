@@ -6738,8 +6738,8 @@ def run_layer_pipeline(map_obj):
     layer_objects = collect_osm_layers(map_obj)
     paint_entire_map_base(map_obj, base_material='BASE')
     water_obj = apply_water_layer(map_obj, layer_objects)
-    overlay_objs = apply_overlay_layers(map_obj, layer_objects)
     apply_island_layer(map_obj, layer_objects)
+    overlay_objs = apply_overlay_layers(map_obj, layer_objects)
     return {
         "water": water_obj,
         "overlays": overlay_objs,
