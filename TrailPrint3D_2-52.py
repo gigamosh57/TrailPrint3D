@@ -6613,6 +6613,24 @@ def apply_land_base(map_obj):
                     space.shading.type = 'MATERIAL'
 
 
+def paint_entire_map_base(map_obj, base_material='BASE'):
+    if not map_obj or map_obj.type != 'MESH' or not map_obj.data:
+        return
+
+    base_mat = bpy.data.materials.get(base_material)
+    if base_mat is None:
+        return
+
+    mesh = map_obj.data
+    base_index = mesh.materials.find(base_material)
+    if base_index == -1:
+        mesh.materials.append(base_mat)
+        base_index = mesh.materials.find(base_material)
+
+    for poly in mesh.polygons:
+        poly.material_index = base_index
+
+
 def apply_water_layer(map_obj, layer_objects):
     layer = layer_objects.get("WATER")
     return paint_coloring_layer(map_obj, layer) if layer else None
@@ -6634,6 +6652,7 @@ def apply_overlay_layers(map_obj, layer_objects):
 def run_layer_pipeline(map_obj):
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
+    paint_entire_map_base(map_obj, base_material='BASE')
     water_obj = apply_water_layer(map_obj, layer_objects)
     overlay_objs = apply_overlay_layers(map_obj, layer_objects)
     apply_island_layer(map_obj)
