@@ -6549,9 +6549,71 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     bm.free()
 
     print(f"Colored {colored_count} faces on {map_obj.name} based on {terrain_obj.name}")
-    
 
-       
+
+def build_terrain_surface(map_obj):
+    module_logger.info("Fetching elevation data for map %s", map_obj.name if map_obj else "unknown")
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    tile_verts, diff = get_tile_elevation(map_obj)
+    if len(tile_verts) < 2000:
+        show_message_box(f"Mesh has only {len(tile_verts)} Points. Add more Points to Increase Resolution (e.G Subdivision)", "INFO", "INFO")
+    return tile_verts, diff
+
+
+def collect_osm_layers(map_obj):
+    layers = {}
+    if col_wActive == 1:
+        layers["WATER"] = coloring_main(map_obj, "WATER")
+    if col_fActive == 1:
+        layers["FOREST"] = coloring_main(map_obj, "FOREST")
+    if col_cActive == 1:
+        layers["CITY"] = coloring_main(map_obj, "CITY")
+    if col_glActive == 1:
+        layers["GLACIER"] = coloring_main(map_obj, "GLACIER")
+    return layers
+
+
+def apply_land_base(map_obj):
+    mat = bpy.data.materials.get("BASE")
+    map_obj.data.materials.clear()
+    map_obj.data.materials.append(mat)
+
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    space.shading.type = 'MATERIAL'
+
+
+def apply_water_layer(layer_objects):
+    return layer_objects.get("WATER")
+
+
+def apply_island_layer(map_obj):
+    if bpy.context.scene.tp3d.col_PaintMap == 1:
+        paint_pending_islands_on_map(map_obj)
+
+
+def apply_overlay_layers(layer_objects):
+    return {
+        "FOREST": layer_objects.get("FOREST"),
+        "CITY": layer_objects.get("CITY"),
+        "GLACIER": layer_objects.get("GLACIER"),
+    }
+
+
+def run_layer_pipeline(map_obj):
+    apply_land_base(map_obj)
+    layer_objects = collect_osm_layers(map_obj)
+    water_obj = apply_water_layer(layer_objects)
+    apply_island_layer(map_obj)
+    overlay_objs = apply_overlay_layers(layer_objects)
+    return {
+        "water": water_obj,
+        "overlays": overlay_objs,
+    }
+
+
 def merge_with_map(mapobject, mergeobject):
 
     print(mapobject.name)
@@ -7492,14 +7554,8 @@ def runGeneration(type):
     
 
     #fetch and apply the elevation
-    module_logger.info("Fetching elevation data for map %s", MapObject.name if MapObject else "unknown")
-    
     global autoScale
-    bpy.ops.object.transform_apply(location = False, rotation = True, scale = True)
-    tileVerts, diff = get_tile_elevation(MapObject)
-
-    if len(tileVerts) < 2000:
-            show_message_box(f"Mesh has only {len(tileVerts)} Points. Add more Points to Increase Resolution (e.G Subdivision)", "INFO", "INFO")
+    tileVerts, diff = build_terrain_surface(MapObject)
     
     if fixedElevationScale == True:
         if diff > 0:
@@ -7721,33 +7777,12 @@ def runGeneration(type):
             text.rotation_euler[2] += shapeRotation * (3.14159265 / 180)
     
     
-    #ADD COLORS TO OBJECTS
-    mat = bpy.data.materials.get("BASE")
-    obj.data.materials.clear()
-    obj.data.materials.append(mat)
-
-    #MATERIAL PREVIEW MODE
-    for area in bpy.context.screen.areas:
-        if area.type == 'VIEW_3D':  # make sure it's a 3D Viewport
-            for space in area.spaces:
-                if space.type == 'VIEW_3D':
-                    space.shading.type = 'MATERIAL'  # switch shading
-
-
-
-    #WATER MESH
-    if col_wActive == 1:
-        objWater = coloring_main(obj, "WATER")
-    if col_fActive == 1:
-        objForest = coloring_main(obj, "FOREST")
-    if col_cActive == 1:
-        objCity = coloring_main(obj, "CITY")
-    if col_glActive == 1:
-        objGlacier = coloring_main(obj, "GLACIER")
-
-    # Paint islands after all other map features so islands keep base land color.
-    if bpy.context.scene.tp3d.col_PaintMap == 1:
-        paint_pending_islands_on_map(obj)
+    layer_pipeline_result = run_layer_pipeline(obj)
+    objWater = layer_pipeline_result["water"]
+    overlay_layers = layer_pipeline_result["overlays"]
+    objForest = overlay_layers.get("FOREST")
+    objCity = overlay_layers.get("CITY")
+    objGlacier = overlay_layers.get("GLACIER")
 
 
     
