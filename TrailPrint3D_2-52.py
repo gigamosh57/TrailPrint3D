@@ -129,7 +129,6 @@ objWater = None
 objForest = None
 objCity = None
 objGlacier = None
-pending_island_paint_objects = []
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -6137,10 +6136,6 @@ def paint_coloring_layer(map_obj, layer_artifact):
         bpy.data.meshes.remove(mesh_data)
         layer_artifact["merged_object"] = None
 
-    if kind == "WATER" and col_PaintMap and island_objects:
-        global pending_island_paint_objects
-        pending_island_paint_objects.extend(island_objects)
-
     return layer_artifact.get("merged_object")
 
 
@@ -6149,13 +6144,12 @@ def coloring_main(map,kind = "WATER"):
     paint_coloring_layer(map, layer_artifact)
     return layer_artifact.get("merged_object")
 
-def paint_pending_islands_on_map(map_obj):
-    global pending_island_paint_objects
-    if not pending_island_paint_objects:
+def paint_islands_on_map(map_obj, island_objects):
+    if not island_objects:
         module_logger.info("Island paint pass skipped: no pending islands for map=%s", map_obj.name if map_obj else None)
         return
 
-    for island_obj in pending_island_paint_objects:
+    for island_obj in island_objects:
         if _is_valid_blender_object(island_obj) and island_obj.type == 'MESH':
             island_min_z, island_max_z = _mesh_z_range(island_obj)
             map_min_z, map_max_z = _mesh_z_range(map_obj)
@@ -6197,8 +6191,7 @@ def paint_pending_islands_on_map(map_obj):
                 _is_valid_blender_object(island_obj),
                 getattr(island_obj, "type", None),
             )
-    pending_island_paint_objects = []
-
+    
 
 
 def _is_valid_blender_object(obj):
@@ -6636,9 +6629,11 @@ def apply_water_layer(map_obj, layer_objects):
     return paint_coloring_layer(map_obj, layer) if layer else None
 
 
-def apply_island_layer(map_obj):
+def apply_island_layer(map_obj, layer_objects):
     if bpy.context.scene.tp3d.col_PaintMap == 1:
-        paint_pending_islands_on_map(map_obj)
+        water_layer = layer_objects.get("WATER") if layer_objects else None
+        island_objects = water_layer.get("island_objects") if water_layer else None
+        paint_islands_on_map(map_obj, island_objects)
 
 
 def apply_overlay_layers(map_obj, layer_objects):
@@ -6655,7 +6650,7 @@ def run_layer_pipeline(map_obj):
     paint_entire_map_base(map_obj, base_material='BASE')
     water_obj = apply_water_layer(map_obj, layer_objects)
     overlay_objs = apply_overlay_layers(map_obj, layer_objects)
-    apply_island_layer(map_obj)
+    apply_island_layer(map_obj, layer_objects)
     return {
         "water": water_obj,
         "overlays": overlay_objs,
