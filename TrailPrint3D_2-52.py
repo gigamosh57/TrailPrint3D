@@ -563,10 +563,11 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.tp3d
+        provider = getattr(props, "api_enum", "") or props.api
         lat = props.jMapLat
         lon = props.jMapLon
 
-        if props.api == "OPEN-ELEVATION":
+        if provider == "OPEN-ELEVATION":
             url = "https://api.open-elevation.com/api/v1/lookup"
             payload = {"locations": [{"latitude": lat, "longitude": lon}]}
             try:
@@ -578,7 +579,7 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
             except requests.exceptions.RequestException as e:
                 code = getattr(getattr(e, "response", None), "status_code", "no_response")
                 props.o_elevationApiStatus = f"Status: ERROR ({code}) Open-Elevation | {str(e)}"
-        elif props.api == "OPENTOPODATA":
+        elif provider == "OPENTOPODATA":
             base = props.selfHosted.strip() if props.selfHosted.strip() else "https://api.opentopodata.org/v1/"
             url = f"{base}{props.dataset}?locations={lat},{lon}"
             try:
@@ -590,6 +591,30 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
             except requests.exceptions.RequestException as e:
                 code = getattr(getattr(e, "response", None), "status_code", "no_response")
                 props.o_elevationApiStatus = f"Status: ERROR ({code}) OpenTopoData | {str(e)}"
+        elif provider == "USGS_TNM":
+            test_lat = 39.7392
+            test_lon = -104.9903
+            url = f"https://epqs.nationalmap.gov/v1/json?x={test_lon}&y={test_lat}&units=Meters&wkid=4326"
+            debug_prefix = f"USGS TNM debug | url={url}"
+            print(debug_prefix)
+            module_logger.debug(debug_prefix)
+            try:
+                response = requests.get(url, timeout=12)
+                response.raise_for_status()
+                payload = response.json()
+                module_logger.debug("USGS TNM debug | status=%s | payload=%s", response.status_code, payload)
+                print(f"USGS TNM debug | status={response.status_code} | payload={payload}")
+                value = payload.get("value")
+                if value is None:
+                    value = payload.get("USGS_Elevation_Point_Query_Service", {}).get("Elevation_Query", {}).get("Elevation")
+                if value is None:
+                    raise ValueError(f"No elevation value found in response: {payload}")
+                props.o_elevationApiStatus = f"Status: OK ({response.status_code}) USGS TNM | elev={value}"
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", "no_response")
+                module_logger.exception("USGS TNM debug | request failed | code=%s | error=%s", code, str(e))
+                print(f"USGS TNM debug | request failed | code={code} | error={str(e)}")
+                props.o_elevationApiStatus = f"Status: ERROR ({code}) USGS TNM | {str(e)}"
         else:
             props.o_elevationApiStatus = "Status: Terrain-Tiles uses AWS tile server (no API test endpoint here)"
 
