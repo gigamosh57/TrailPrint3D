@@ -3197,9 +3197,19 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         try:
             url = "https://tnmaccess.nationalmap.gov/api/v1/point"
             params = {"x": lon, "y": lat, "units": "Meters", "output": "json"}
+            prepared_request = requests.Request("GET", url, params=params).prepare()
+            request_url = prepared_request.url
+            module_logger.debug("USGS TNM request | point=%s/%s | lat=%s lon=%s | url=%s", nr, int(lenv), lat, lon, request_url)
+            print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
+
             response = requests.get(url, params=params, timeout=10)
+            module_logger.debug("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
+            print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
             response.raise_for_status()
+
             data = response.json()
+            module_logger.debug("USGS TNM data | point=%s/%s | payload=%s", nr, int(lenv), data)
+            print(f"USGS TNM data | point={nr}/{int(lenv)} | payload={data}")
 
             elevation = data.get("elevation", None)
             if elevation is None and isinstance(data.get("value"), dict):
@@ -3213,10 +3223,16 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             try:
                 elevation = float(elevation)
             except (TypeError, ValueError):
+                module_logger.warning("USGS TNM parse warning | point=%s/%s | lat=%s lon=%s | raw_elevation=%s", nr, int(lenv), lat, lon, elevation)
+                print(f"USGS TNM parse warning | point={nr}/{int(lenv)} | lat={lat} lon={lon} | raw_elevation={elevation}")
                 elevation = 0
 
+            module_logger.debug("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
+            print(f"USGS TNM parsed elevation | point={nr}/{int(lenv)} | lat={lat} lon={lon} | elevation={elevation}")
+
         except Exception as e:
-            print(f"USGS TNM request failed for ({lat}, {lon}): {e}")
+            module_logger.exception("USGS TNM request failed | point=%s/%s | lat=%s lon=%s | error=%s", nr, int(lenv), lat, lon, str(e))
+            print(f"USGS TNM request failed | point={nr}/{int(lenv)} | lat={lat} lon={lon} | error={str(e)}")
             elevation = 0
 
         cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
