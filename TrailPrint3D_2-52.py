@@ -286,6 +286,7 @@ class MyProperties(bpy.types.PropertyGroup):
         items=[
             ("OPENTOPODATA", "Opentopodata", "Slower but more accurate elevation"),
             ("OPEN-ELEVATION","Open-Elevation","Faster but some regions are low quali"),
+            ("USGS_TNM", "USGS TNM", "Uses The National Map elevation point query endpoint"),
             ("TERRAIN-TILES", "Terrain-Tiles", "Currently Fastest available set")
         ],
         default = "TERRAIN-TILES"
