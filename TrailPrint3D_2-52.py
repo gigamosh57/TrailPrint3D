@@ -3145,6 +3145,59 @@ def get_elevation_openTopoData(coords, lenv = 0, pointsDone = 0):
 
     return elevations
 
+
+
+def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
+    """Fetches real elevation for each vertex using USGS TNM point query."""
+
+    disableCache = bpy.context.scene.tp3d.get("disableCache", 0)
+
+    # Ensure the cache is loaded
+    if not _elevation_cache:
+        load_elevation_cache()
+
+    elevations = [0] * len(coords)
+
+    for i, (lat, lon) in enumerate(coords):
+        cached_elevation = get_cached_elevation(lat, lon, api_type="usgs_tnm")
+        if cached_elevation is not None and disableCache == 0:
+            elevations[i] = cached_elevation
+            continue
+
+        nr = i + 1 + pointsDone
+        addition = f" {nr}/{int(lenv)}"
+        send_api_request(addition)
+
+        try:
+            url = "https://tnmaccess.nationalmap.gov/api/v1/point"
+            params = {"x": lon, "y": lat, "units": "Meters", "output": "json"}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            elevation = data.get("elevation", None)
+            if elevation is None and isinstance(data.get("value"), dict):
+                elevation = data["value"].get("elevation", None)
+            if elevation is None and isinstance(data.get("result"), dict):
+                elevation = data["result"].get("elevation", None)
+
+            if elevation is None:
+                elevation = 0
+
+            try:
+                elevation = float(elevation)
+            except (TypeError, ValueError):
+                elevation = 0
+
+        except Exception as e:
+            print(f"USGS TNM request failed for ({lat}, {lon}): {e}")
+            elevation = 0
+
+        cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
+        elevations[i] = elevation
+
+    return elevations
+
 def get_elevation_openElevation(coords, lenv = 0, pointsDone = 0):
     """Fetches real elevation for each vertex using Open-Elevation with request batching."""
     
