@@ -597,12 +597,12 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
             url = f"https://epqs.nationalmap.gov/v1/json?x={test_lon}&y={test_lat}&units=Meters&wkid=4326"
             debug_prefix = f"USGS TNM debug | url={url}"
             print(debug_prefix)
-            module_logger.debug(debug_prefix)
+            module_logger.info(debug_prefix)
             try:
                 response = requests.get(url, timeout=12)
                 response.raise_for_status()
                 payload = response.json()
-                module_logger.debug("USGS TNM debug | status=%s | payload=%s", response.status_code, payload)
+                module_logger.info("USGS TNM debug | status=%s | payload=%s", response.status_code, payload)
                 print(f"USGS TNM debug | status={response.status_code} | payload={payload}")
                 value = payload.get("value")
                 if value is None:
@@ -3199,16 +3199,16 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             params = {"x": lon, "y": lat, "units": "Meters", "output": "json"}
             prepared_request = requests.Request("GET", url, params=params).prepare()
             request_url = prepared_request.url
-            module_logger.debug("USGS TNM request | point=%s/%s | lat=%s lon=%s | url=%s", nr, int(lenv), lat, lon, request_url)
+            module_logger.info("USGS TNM request | point=%s/%s | lat=%s lon=%s | url=%s", nr, int(lenv), lat, lon, request_url)
             print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
 
             response = requests.get(url, params=params, timeout=10)
-            module_logger.debug("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
+            module_logger.info("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
             print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
             response.raise_for_status()
 
             data = response.json()
-            module_logger.debug("USGS TNM data | point=%s/%s | payload=%s", nr, int(lenv), data)
+            module_logger.info("USGS TNM data | point=%s/%s | payload=%s", nr, int(lenv), data)
             print(f"USGS TNM data | point={nr}/{int(lenv)} | payload={data}")
 
             elevation = data.get("elevation", None)
@@ -3227,7 +3227,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
                 print(f"USGS TNM parse warning | point={nr}/{int(lenv)} | lat={lat} lon={lon} | raw_elevation={elevation}")
                 elevation = 0
 
-            module_logger.debug("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
+            module_logger.info("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
             print(f"USGS TNM parsed elevation | point={nr}/{int(lenv)} | lat={lat} lon={lon} | elevation={elevation}")
 
         except Exception as e:
