@@ -3183,10 +3183,12 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         load_elevation_cache()
 
     elevations = [0] * len(coords)
+    cache_hits = 0
 
     for i, (lat, lon) in enumerate(coords):
         cached_elevation = get_cached_elevation(lat, lon, api_type="usgs_tnm")
         if cached_elevation is not None and disableCache == 0:
+            cache_hits += 1
             elevations[i] = cached_elevation
             continue
 
@@ -3238,6 +3240,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
         elevations[i] = elevation
 
+    module_logger.info("USGS TNM summary | points=%s | cache_hits=%s | network_calls=%s", len(coords), cache_hits, len(coords) - cache_hits)
     return elevations
 
 def get_elevation_openElevation(coords, lenv = 0, pointsDone = 0):
@@ -3689,8 +3692,10 @@ def get_tile_elevation(obj):
 
     mesh = obj.data
     global api
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
     elevationApi = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
     api = elevationApi
+    module_logger.info("get_tile_elevation start | map=%s | props.api=%s | idprop_api=%s", getattr(obj, "name", "unknown"), getattr(props, "api", None), elevationApi)
 
     # Set chunk size based on API
     if elevationApi in {"OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM"}:
@@ -3699,6 +3704,8 @@ def get_tile_elevation(obj):
         chunk_size = 50000000
     else:
         chunk_size = 100000  # fallback
+
+    module_logger.info("Elevation API selected=%s chunk_size=%s", elevationApi, chunk_size)
 
     vertices = list(mesh.vertices)
     obj_matrix = obj.matrix_world
@@ -6671,9 +6678,12 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
 
 
 def build_terrain_surface(map_obj):
-    module_logger.info("Fetching elevation data for map %s", map_obj.name if map_obj else "unknown")
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    module_logger.info("Fetching elevation data for map %s | props.api=%s", map_obj.name if map_obj else "unknown", getattr(props, "api", None))
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    module_logger.info("build_terrain_surface before get_tile_elevation | map=%s", map_obj.name if map_obj else "unknown")
     tile_verts, diff = get_tile_elevation(map_obj)
+    module_logger.info("build_terrain_surface after get_tile_elevation | verts=%s | elev_range=%s", len(tile_verts), diff)
     if len(tile_verts) < 2000:
         show_message_box(f"Mesh has only {len(tile_verts)} Points. Add more Points to Increase Resolution (e.G Subdivision)", "INFO", "INFO")
     return tile_verts, diff
