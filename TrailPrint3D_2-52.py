@@ -3201,11 +3201,12 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             params = {"x": lon, "y": lat, "units": "Meters", "output": "json"}
             prepared_request = requests.Request("GET", url, params=params).prepare()
             request_url = prepared_request.url
-            module_logger.info("USGS TNM request | point=%s/%s | lat=%s lon=%s | url=%s", nr, int(lenv), lat, lon, request_url)
+            module_logger.info("USGS TNM request | point=%s/%s | lat=%s lon=%s | params=%s | url=%s", nr, int(lenv), lat, lon, params, request_url)
             print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
 
             response = requests.get(url, params=params, timeout=10)
             module_logger.info("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
+            module_logger.info("USGS TNM response text | point=%s/%s | body=%s", nr, int(lenv), response.text)
             print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
             response.raise_for_status()
 
@@ -3688,14 +3689,38 @@ def RaycastCurveToAnyMesh(curve_obj, offset_z=1000.0, smooth_after=True):
 
 
 # Get tile elevation
+def normalize_elevation_api_value(props, api_raw):
+    """Normalize legacy/int and string API values to current enum keys."""
+    enum_order = ["OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM", "TERRAIN-TILES"]
+
+    if isinstance(api_raw, str):
+        stripped = api_raw.strip()
+        if stripped in enum_order or stripped == "TERRARIUM":
+            return stripped
+        if stripped.isdigit():
+            idx = int(stripped)
+            if 0 <= idx < len(enum_order):
+                return enum_order[idx]
+
+    if isinstance(api_raw, int) and 0 <= api_raw < len(enum_order):
+        return enum_order[api_raw]
+
+    prop_value = getattr(props, "api", None) if props is not None else None
+    if isinstance(prop_value, str) and prop_value in enum_order:
+        return prop_value
+
+    return "TERRAIN-TILES"
+
+
 def get_tile_elevation(obj):
 
     mesh = obj.data
     global api
     props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
-    elevationApi = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
+    api_raw = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
+    elevationApi = normalize_elevation_api_value(props, api_raw)
     api = elevationApi
-    module_logger.info("get_tile_elevation start | map=%s | props.api=%s | idprop_api=%s", getattr(obj, "name", "unknown"), getattr(props, "api", None), elevationApi)
+    module_logger.info("get_tile_elevation start | map=%s | props.api=%s | idprop_api=%s | normalized_api=%s", getattr(obj, "name", "unknown"), getattr(props, "api", None), api_raw, elevationApi)
 
     # Set chunk size based on API
     if elevationApi in {"OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM"}:
