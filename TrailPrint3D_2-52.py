@@ -597,12 +597,12 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
             url = f"https://epqs.nationalmap.gov/v1/json?x={test_lon}&y={test_lat}&units=Meters&wkid=4326"
             debug_prefix = f"USGS TNM debug | url={url}"
             print(debug_prefix)
-            module_logger.debug(debug_prefix)
+            module_logger.info(debug_prefix)
             try:
                 response = requests.get(url, timeout=12)
                 response.raise_for_status()
                 payload = response.json()
-                module_logger.debug("USGS TNM debug | status=%s | payload=%s", response.status_code, payload)
+                module_logger.info("USGS TNM debug | status=%s | payload=%s", response.status_code, payload)
                 print(f"USGS TNM debug | status={response.status_code} | payload={payload}")
                 value = payload.get("value")
                 if value is None:
@@ -3183,10 +3183,12 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         load_elevation_cache()
 
     elevations = [0] * len(coords)
+    cache_hits = 0
 
     for i, (lat, lon) in enumerate(coords):
         cached_elevation = get_cached_elevation(lat, lon, api_type="usgs_tnm")
         if cached_elevation is not None and disableCache == 0:
+            cache_hits += 1
             elevations[i] = cached_elevation
             continue
 
@@ -3199,16 +3201,17 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             params = {"x": lon, "y": lat, "units": "Meters", "output": "json"}
             prepared_request = requests.Request("GET", url, params=params).prepare()
             request_url = prepared_request.url
-            module_logger.debug("USGS TNM request | point=%s/%s | lat=%s lon=%s | url=%s", nr, int(lenv), lat, lon, request_url)
+            module_logger.info("USGS TNM request | point=%s/%s | lat=%s lon=%s | params=%s | url=%s", nr, int(lenv), lat, lon, params, request_url)
             print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
 
             response = requests.get(url, params=params, timeout=10)
-            module_logger.debug("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
+            module_logger.info("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
+            module_logger.info("USGS TNM response text | point=%s/%s | body=%s", nr, int(lenv), response.text)
             print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
             response.raise_for_status()
 
             data = response.json()
-            module_logger.debug("USGS TNM data | point=%s/%s | payload=%s", nr, int(lenv), data)
+            module_logger.info("USGS TNM data | point=%s/%s | payload=%s", nr, int(lenv), data)
             print(f"USGS TNM data | point={nr}/{int(lenv)} | payload={data}")
 
             elevation = data.get("elevation", None)
@@ -3227,7 +3230,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
                 print(f"USGS TNM parse warning | point={nr}/{int(lenv)} | lat={lat} lon={lon} | raw_elevation={elevation}")
                 elevation = 0
 
-            module_logger.debug("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
+            module_logger.info("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
             print(f"USGS TNM parsed elevation | point={nr}/{int(lenv)} | lat={lat} lon={lon} | elevation={elevation}")
 
         except Exception as e:
@@ -3238,6 +3241,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
         elevations[i] = elevation
 
+    module_logger.info("USGS TNM summary | points=%s | cache_hits=%s | network_calls=%s", len(coords), cache_hits, len(coords) - cache_hits)
     return elevations
 
 def get_elevation_openElevation(coords, lenv = 0, pointsDone = 0):
@@ -3685,12 +3689,38 @@ def RaycastCurveToAnyMesh(curve_obj, offset_z=1000.0, smooth_after=True):
 
 
 # Get tile elevation
+def normalize_elevation_api_value(props, api_raw):
+    """Normalize legacy/int and string API values to current enum keys."""
+    enum_order = ["OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM", "TERRAIN-TILES"]
+
+    if isinstance(api_raw, str):
+        stripped = api_raw.strip()
+        if stripped in enum_order or stripped == "TERRARIUM":
+            return stripped
+        if stripped.isdigit():
+            idx = int(stripped)
+            if 0 <= idx < len(enum_order):
+                return enum_order[idx]
+
+    if isinstance(api_raw, int) and 0 <= api_raw < len(enum_order):
+        return enum_order[api_raw]
+
+    prop_value = getattr(props, "api", None) if props is not None else None
+    if isinstance(prop_value, str) and prop_value in enum_order:
+        return prop_value
+
+    return "TERRAIN-TILES"
+
+
 def get_tile_elevation(obj):
 
     mesh = obj.data
     global api
-    elevationApi = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    api_raw = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
+    elevationApi = normalize_elevation_api_value(props, api_raw)
     api = elevationApi
+    module_logger.info("get_tile_elevation start | map=%s | props.api=%s | idprop_api=%s | normalized_api=%s", getattr(obj, "name", "unknown"), getattr(props, "api", None), api_raw, elevationApi)
 
     # Set chunk size based on API
     if elevationApi in {"OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM"}:
@@ -3699,6 +3729,8 @@ def get_tile_elevation(obj):
         chunk_size = 50000000
     else:
         chunk_size = 100000  # fallback
+
+    module_logger.info("Elevation API selected=%s chunk_size=%s", elevationApi, chunk_size)
 
     vertices = list(mesh.vertices)
     obj_matrix = obj.matrix_world
@@ -6671,9 +6703,12 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
 
 
 def build_terrain_surface(map_obj):
-    module_logger.info("Fetching elevation data for map %s", map_obj.name if map_obj else "unknown")
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    module_logger.info("Fetching elevation data for map %s | props.api=%s", map_obj.name if map_obj else "unknown", getattr(props, "api", None))
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    module_logger.info("build_terrain_surface before get_tile_elevation | map=%s", map_obj.name if map_obj else "unknown")
     tile_verts, diff = get_tile_elevation(map_obj)
+    module_logger.info("build_terrain_surface after get_tile_elevation | verts=%s | elev_range=%s", len(tile_verts), diff)
     if len(tile_verts) < 2000:
         show_message_box(f"Mesh has only {len(tile_verts)} Points. Add more Points to Increase Resolution (e.G Subdivision)", "INFO", "INFO")
     return tile_verts, diff
