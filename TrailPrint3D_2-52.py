@@ -599,7 +599,7 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
             print(debug_prefix)
             module_logger.info(debug_prefix)
             try:
-                response = requests.get(url, timeout=12)
+                response = requests.get(url, timeout=12, headers=get_usgs_auth_headers())
                 response.raise_for_status()
                 payload = response.json()
                 module_logger.info("USGS TNM debug | status=%s | payload=%s", response.status_code, payload)
@@ -620,6 +620,12 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
 
         self.report({'INFO'}, props.o_elevationApiStatus)
         return {'FINISHED'}
+
+
+def get_usgs_auth_headers():
+    """Build auth headers for USGS requests using a local environment token."""
+    token = os.environ.get("USGS_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def open_website(self, context):
@@ -3204,7 +3210,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             module_logger.info("USGS TNM request | point=%s/%s | lat=%s lon=%s | params=%s | url=%s", nr, int(lenv), lat, lon, params, request_url)
             print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
 
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=10, headers=get_usgs_auth_headers())
             module_logger.info("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
             module_logger.info("USGS TNM response text | point=%s/%s | body=%s", nr, int(lenv), response.text)
             print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
