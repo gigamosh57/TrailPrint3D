@@ -3190,12 +3190,27 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
 
     elevations = [0] * len(coords)
     cache_hits = 0
+    cache_zero_hits = 0
+    network_calls = 0
+    network_zero_results = 0
+    first_network_url = None
+
+    module_logger.info(
+        "USGS TNM start | total_points=%s | disableCache=%s | cache_entries=%s | pointsDone=%s | lenv=%s",
+        len(coords),
+        disableCache,
+        len(_elevation_cache),
+        pointsDone,
+        lenv,
+    )
 
     for i, (lat, lon) in enumerate(coords):
         cached_elevation = get_cached_elevation(lat, lon, api_type="usgs_tnm")
         if cached_elevation is not None and disableCache == 0:
             cache_hits += 1
             elevations[i] = cached_elevation
+            if cached_elevation == 0:
+                cache_zero_hits += 1
             continue
 
         nr = i + 1 + pointsDone
@@ -3211,6 +3226,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
 
             response = requests.get(url, params=params, timeout=10, headers=get_usgs_auth_headers())
+            network_calls += 1
             module_logger.info("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
             module_logger.info("USGS TNM response text | point=%s/%s | body=%s", nr, int(lenv), response.text)
             print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
@@ -3228,6 +3244,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
 
             if elevation is None:
                 elevation = 0
+                network_zero_results += 1
 
             try:
                 elevation = float(elevation)
@@ -3235,6 +3252,9 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
                 module_logger.warning("USGS TNM parse warning | point=%s/%s | lat=%s lon=%s | raw_elevation=%s", nr, int(lenv), lat, lon, elevation)
                 print(f"USGS TNM parse warning | point={nr}/{int(lenv)} | lat={lat} lon={lon} | raw_elevation={elevation}")
                 elevation = 0
+
+            if first_network_url is None:
+                first_network_url = request_url
 
             module_logger.info("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
             print(f"USGS TNM parsed elevation | point={nr}/{int(lenv)} | lat={lat} lon={lon} | elevation={elevation}")
@@ -3247,7 +3267,20 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
         elevations[i] = elevation
 
-    module_logger.info("USGS TNM summary | points=%s | cache_hits=%s | network_calls=%s", len(coords), cache_hits, len(coords) - cache_hits)
+    sample_coords = coords[:3]
+    sample_elevations = elevations[:3]
+    module_logger.info(
+        "USGS TNM summary | points=%s | cache_hits=%s | cache_zero_hits=%s | network_calls=%s | network_zero_results=%s | disableCache=%s | first_network_url=%s | sample_coords=%s | sample_elevations=%s",
+        len(coords),
+        cache_hits,
+        cache_zero_hits,
+        network_calls,
+        network_zero_results,
+        disableCache,
+        first_network_url,
+        sample_coords,
+        sample_elevations,
+    )
     return elevations
 
 def get_elevation_openElevation(coords, lenv = 0, pointsDone = 0):
@@ -3726,7 +3759,8 @@ def get_tile_elevation(obj):
     api_raw = bpy.context.scene.tp3d.get("api", "TERRAIN-TILES")
     elevationApi = normalize_elevation_api_value(props, api_raw)
     api = elevationApi
-    module_logger.info("get_tile_elevation start | map=%s | props.api=%s | idprop_api=%s | normalized_api=%s", getattr(obj, "name", "unknown"), getattr(props, "api", None), api_raw, elevationApi)
+    disable_cache = bpy.context.scene.tp3d.get("disableCache", 0)
+    module_logger.info("get_tile_elevation start | map=%s | props.api=%s | idprop_api=%s | normalized_api=%s | disableCache=%s", getattr(obj, "name", "unknown"), getattr(props, "api", None), api_raw, elevationApi, disable_cache)
 
     # Set chunk size based on API
     if elevationApi in {"OPENTOPODATA", "OPEN-ELEVATION", "USGS_TNM"}:
