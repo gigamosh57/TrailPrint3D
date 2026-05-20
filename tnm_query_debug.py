@@ -88,11 +88,11 @@ def extract_epqs_elevation(payload: Dict[str, Any], logger: logging.Logger) -> A
     return payload.get("USGS_Elevation_Point_Query_Service", {}).get("Elevation_Query", {}).get("Elevation")
 
 
-def run_request(url: str, timeout: float, headers: Dict[str, str], logger: logging.Logger) -> Dict[str, Any]:
-    logger.info("Request | GET %s | timeout=%.2fs", url, timeout)
+def run_request(url: str, timeout: float, headers: Dict[str, str], logger: logging.Logger, method: str = "GET") -> Dict[str, Any]:
+    logger.info("Request | %s %s | timeout=%.2fs", method, url, timeout)
     logger.debug("Headers: %s", headers if headers else "{}")
 
-    req = Request(url, method="GET")
+    req = Request(url, method=method)
     for key, value in headers.items():
         req.add_header(key, value)
 
@@ -101,11 +101,13 @@ def run_request(url: str, timeout: float, headers: Dict[str, str], logger: loggi
         with urlopen(req, timeout=timeout) as response:
             elapsed = time.perf_counter() - start
             status = getattr(response, "status", None)
-            body = response.read().decode("utf-8", "replace")
+            body = response.read()
             response_headers = dict(response.headers.items())
             logger.info("Response | status=%s | elapsed=%.3fs", status, elapsed)
             logger.debug("Response headers: %s", response_headers)
-            logger.debug("Response body (first 2000 chars): %s", body[:2000])
+            logger.debug("Response body bytes=%s", len(body))
+            if method == "GET" and "json" in response_headers.get("Content-Type", "").lower():
+                logger.debug("Response body (first 2000 chars): %s", body.decode("utf-8", "replace")[:2000])
             return {
                 "status": status,
                 "elapsed": elapsed,
@@ -131,7 +133,7 @@ def run_epqs(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 1
 
     try:
-        payload = json.loads(result["body"])
+        payload = json.loads(result["body"].decode("utf-8", "replace"))
         logger.debug("Parsed JSON: %s", json.dumps(payload, indent=2, ensure_ascii=False))
     except Exception as exc:
         logger.error("JSON parse failed: %s", exc)
@@ -178,7 +180,7 @@ def run_3dep(args: argparse.Namespace, logger: logging.Logger) -> int:
     # For f=json, parse details and print the downloadable URL.
     if args.response_format.lower() == "json":
         try:
-            payload = json.loads(result["body"])
+            payload = json.loads(result["body"].decode("utf-8", "replace"))
             logger.debug("Parsed JSON: %s", json.dumps(payload, indent=2, ensure_ascii=False))
         except Exception as exc:
             logger.error("JSON parse failed: %s", exc)
@@ -187,6 +189,31 @@ def run_3dep(args: argparse.Namespace, logger: logging.Logger) -> int:
         href = payload.get("href")
         if href:
             logger.info("SUCCESS | provider=3dep | export href=%s", href)
+            try:
+                raster_result = run_request(href, args.timeout, headers, logger)
+            except Exception as exc:
+                logger.error("3DEP raster fetch failed after metadata success | href=%s | error=%s", href, exc)
+                return 4
+
+            raster_content_type = raster_result["headers"].get("Content-Type", "").lower()
+            if raster_result["status"] != 200:
+                logger.error(
+                    "3DEP raster fetch failed after metadata success | expected status=200 | got=%s",
+                    raster_result["status"],
+                )
+                return 4
+            if not any(token in raster_content_type for token in ("image/tiff", "image/tif", "application/octet-stream")):
+                logger.error(
+                    "3DEP raster fetch failed after metadata success | unexpected content-type=%s",
+                    raster_result["headers"].get("Content-Type", ""),
+                )
+                return 4
+            logger.info(
+                "SUCCESS | provider=3dep | metadata ok + raster fetch ok | href=%s | content-type=%s | bytes=%s",
+                href,
+                raster_result["headers"].get("Content-Type", ""),
+                len(raster_result["body"]),
+            )
         else:
             logger.warning("3DEP JSON response did not include href; payload keys=%s", sorted(payload.keys()))
             logger.info("SUCCESS | provider=3dep | json response received")
