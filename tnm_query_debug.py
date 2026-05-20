@@ -6,6 +6,7 @@ Supports:
 - 3DEP ImageServer exportImage metadata requests for bbox coverage testing
 """
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -31,6 +32,27 @@ DEFAULT_MAX_LON = -104.97
 DEFAULT_MAX_LAT = 39.76
 DEFAULT_WIDTH = 512
 DEFAULT_HEIGHT = 512
+
+
+def build_3dep_cache_paths(args: argparse.Namespace) -> Dict[str, str]:
+    cache_key = hashlib.sha1(
+        f"{args.min_lon},{args.min_lat},{args.max_lon},{args.max_lat}|{args.width}x{args.height}|{args.wkid}|{args.image_format}|{args.pixel_type}".encode("utf-8")
+    ).hexdigest()
+    root = os.path.abspath(os.path.expanduser(args.cache_dir))
+    os.makedirs(root, exist_ok=True)
+    return {
+        "metadata": os.path.join(root, f"{cache_key}.json"),
+        "raster": os.path.join(root, f"{cache_key}.tif"),
+    }
+
+
+def write_3dep_cache(args: argparse.Namespace, metadata: Dict[str, Any], raster_body: bytes, logger: logging.Logger) -> None:
+    paths = build_3dep_cache_paths(args)
+    with open(paths["metadata"], "w", encoding="utf-8") as f_meta:
+        json.dump(metadata, f_meta, indent=2)
+    with open(paths["raster"], "wb") as f_raster:
+        f_raster.write(raster_body)
+    logger.info("3DEP cache saved | metadata=%s | raster=%s", paths["metadata"], paths["raster"])
 
 
 def configure_logging(verbose: bool) -> logging.Logger:
@@ -189,11 +211,28 @@ def run_3dep(args: argparse.Namespace, logger: logging.Logger) -> int:
         href = payload.get("href")
         if href:
             logger.info("SUCCESS | provider=3dep | export href=%s", href)
+            raster_result = None
             try:
                 raster_result = run_request(href, args.timeout, headers, logger)
             except Exception as exc:
-                logger.error("3DEP raster fetch failed after metadata success | href=%s | error=%s", href, exc)
-                return 4
+                logger.warning(
+                    "3DEP raster fetch from export href failed; attempting direct image fallback | href=%s | error=%s",
+                    href,
+                    exc,
+                )
+                image_args = argparse.Namespace(**vars(args))
+                image_args.response_format = "image"
+                fallback_image_url = build_3dep_export_url(args.base_url, image_args, logger)
+                try:
+                    raster_result = run_request(fallback_image_url, args.timeout, headers, logger)
+                except Exception as fallback_exc:
+                    logger.error(
+                        "3DEP raster fetch failed after metadata success | href=%s | fallback_url=%s | error=%s",
+                        href,
+                        fallback_image_url,
+                        fallback_exc,
+                    )
+                    return 4
 
             raster_content_type = raster_result["headers"].get("Content-Type", "").lower()
             if raster_result["status"] != 200:
@@ -214,6 +253,7 @@ def run_3dep(args: argparse.Namespace, logger: logging.Logger) -> int:
                 raster_result["headers"].get("Content-Type", ""),
                 len(raster_result["body"]),
             )
+            write_3dep_cache(args, payload, raster_result["body"], logger)
         else:
             logger.warning("3DEP JSON response did not include href; payload keys=%s", sorted(payload.keys()))
             logger.info("SUCCESS | provider=3dep | json response received")
@@ -232,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--wkid", type=int, default=DEFAULT_WKID)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--cache-dir", default=".cache/tnm_3dep")
 
     # EPQS point params
     parser.add_argument("--lat", type=float, default=DEFAULT_LAT)
