@@ -67,7 +67,15 @@ import csv
 import functools
 import logging
 import random
+import hashlib
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from logging.handlers import RotatingFileHandler
+
+try:
+    import rasterio # type: ignore
+except ImportError:
+    rasterio = None
 
 
 gpx_file_path = ""
@@ -137,6 +145,9 @@ elevation_cache_file = os.path.join(bpy.utils.user_resource('CONFIG'), "elevatio
 terrarium_cache_dir = os.path.join(bpy.utils.user_resource('CONFIG'), "terrarium_cache")
 if not os.path.exists(terrarium_cache_dir):
     os.makedirs(terrarium_cache_dir)
+tnm_3dep_cache_dir = os.path.join(bpy.utils.user_resource('CONFIG'), "tnm_3dep")
+if not os.path.exists(tnm_3dep_cache_dir):
+    os.makedirs(tnm_3dep_cache_dir)
 
 # In-memory elevation cache
 _elevation_cache = {}
@@ -3180,7 +3191,12 @@ def get_elevation_openTopoData(coords, lenv = 0, pointsDone = 0):
 
 
 def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
-    """Fetches real elevation for each vertex using USGS TNM point query."""
+    """Fetches real elevation for each vertex using USGS TNM 3DEP exportImage raster query."""
+    if rasterio is None:
+        print("USGS TNM 3DEP unavailable: rasterio is not installed")
+        return [0] * len(coords)
+    if not coords:
+        return []
 
     disableCache = bpy.context.scene.tp3d.get("disableCache", 0)
 
@@ -3204,6 +3220,8 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         lenv,
     )
 
+    coords_to_fetch = []
+    coords_indices = []
     for i, (lat, lon) in enumerate(coords):
         cached_elevation = get_cached_elevation(lat, lon, api_type="usgs_tnm")
         if cached_elevation is not None and disableCache == 0:
@@ -3211,61 +3229,69 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             elevations[i] = cached_elevation
             if cached_elevation == 0:
                 cache_zero_hits += 1
-            continue
+        else:
+            coords_to_fetch.append((lat, lon))
+            coords_indices.append(i)
 
-        nr = i + 1 + pointsDone
-        addition = f" {nr}/{int(lenv)}"
-        send_api_request(addition)
+    if not coords_to_fetch:
+        return elevations
 
-        try:
-            url = "https://tnmaccess.nationalmap.gov/api/v1/point"
-            params = {"x": lon, "y": lat, "units": "Meters", "output": "json"}
-            prepared_request = requests.Request("GET", url, params=params).prepare()
-            request_url = prepared_request.url
-            module_logger.info("USGS TNM request | point=%s/%s | lat=%s lon=%s | params=%s | url=%s", nr, int(lenv), lat, lon, params, request_url)
-            print(f"USGS TNM request | point={nr}/{int(lenv)} | lat={lat} lon={lon} | url={request_url}")
+    lats = [c[0] for c in coords_to_fetch]
+    lons = [c[1] for c in coords_to_fetch]
+    pad = 0.0002
+    min_lat = min(lats) - pad
+    max_lat = max(lats) + pad
+    min_lon = min(lons) - pad
+    max_lon = max(lons) + pad
 
-            response = requests.get(url, params=params, timeout=10, headers=get_usgs_auth_headers())
-            network_calls += 1
-            module_logger.info("USGS TNM response | point=%s/%s | status=%s | reason=%s", nr, int(lenv), response.status_code, response.reason)
-            module_logger.info("USGS TNM response text | point=%s/%s | body=%s", nr, int(lenv), response.text)
-            print(f"USGS TNM response | point={nr}/{int(lenv)} | status={response.status_code} | reason={response.reason}")
-            response.raise_for_status()
+    cache_key = hashlib.sha1(
+        f"{min_lon},{min_lat},{max_lon},{max_lat}|1024x1024|4326|tiff|F32".encode("utf-8")
+    ).hexdigest()
+    raster_path = os.path.join(tnm_3dep_cache_dir, f"{cache_key}.tif")
 
-            data = response.json()
-            module_logger.info("USGS TNM data | point=%s/%s | payload=%s", nr, int(lenv), data)
-            print(f"USGS TNM data | point={nr}/{int(lenv)} | payload={data}")
+    if not os.path.exists(raster_path):
+        metadata_params = {
+            "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+            "bboxSR": 4326,
+            "imageSR": 4326,
+            "size": "1024,1024",
+            "format": "tiff",
+            "pixelType": "F32",
+            "f": "json",
+        }
+        metadata_url = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage?" + urlencode(metadata_params)
+        network_calls += 1
+        req = Request(metadata_url, headers=get_usgs_auth_headers())
+        with urlopen(req, timeout=20) as resp:
+            metadata = json.loads(resp.read().decode("utf-8", "replace"))
+        href = metadata.get("href")
+        if not href:
+            raise ValueError(f"USGS TNM 3DEP metadata missing href: {metadata}")
+        if first_network_url is None:
+            first_network_url = metadata_url
+        req = Request(href, headers=get_usgs_auth_headers())
+        with urlopen(req, timeout=25) as resp:
+            raster_bytes = resp.read()
+        with open(raster_path, "wb") as f_raster:
+            f_raster.write(raster_bytes)
 
-            elevation = data.get("elevation", None)
-            if elevation is None and isinstance(data.get("value"), dict):
-                elevation = data["value"].get("elevation", None)
-            if elevation is None and isinstance(data.get("result"), dict):
-                elevation = data["result"].get("elevation", None)
-
-            if elevation is None:
+    with rasterio.open(raster_path) as src:
+        for pos, (lat, lon) in enumerate(coords_to_fetch):
+            nr = pos + 1 + pointsDone
+            addition = f" {nr}/{int(lenv)}"
+            send_api_request(addition)
+            try:
+                sample = next(src.sample([(lon, lat)]))[0]
+                if sample is None:
+                    elevation = 0
+                    network_zero_results += 1
+                else:
+                    elevation = float(sample)
+            except Exception:
                 elevation = 0
                 network_zero_results += 1
-
-            try:
-                elevation = float(elevation)
-            except (TypeError, ValueError):
-                module_logger.warning("USGS TNM parse warning | point=%s/%s | lat=%s lon=%s | raw_elevation=%s", nr, int(lenv), lat, lon, elevation)
-                print(f"USGS TNM parse warning | point={nr}/{int(lenv)} | lat={lat} lon={lon} | raw_elevation={elevation}")
-                elevation = 0
-
-            if first_network_url is None:
-                first_network_url = request_url
-
-            module_logger.info("USGS TNM parsed elevation | point=%s/%s | lat=%s lon=%s | elevation=%s", nr, int(lenv), lat, lon, elevation)
-            print(f"USGS TNM parsed elevation | point={nr}/{int(lenv)} | lat={lat} lon={lon} | elevation={elevation}")
-
-        except Exception as e:
-            module_logger.exception("USGS TNM request failed | point=%s/%s | lat=%s lon=%s | error=%s", nr, int(lenv), lat, lon, str(e))
-            print(f"USGS TNM request failed | point={nr}/{int(lenv)} | lat={lat} lon={lon} | error={str(e)}")
-            elevation = 0
-
-        cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
-        elevations[i] = elevation
+            cache_elevation(lat, lon, elevation, api_type="usgs_tnm")
+            elevations[coords_indices[pos]] = elevation
 
     sample_coords = coords[:3]
     sample_elevations = elevations[:3]
