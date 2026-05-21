@@ -6437,6 +6437,11 @@ def paint_coloring_layer(map_obj, layer_artifact):
     if col_PaintMap and _is_valid_blender_object(merged_object):
         color_map_faces_by_terrain(map_obj, merged_object)
         if kind == "WATER" and bpy.context.scene.tp3d.col_WaterSpotCleanup:
+            _debug_preserve_object_if_enabled(
+                map_obj,
+                _format_debug_step_name("WATER", "PRE_SPOT_CLEANUP_MAP"),
+                kind="WATER",
+            )
             _cleanup_water_paint_clusters(
                 map_obj,
                 water_material_name="WATER",
@@ -6444,6 +6449,11 @@ def paint_coloring_layer(map_obj, layer_artifact):
                 tiny_cluster_mul=bpy.context.scene.tp3d.col_WaterSpotCleanupMul,
                 hole_fill_enabled=bpy.context.scene.tp3d.col_WaterHoleFillEnabled,
                 hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
+            )
+            _debug_preserve_object_if_enabled(
+                map_obj,
+                _format_debug_step_name("WATER", "POST_SPOT_CLEANUP_MAP"),
+                kind="WATER",
             )
         mesh_data = merged_object.data
         _debug_preserve_object_if_enabled(
@@ -6640,6 +6650,28 @@ def _extract_thin_bridge_faces(cluster_faces, area_scale):
             if f.calc_area() <= area_scale:
                 bridge_faces.append(f)
     return bridge_faces
+
+
+def _material_face_histogram(bm, mesh):
+    histogram = {}
+    for face in bm.faces:
+        mat_index = face.material_index
+        mat_name = None
+        if 0 <= mat_index < len(mesh.materials):
+            mat_slot = mesh.materials[mat_index]
+            mat_name = mat_slot.name if mat_slot else "<None>"
+        if not mat_name:
+            mat_name = "<UNASSIGNED>"
+        key = (mat_index, mat_name)
+        histogram[key] = histogram.get(key, 0) + 1
+    return histogram
+
+
+def _format_material_face_histogram(histogram):
+    if not histogram:
+        return "none"
+    ordered_items = sorted(histogram.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+    return ", ".join(f"{mat_index}:{mat_name}={count}" for (mat_index, mat_name), count in ordered_items)
 def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_material_name="BASE", tiny_cluster_mul=2.0, hole_fill_enabled=False, hole_fill_mul=1.0, hole_fill_min_faces=2):
     if not _is_valid_blender_object(map_obj) or map_obj.type != 'MESH':
         return
@@ -6654,6 +6686,7 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     bm = bmesh.new()
     bm.from_mesh(mesh)
     bm.faces.ensure_lookup_table()
+    hist_before = _material_face_histogram(bm, mesh)
 
     map_face_areas = sorted(f.calc_area() for f in bm.faces if f.calc_area() > 0)
     median_face_area = map_face_areas[len(map_face_areas)//2] if map_face_areas else 0.0
@@ -6793,8 +6826,14 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     bm.to_mesh(mesh)
     bm.free()
 
+    bm_hist_after = bmesh.new()
+    bm_hist_after.from_mesh(mesh)
+    bm_hist_after.faces.ensure_lookup_table()
+    hist_after = _material_face_histogram(bm_hist_after, mesh)
+    bm_hist_after.free()
+
     module_logger.info(
-        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_enabled=%s hole_fill_threshold=%.8f hole_fill_min_faces=%s clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f base_clusters_considered=%s enclosed_clusters_promoted=%s promoted_area=%.8f thin_kept_clusters=%s bridge_faces_reclassified=%s largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f",
+        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_enabled=%s hole_fill_threshold=%.8f hole_fill_min_faces=%s clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f base_clusters_considered=%s enclosed_clusters_promoted=%s promoted_area=%.8f thin_kept_clusters=%s bridge_faces_reclassified=%s largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f material_faces_before=[%s] material_faces_after=[%s]",
         map_obj.name,
         median_face_area,
         tiny_cluster_threshold,
@@ -6816,6 +6855,8 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
         median_before,
         largest_after,
         median_after,
+        _format_material_face_histogram(hist_before),
+        _format_material_face_histogram(hist_after),
     )
 
 
