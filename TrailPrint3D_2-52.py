@@ -6857,26 +6857,42 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     debug_samples = 5
     debug_every = max(1, len(bm.faces) // debug_samples)
     map_world = map_obj.matrix_world
-    map_normal_matrix = map_world.to_3x3().inverted().transposed()
+    map_direction_matrix = map_world.to_3x3()
 
     for i, f in enumerate(bm.faces):
-        normal = (map_normal_matrix @ f.normal).normalized()
-        dot = normal.dot(up)
+        normal_world = (map_direction_matrix @ f.normal).normalized()
+        dot = normal_world.dot(up)
         # Only consider faces facing upward
         if dot > up_threshold:
             center = f.calc_center_median()
             center_world = map_world @ center
-            ray_dir = normal
+            ray_dir = normal_world
             loc, norm, idx, dist = bvh.ray_cast(center_world, ray_dir, 1000)
 
             if i % debug_every == 0:
                 print(
                     f"[terrain paint debug] face={i} center_world={tuple(round(v, 4) for v in center_world)} "
                     f"ray_dir={tuple(round(v, 4) for v in ray_dir)} "
-                    f"hit={'yes' if loc is not None else 'no'} dist={round(dist, 4) if dist is not None else None}"
+                    f"dot={round(dot, 4)} "
+                    f"hit={'yes' if loc is not None else 'no'} dist={round(dist, 6) if dist is not None else None}"
                 )
+                if loc is None or not (dist is not None and dist > 1e-6):
+                    module_logger.info(
+                        "Terrain paint miss sample | map=%s terrain=%s face=%s center_world=(%.6f,%.6f,%.6f) normal_world=(%.6f,%.6f,%.6f) dot=%.6f hit_dist=%s",
+                        map_obj.name,
+                        terrain_obj.name,
+                        i,
+                        center_world.x,
+                        center_world.y,
+                        center_world.z,
+                        normal_world.x,
+                        normal_world.y,
+                        normal_world.z,
+                        dot,
+                        "None" if dist is None else f"{dist:.9f}",
+                    )
 
-            if loc is not None and dist > 0:
+            if loc is not None and dist is not None and dist > 1e-6:
                 # Assign terrain material to this face
                 f.material_index = mat_index
                 colored_count += 1
@@ -6972,6 +6988,13 @@ def apply_overlay_layers(map_obj, layer_objects):
 def run_layer_pipeline(map_obj):
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
+    module_logger.info(
+        "Layer paint routing | WATER=%s FOREST=%s CITY=%s GLACIER=%s via=paint_coloring_layer->color_map_faces_by_terrain",
+        bool(layer_objects.get("WATER")),
+        bool(layer_objects.get("FOREST")),
+        bool(layer_objects.get("CITY")),
+        bool(layer_objects.get("GLACIER")),
+    )
     paint_entire_map_base(map_obj, base_material='BASE')
     water_obj = apply_water_layer(map_obj, layer_objects)
     apply_island_layer(map_obj, layer_objects)
