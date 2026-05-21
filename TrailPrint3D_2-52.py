@@ -5708,6 +5708,77 @@ def _validate_ring_with_reason(coords, min_area=0.0):
     return True, area, None
 
 
+def _ring_bbox_2d(coords):
+    if not coords:
+        return None
+    xs = [p[0] for p in coords]
+    ys = [p[1] for p in coords]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _ring_centroid_2d(coords):
+    if not coords:
+        return None
+    pts = coords[:-1] if len(coords) > 1 and coords[0] == coords[-1] else coords
+    if not pts:
+        return None
+    sx = sum(p[0] for p in pts)
+    sy = sum(p[1] for p in pts)
+    n = len(pts)
+    return (sx / n, sy / n)
+
+
+def _point_in_ring_2d(point, ring):
+    if not point or not ring or len(ring) < 4:
+        return False
+    x, y = point
+    inside = False
+    pts = ring[:-1] if ring[0] == ring[-1] else ring
+    n = len(pts)
+    for i in range(n):
+        x0, y0, _ = pts[i]
+        x1, y1, _ = pts[(i + 1) % n]
+        intersects = ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / ((y1 - y0) or 1e-12) + x0)
+        if intersects:
+            inside = not inside
+    return inside
+
+
+def _mesh_health_stats(obj):
+    stats = {
+        "faces": 0,
+        "edges": 0,
+        "verts": 0,
+        "non_manifold_edges": 0,
+        "loose_edges": 0,
+        "zero_area_faces": 0,
+        "min_face_area": 0.0,
+        "max_face_area": 0.0,
+    }
+    if not obj or obj.type != "MESH" or not obj.data:
+        return stats
+    mesh = obj.data
+    stats["faces"] = len(mesh.polygons)
+    stats["edges"] = len(mesh.edges)
+    stats["verts"] = len(mesh.vertices)
+    areas = []
+    for poly in mesh.polygons:
+        area = float(poly.area)
+        areas.append(area)
+        if area <= 1e-12:
+            stats["zero_area_faces"] += 1
+    if areas:
+        stats["min_face_area"] = min(areas)
+        stats["max_face_area"] = max(areas)
+    for edge in mesh.edges:
+        linked = len(edge.link_faces)
+        if linked != 2:
+            stats["non_manifold_edges"] += 1
+        if linked == 0:
+            stats["loose_edges"] += 1
+    return stats
+
+
 
 
 def _get_or_create_temp_debug_root_collection():
@@ -6098,6 +6169,14 @@ def build_coloring_layer(map,kind = "WATER"):
                         "area_below_threshold": 0,
                     }
                     inner_area_threshold = min_area_effective
+                    module_logger.info(
+                        "Multipolygon relation settings relation=%s kind=%s process_inner_holes=%s create_island_objects=%s inner_area_threshold=%.8f",
+                        relation_id,
+                        kind,
+                        True,
+                        should_process_water_islands,
+                        inner_area_threshold,
+                    )
                     for inner_idx, ring in enumerate(inner_rings):
                         blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
                         is_valid_inner, rejection_reason = classify_ring_validity(blender_ring, inner_area_threshold)
@@ -6115,15 +6194,18 @@ def build_coloring_layer(map,kind = "WATER"):
                                 calculate_polygon_area_2d(blender_ring),
                                 inner_area_threshold,
                             )
-                            if rejection_reason == "self_intersecting":
-                                module_logger.warning(
-                                    "Non-simple inner ring relation=%s kind=%s inner_idx=%s point_count=%s bbox=%s",
-                                    relation_id,
-                                    kind,
-                                    inner_idx,
-                                    len(blender_ring),
-                                    _ring_bbox_2d(blender_ring),
-                                )
+                    for outer_idx, outer_coords in enumerate(valid_outers):
+                        outer_bbox = _ring_bbox_2d(outer_coords)
+                        outer_area = calculate_polygon_area_2d(outer_coords)
+                        module_logger.info(
+                            "Outer ring geometry relation=%s kind=%s outer_idx=%s ring_points=%s area=%.8f bbox=%s",
+                            relation_id,
+                            kind,
+                            outer_idx,
+                            len(outer_coords),
+                            outer_area,
+                            outer_bbox,
+                        )
 
                     holes_applied_total = 0
                     island_objects_created = 0
@@ -6152,13 +6234,48 @@ def build_coloring_layer(map,kind = "WATER"):
                             island_objects_created += 1
 
                     for j, outer_coords in enumerate(valid_outers):
+                        assigned_inners = []
+                        for inner_idx, inner_coords in enumerate(valid_inners):
+                            inner_bbox = _ring_bbox_2d(inner_coords)
+                            inner_area = calculate_polygon_area_2d(inner_coords)
+                            inner_centroid = _ring_centroid_2d(inner_coords)
+                            contained = _point_in_ring_2d(inner_centroid, outer_coords) if inner_centroid else False
+                            module_logger.info(
+                                "Inner assignment relation=%s kind=%s outer_idx=%s inner_idx=%s ring_points=%s area=%.8f centroid=%s bbox=%s contained=%s assigned_to_outer_idx=%s",
+                                relation_id,
+                                kind,
+                                j,
+                                inner_idx,
+                                len(inner_coords),
+                                inner_area,
+                                inner_centroid,
+                                inner_bbox,
+                                contained,
+                                j if contained else None,
+                            )
+                            if contained:
+                                assigned_inners.append(inner_coords)
+                            else:
+                                module_logger.warning(
+                                    "Inner ring skipped due to containment mismatch relation=%s kind=%s outer_idx=%s inner_idx=%s centroid=%s outer_bbox=%s inner_bbox=%s",
+                                    relation_id,
+                                    kind,
+                                    j,
+                                    inner_idx,
+                                    inner_centroid,
+                                    _ring_bbox_2d(outer_coords),
+                                    inner_bbox,
+                                )
+
+                        pre_health = _mesh_health_stats(None)
                         tobj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}", outer_coords)
                         if not tobj:
                             waterDeleted += 1
                             continue
+                        pre_health = _mesh_health_stats(tobj)
                         hole_telemetry = apply_hole_difference(
                             tobj,
-                            valid_inners,
+                            assigned_inners,
                             name_prefix=f"Hole_{relation_id}_{i}_{j}"
                         )
                         holes_applied_total += hole_telemetry["cutter_faces_created"]
@@ -6174,6 +6291,15 @@ def build_coloring_layer(map,kind = "WATER"):
                             hole_telemetry["boolean_changed_mesh"],
                             hole_telemetry["delta_faces"],
                             hole_telemetry["delta_edges"],
+                        )
+                        post_health = _mesh_health_stats(tobj)
+                        module_logger.info(
+                            "Hole boolean mesh health relation=%s outer_idx=%s kind=%s pre=%s post=%s",
+                            relation_id,
+                            j,
+                            kind,
+                            pre_health,
+                            post_health,
                         )
                         if hole_telemetry["cutter_faces_created"] == 0 and valid_inners:
                             module_logger.warning(
