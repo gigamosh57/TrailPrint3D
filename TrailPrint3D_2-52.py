@@ -5203,8 +5203,10 @@ def _osm_selector_lines(kind, south, west, north, east):
     if kind == "WATER":
         return [
             f'nwr["natural"="water"]({south},{west},{north},{east});',
-            f'nwr["water"="river"]({south},{west},{north},{east});',
             f'nwr["water"="lake"]({south},{west},{north},{east});',
+            f'nwr["waterway"="river"]({south},{west},{north},{east});',
+            f'nwr["waterway"="stream"]({south},{west},{north},{east});',
+            f'nwr["waterway"="canal"]({south},{west},{north},{east});',
         ]
     if kind == "FOREST":
         return [
@@ -5938,6 +5940,25 @@ def build_coloring_layer(map,kind = "WATER"):
                                 relation_member_way_ids.add(member["ref"])
                     filtered_elements.append(el)
                 module_logger.info("OSM tile telemetry kind=%s tile=%s/%s bbox=%s count=%s elapsed=%.3fs retries=%s", kind, idx, len(bboxes), bbox, len(filtered_elements), time.perf_counter() - started, retries)
+                if kind == "WATER":
+                    waterway_way_count = 0
+                    water_polygon_count = 0
+                    for el in filtered_elements:
+                        if el.get("type") != "way":
+                            continue
+                        tags = el.get("tags") or {}
+                        if tags.get("waterway") in {"river", "stream", "canal"}:
+                            waterway_way_count += 1
+                        if tags.get("natural") == "water" or tags.get("water") == "lake":
+                            water_polygon_count += 1
+                    module_logger.info(
+                        "OSM water feature telemetry tile=%s/%s bbox=%s waterway_ways=%s water_polygons=%s",
+                        idx,
+                        len(bboxes),
+                        bbox,
+                        waterway_way_count,
+                        water_polygon_count,
+                    )
                 nodes = build_osm_nodes({"elements": filtered_elements})
                 bodies = extract_multipolygon_bodies(filtered_elements, nodes)
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
