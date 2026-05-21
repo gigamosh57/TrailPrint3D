@@ -6925,19 +6925,32 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
         if dot > up_threshold:
             center = f.calc_center_median()
             center_world = map_world @ center
-            ray_dir = normal_world
-            loc, norm, idx, dist = bvh.ray_cast(center_world, ray_dir, 1000)
+            primary_ray_dir = Vector((0, 0, 1))
+            fallback_ray_dir = Vector((0, 0, -1))
+            cast_results = []
+            for cast_name, ray_dir in (("up", primary_ray_dir), ("down", fallback_ray_dir)):
+                loc, norm, idx, dist = bvh.ray_cast(center_world, ray_dir, 1000)
+                if loc is not None and dist is not None and dist > 1e-6:
+                    cast_results.append((dist, cast_name, ray_dir, loc, norm, idx))
+
+            if cast_results:
+                dist, hit_direction_name, hit_direction_vec, loc, norm, idx = min(cast_results, key=lambda x: x[0])
+            else:
+                hit_direction_name = None
+                hit_direction_vec = primary_ray_dir
+                loc = norm = idx = dist = None
 
             if i % debug_every == 0:
                 print(
                     f"[terrain paint debug] face={i} center_world={tuple(round(v, 4) for v in center_world)} "
-                    f"ray_dir={tuple(round(v, 4) for v in ray_dir)} "
+                    f"ray_dir={tuple(round(v, 4) for v in hit_direction_vec)} "
+                    f"hit_dir={hit_direction_name if hit_direction_name is not None else 'none'} "
                     f"dot={round(dot, 4)} "
                     f"hit={'yes' if loc is not None else 'no'} dist={round(dist, 6) if dist is not None else None}"
                 )
-                if loc is None or not (dist is not None and dist > 1e-6):
+                if loc is None:
                     module_logger.info(
-                        "Terrain paint miss sample | map=%s terrain=%s face=%s center_world=(%.6f,%.6f,%.6f) normal_world=(%.6f,%.6f,%.6f) dot=%.6f hit_dist=%s",
+                        "Terrain paint miss sample | map=%s terrain=%s face=%s center_world=(%.6f,%.6f,%.6f) normal_world=(%.6f,%.6f,%.6f) dot=%.6f hit_dir=%s hit_dist=%s",
                         map_obj.name,
                         terrain_obj.name,
                         i,
@@ -6948,7 +6961,8 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
                         normal_world.y,
                         normal_world.z,
                         dot,
-                        "None" if dist is None else f"{dist:.9f}",
+                        "none",
+                        "None",
                     )
 
             if loc is not None and dist is not None and dist > 1e-6:
