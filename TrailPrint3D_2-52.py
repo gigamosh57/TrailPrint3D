@@ -431,6 +431,7 @@ class MyProperties(bpy.types.PropertyGroup):
     col_WaterSpotCleanupMul: bpy.props.FloatProperty(name="Water Cleanup Threshold Mult", default=2.0, min=0.0, description="Cluster threshold in multiples of median map face area")
     col_WaterHoleFillEnabled: bpy.props.BoolProperty(name="Water Hole Fill", default=False, description="Promote small enclosed BASE holes to WATER during cleanup")
     col_WaterHoleFillMul: bpy.props.FloatProperty(name="Water Hole Fill Mult", default=1.0, min=0.0, description="BASE hole-fill threshold in multiples of median map face area")
+    col_WaterMeshNonManifoldEdgeThreshold: bpy.props.IntProperty(name="Water Mesh Non-Manifold Edge Threshold", default=0, min=0, description="Maximum allowed non-manifold edges for water outer meshes before hole carving")
 
     mountain_treshold:bpy.props.IntProperty(name="Mountain Treshold", default = 60, min = 0, max = 100,subtype='PERCENTAGE', description="Height Treshold to Color Mountians")
     cl_thickness: bpy.props.FloatProperty(name="Contour Line Thickness", default = 0.2, description = "Thickness of the Contour Line")
@@ -5861,6 +5862,43 @@ def _point_in_ring_2d(point, ring):
     return inside
 
 
+def _sanitize_water_outer_mesh(obj, merge_distance=1e-6):
+    actions = []
+    if not obj or obj.type != "MESH" or not obj.data:
+        return actions
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    try:
+        before_verts = len(bm.verts)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_distance)
+        merged = max(0, before_verts - len(bm.verts))
+        actions.append({"action": "remove_doubles", "merge_distance": merge_distance, "merged_verts": merged})
+
+        loose_geom = [e for e in bm.edges if len(e.link_faces) == 0] + [v for v in bm.verts if len(v.link_edges) == 0]
+        if loose_geom:
+            bmesh.ops.delete(bm, geom=loose_geom, context="VERTS")
+        actions.append({"action": "delete_loose", "deleted_items": len(loose_geom)})
+
+        zero_area_faces = [f for f in bm.faces if f.calc_area() <= 1e-12]
+        if zero_area_faces:
+            bmesh.ops.dissolve_faces(bm, faces=zero_area_faces)
+        actions.append({"action": "dissolve_zero_area_faces", "faces_targeted": len(zero_area_faces)})
+
+        if bm.faces:
+            bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+        actions.append({"action": "recalc_normals", "faces": len(bm.faces)})
+
+        bm.to_mesh(mesh)
+        mesh.update()
+    finally:
+        bm.free()
+
+    return actions
+
+
 def _mesh_health_stats(obj):
     stats = {
         "faces": 0,
@@ -6392,18 +6430,61 @@ def build_coloring_layer(map,kind = "WATER"):
                                     inner_bbox,
                                 )
 
-                        pre_health = _mesh_health_stats(None)
-                        tobj, hole_telemetry = col_create_face_mesh_with_holes(
-                            f"Relation_{relation_id}_{i}_{j}",
-                            outer_coords,
-                            assigned_inners,
-                            relation_id=relation_id,
-                            outer_idx=j,
-                        )
-                        if not tobj:
+                        relation_quality_log = {
+                            "pre_clean_stats": _mesh_health_stats(None),
+                            "post_clean_stats": _mesh_health_stats(None),
+                            "cleaning_actions": [],
+                            "quality_gate_passed": False,
+                        }
+
+                        outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}_outer", outer_coords)
+                        if not outer_obj:
                             waterDeleted += 1
+                            module_logger.warning("Outer water mesh build failed before hole carving relation=%s kind=%s outer_idx=%s reason=outer_creation_failed", relation_id, kind, j)
                             continue
-                        pre_health = _mesh_health_stats(tobj)
+
+                        relation_quality_log["pre_clean_stats"] = _mesh_health_stats(outer_obj)
+                        relation_quality_log["cleaning_actions"] = _sanitize_water_outer_mesh(outer_obj)
+                        relation_quality_log["post_clean_stats"] = _mesh_health_stats(outer_obj)
+
+                        non_manifold_threshold = int(getattr(bpy.context.scene.tp3d, "col_WaterMeshNonManifoldEdgeThreshold", 0))
+                        post_stats = relation_quality_log["post_clean_stats"]
+                        quality_gate_passed = (
+                            post_stats.get("zero_area_faces", 0) == 0 and
+                            post_stats.get("loose_edges", 0) == 0 and
+                            post_stats.get("non_manifold_edges", 0) <= non_manifold_threshold
+                        )
+                        relation_quality_log["quality_gate_passed"] = quality_gate_passed
+
+                        if quality_gate_passed:
+                            tobj, hole_telemetry = col_create_face_mesh_with_holes(
+                                f"Relation_{relation_id}_{i}_{j}",
+                                outer_coords,
+                                assigned_inners,
+                                relation_id=relation_id,
+                                outer_idx=j,
+                            )
+                            bpy.data.objects.remove(outer_obj, do_unlink=True)
+                            if not tobj:
+                                waterDeleted += 1
+                                module_logger.warning("Hole carving failed after quality pass relation=%s kind=%s outer_idx=%s reason=hole_mesh_creation_failed quality_log=%s", relation_id, kind, j, relation_quality_log)
+                                continue
+                        else:
+                            gate_reason = f"quality_gate_failed(non_manifold={post_stats.get('non_manifold_edges', 0)}/{non_manifold_threshold}, zero_area={post_stats.get('zero_area_faces', 0)}, loose_edges={post_stats.get('loose_edges', 0)})"
+                            module_logger.warning("Skipping hole carving and falling back to sanitized outer mesh relation=%s kind=%s outer_idx=%s reason=%s quality_log=%s", relation_id, kind, j, gate_reason, relation_quality_log)
+                            tobj = outer_obj
+                            hole_telemetry = {
+                                "candidate_holes": len(assigned_inners or []),
+                                "holes_applied": 0,
+                                "boolean_changed_mesh": False,
+                                "delta_faces": 0,
+                                "delta_edges": 0,
+                                "prep": 0.0,
+                                "apply": 0.0,
+                                "source": "fallback_outer_mesh_quality_gate_failed",
+                            }
+
+                        pre_health = relation_quality_log["post_clean_stats"]
                         holes_applied_total += hole_telemetry["holes_applied"]
                         module_logger.info(
                             "Hole non-boolean telemetry relation=%s outer_idx=%s kind=%s source=%s prep=%.4fs apply=%.4fs candidate_holes=%s holes_applied=%s mesh_changed=%s delta_faces=%s delta_edges=%s",
@@ -6427,6 +6508,13 @@ def build_coloring_layer(map,kind = "WATER"):
                             kind,
                             pre_health,
                             post_health,
+                        )
+                        module_logger.info(
+                            "Hole relation quality relation=%s outer_idx=%s kind=%s quality=%s",
+                            relation_id,
+                            j,
+                            kind,
+                            relation_quality_log,
                         )
                         if hole_telemetry["holes_applied"] == 0 and valid_inners:
                             module_logger.warning(
