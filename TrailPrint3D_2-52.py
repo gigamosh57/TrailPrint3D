@@ -5491,6 +5491,12 @@ def col_create_face_mesh(name, coords):
                 bmesh.ops.triangle_fill(bm, edges=edges, use_beauty=True, use_dissolve=True)
             except Exception:
                 pass
+    if not bm.faces:
+        bm.free()
+        bpy.data.objects.remove(tobj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        return None
     bm.to_mesh(mesh)
     bm.free()
     _debug_preserve_created_object_if_enabled(tobj, creation_type="FACE")
@@ -5508,6 +5514,67 @@ def calculate_polygon_area_2d(coords):
             area += (x0 * y1) - (x1 * y0)
     
     return abs(area) * 0.5
+
+
+def _ring_bbox_2d(coords):
+    if not coords:
+        return None
+    xs = [p[0] for p in coords]
+    ys = [p[1] for p in coords]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _segments_intersect_2d(a1, a2, b1, b2, epsilon=1e-9):
+    ax1, ay1 = a1[0], a1[1]
+    ax2, ay2 = a2[0], a2[1]
+    bx1, by1 = b1[0], b1[1]
+    bx2, by2 = b2[0], b2[1]
+
+    def orient(px, py, qx, qy, rx, ry):
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px)
+
+    def on_segment(px, py, qx, qy, rx, ry):
+        return (min(px, rx) - epsilon <= qx <= max(px, rx) + epsilon and
+                min(py, ry) - epsilon <= qy <= max(py, ry) + epsilon)
+
+    o1 = orient(ax1, ay1, ax2, ay2, bx1, by1)
+    o2 = orient(ax1, ay1, ax2, ay2, bx2, by2)
+    o3 = orient(bx1, by1, bx2, by2, ax1, ay1)
+    o4 = orient(bx1, by1, bx2, by2, ax2, ay2)
+
+    if ((o1 > epsilon and o2 < -epsilon) or (o1 < -epsilon and o2 > epsilon)) and \
+       ((o3 > epsilon and o4 < -epsilon) or (o3 < -epsilon and o4 > epsilon)):
+        return True
+
+    if abs(o1) <= epsilon and on_segment(ax1, ay1, bx1, by1, ax2, ay2):
+        return True
+    if abs(o2) <= epsilon and on_segment(ax1, ay1, bx2, by2, ax2, ay2):
+        return True
+    if abs(o3) <= epsilon and on_segment(bx1, by1, ax1, ay1, bx2, by2):
+        return True
+    if abs(o4) <= epsilon and on_segment(bx1, by1, ax2, ay2, bx2, by2):
+        return True
+    return False
+
+
+def is_ring_simple_2d(coords):
+    if len(coords) < 4:
+        return False
+
+    segment_count = len(coords) - 1
+    for i in range(segment_count):
+        a1 = coords[i]
+        a2 = coords[i + 1]
+        for j in range(i + 1, segment_count):
+            if j == i + 1:
+                continue
+            if i == 0 and j == segment_count - 1:
+                continue
+            b1 = coords[j]
+            b2 = coords[j + 1]
+            if _segments_intersect_2d(a1, a2, b1, b2):
+                return False
+    return True
 
 
 
@@ -5591,6 +5658,8 @@ def classify_ring_validity(coords, min_area=0.0):
         return False, "not_closed"
     if len(coords) < 4:
         return False, "too_few_points"
+    if not is_ring_simple_2d(coords):
+        return False, "self_intersecting"
     area = calculate_polygon_area_2d(coords)
     if area <= min_area:
         return False, "area_below_threshold"
@@ -5631,6 +5700,8 @@ def _validate_ring_with_reason(coords, min_area=0.0):
         return False, 0.0, "not_closed"
     if len(coords) < 4:
         return False, 0.0, "too_few_points"
+    if not is_ring_simple_2d(coords):
+        return False, 0.0, "self_intersecting"
     area = calculate_polygon_area_2d(coords)
     if area <= min_area:
         return False, area, "area_below_threshold"
@@ -6048,6 +6119,7 @@ def build_coloring_layer(map,kind = "WATER"):
                     outer_rejections_by_reason = {
                         "not_closed": 0,
                         "too_few_points": 0,
+                        "self_intersecting": 0,
                         "area_below_threshold": 0,
                     }
                     multipolygon_outer_area_threshold = min_area_effective
@@ -6057,6 +6129,7 @@ def build_coloring_layer(map,kind = "WATER"):
                         "empty": 0,
                         "not_closed": 0,
                         "too_few_points": 0,
+                        "self_intersecting": 0,
                         "area_below_threshold": 0,
                     }
                     for outer_idx, ring in enumerate(outer_rings):
@@ -6077,12 +6150,22 @@ def build_coloring_layer(map,kind = "WATER"):
                                 calculate_polygon_area_2d(blender_ring),
                                 multipolygon_outer_area_threshold,
                             )
+                            if rejection_reason == "self_intersecting":
+                                module_logger.warning(
+                                    "Non-simple outer ring relation=%s kind=%s outer_idx=%s point_count=%s bbox=%s",
+                                    relation_id,
+                                    kind,
+                                    outer_idx,
+                                    len(blender_ring),
+                                    _ring_bbox_2d(blender_ring),
+                                )
 
                     valid_inners = []
                     inner_rejections_by_reason = {
                         "empty": 0,
                         "not_closed": 0,
                         "too_few_points": 0,
+                        "self_intersecting": 0,
                         "area_below_threshold": 0,
                     }
                     inner_area_threshold = min_area_effective
