@@ -417,6 +417,7 @@ class MyProperties(bpy.types.PropertyGroup):
 
     col_wActive: bpy.props.BoolProperty(name="Include Water", default=False, description = "Include Water (lakes, ponds) (experimental), Seas dont work yet")
     col_wArea: bpy.props.FloatProperty(name="Water Size Treshold", default = 1, description = "lakes smaller than the treshold wont be included")
+    col_ProcessIslands: bpy.props.BoolProperty(name="Process Water Islands", default=True, description="Enable extra island cleanup/repaint logic for water multipolygons")
     col_fActive: bpy.props.BoolProperty(name="Include Forests", default=False, description = "Include Forests (experimental)")
     col_fArea: bpy.props.FloatProperty(name="Forest Size Treshold", default = 10, description = "Forests smaller than the treshold wont be included")
     col_cActive: bpy.props.BoolProperty(name="Include City Boundaries", default=False, description = "Include City Boundaries(experimental)")
@@ -1620,6 +1621,7 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.label(text = "Water")
             box.prop(props, "col_wActive")
             box.prop(props, "col_wArea")
+            box.prop(props, "col_ProcessIslands")
             box = boxer.box()
             box.label(text = "Forests")
             box.prop(props, "col_fActive")
@@ -5849,6 +5851,8 @@ def build_coloring_layer(map,kind = "WATER"):
         col_Area = (bpy.context.scene.tp3d.col_glArea)
     
     col_PaintMap = (bpy.context.scene.tp3d.col_PaintMap)
+    process_islands = bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True))
+    should_process_water_islands = (kind == "WATER" and process_islands)
     min_area_effective = _compute_effective_min_area(kind, col_Area)
 
     global exportformat
@@ -6033,23 +6037,24 @@ def build_coloring_layer(map,kind = "WATER"):
                     # Explicitly create visible island meshes from valid inner rings so islands remain
                     # present even when hole visibility is affected by viewport/render filtering.
                     island_objects = []
-                    for inner_idx, inner_coords in enumerate(valid_inners):
-                        island_obj = col_create_face_mesh(f"Island_{relation_id}_{i}_{inner_idx}", inner_coords)
-                        if not island_obj:
-                            island_objects_failed += 1
-                            continue
-                        island_obj.hide_set(False)
-                        island_obj.hide_viewport = False
-                        island_obj.hide_render = False
-                        writeMetadata(island_obj, "MAP")
-                        island_mat = bpy.data.materials.get("MAP") or bpy.data.materials.get("CITY") or bpy.data.materials.get("FOREST")
-                        if island_mat:
-                            island_obj.data.materials.clear()
-                            island_obj.data.materials.append(island_mat)
-                        island_objects.append(island_obj)
-                        island_objects_to_paint.append(island_obj)
-                        relation_debug_pairs.append((relation_id, island_obj.name, None))
-                        island_objects_created += 1
+                    if should_process_water_islands:
+                        for inner_idx, inner_coords in enumerate(valid_inners):
+                            island_obj = col_create_face_mesh(f"Island_{relation_id}_{i}_{inner_idx}", inner_coords)
+                            if not island_obj:
+                                island_objects_failed += 1
+                                continue
+                            island_obj.hide_set(False)
+                            island_obj.hide_viewport = False
+                            island_obj.hide_render = False
+                            writeMetadata(island_obj, "MAP")
+                            island_mat = bpy.data.materials.get("MAP") or bpy.data.materials.get("CITY") or bpy.data.materials.get("FOREST")
+                            if island_mat:
+                                island_obj.data.materials.clear()
+                                island_obj.data.materials.append(island_mat)
+                            island_objects.append(island_obj)
+                            island_objects_to_paint.append(island_obj)
+                            relation_debug_pairs.append((relation_id, island_obj.name, None))
+                            island_objects_created += 1
 
                     for j, outer_coords in enumerate(valid_outers):
                         tobj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}", outer_coords)
@@ -6093,12 +6098,13 @@ def build_coloring_layer(map,kind = "WATER"):
                                 hole_telemetry["candidate_holes"],
                             )
                         created_objects.append(tobj)
-                        for island_obj in island_objects:
-                            relation_debug_pairs.append((
-                                relation_id,
-                                island_obj.name if island_obj else None,
-                                tobj.name if tobj else None,
-                            ))
+                        if should_process_water_islands:
+                            for island_obj in island_objects:
+                                relation_debug_pairs.append((
+                                    relation_id,
+                                    island_obj.name if island_obj else None,
+                                    tobj.name if tobj else None,
+                                ))
                         waterCreated += 1
 
                     if holes_applied_total > 0 and island_objects_created == 0:
@@ -6383,7 +6389,7 @@ def build_coloring_layer(map,kind = "WATER"):
             export_to_STL(merged_object)
 
 
-    if kind == "WATER":
+    if should_process_water_islands:
         for relation_id, land_obj_name, water_obj_name in relation_debug_pairs:
             land_obj = bpy.data.objects.get(land_obj_name) if land_obj_name else None
             if water_obj_name:
@@ -6949,7 +6955,7 @@ def apply_water_layer(map_obj, layer_objects):
 
 
 def apply_island_layer(map_obj, layer_objects):
-    if bpy.context.scene.tp3d.col_PaintMap == 1:
+    if bpy.context.scene.tp3d.col_PaintMap == 1 and bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True)):
         water_layer = layer_objects.get("WATER") if layer_objects else None
         island_objects = water_layer.get("island_objects") if water_layer else None
         paint_islands_on_map(map_obj, island_objects)
@@ -7327,6 +7333,7 @@ def writeMetadata(obj, type = "MAP"):
         obj["selfHosted"] = bpy.context.scene.tp3d.selfHosted
         obj["Horizontal Scale"] = round(bpy.context.scene.tp3d.sScaleHor,6)
         obj["Generate Water"] = bpy.context.scene.tp3d.col_wActive
+        obj["Process Water Islands"] = bpy.context.scene.tp3d.col_ProcessIslands
         obj["MinWaterSize"] = bpy.context.scene.tp3d.col_wArea
         obj["Keep Non-Manifold"] = bpy.context.scene.tp3d.col_KeepManifold
         obj["Map Size in Km"] = round(bpy.context.scene.tp3d.sMapInKm,2)
@@ -7355,6 +7362,7 @@ def writeMetadata(obj, type = "MAP"):
 
         obj["col_wActive"] = bpy.context.scene.tp3d.col_wActive
         obj["col_wArea"] = bpy.context.scene.tp3d.col_wArea
+        obj["col_ProcessIslands"] = bpy.context.scene.tp3d.col_ProcessIslands
         obj["col_fActive"] = bpy.context.scene.tp3d.col_fActive
         obj["col_fArea"] = bpy.context.scene.tp3d.col_fArea
         obj["col_cActive"] = bpy.context.scene.tp3d.col_cActive
