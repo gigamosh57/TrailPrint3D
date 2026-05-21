@@ -5770,8 +5770,16 @@ def _mesh_health_stats(obj):
     if areas:
         stats["min_face_area"] = min(areas)
         stats["max_face_area"] = max(areas)
+    edge_face_counts = {}
+    for poly in mesh.polygons:
+        for edge_key in poly.edge_keys:
+            edge_face_counts[edge_key] = edge_face_counts.get(edge_key, 0) + 1
+
     for edge in mesh.edges:
-        linked = len(edge.link_faces)
+        # MeshEdge (bpy.types.MeshEdge) does not expose link_faces.
+        # Build adjacency from polygon edge keys instead.
+        edge_key = tuple(sorted(edge.vertices))
+        linked = edge_face_counts.get(edge_key, 0)
         if linked != 2:
             stats["non_manifold_edges"] += 1
         if linked == 0:
