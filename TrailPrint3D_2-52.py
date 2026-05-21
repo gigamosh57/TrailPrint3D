@@ -5502,6 +5502,123 @@ def col_create_face_mesh(name, coords):
     _debug_preserve_created_object_if_enabled(tobj, creation_type="FACE")
     return tobj
 
+def col_create_face_mesh_with_holes(name, outer_coords, assigned_inners, relation_id=None, outer_idx=None):
+    candidate_holes = len(assigned_inners or [])
+    telemetry = {
+        "candidate_holes": candidate_holes,
+        "holes_applied": 0,
+        "boolean_changed_mesh": False,
+        "delta_faces": 0,
+        "delta_edges": 0,
+        "prep": 0.0,
+        "apply": 0.0,
+        "source": "bmesh_edgenet_hole_apply",
+    }
+
+    prep_started = time.perf_counter()
+    mesh = bpy.data.meshes.new(name)
+    tobj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(tobj)
+
+    bm = bmesh.new()
+
+    def _build_loop_edges(loop_coords):
+        coords = list(loop_coords)
+        if len(coords) > 1 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            return []
+        verts = [bm.verts.new(c) for c in coords]
+        edges = []
+        for i in range(len(verts)):
+            v0 = verts[i]
+            v1 = verts[(i + 1) % len(verts)]
+            try:
+                edges.append(bm.edges.new((v0, v1)))
+            except ValueError:
+                pass
+        return edges
+
+    outer_valid, outer_reason = classify_ring_validity(outer_coords, 0.0)
+    if not outer_valid:
+        module_logger.warning(
+            "Hole bmesh outer rejected relation=%s outer_idx=%s reason=%s",
+            relation_id,
+            outer_idx,
+            outer_reason,
+        )
+        bm.free()
+        bpy.data.objects.remove(tobj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        telemetry["prep"] = time.perf_counter() - prep_started
+        return None, telemetry
+
+    all_edges = []
+    all_edges.extend(_build_loop_edges(outer_coords))
+
+    valid_inners = []
+    for inner_idx, inner_coords in enumerate(assigned_inners or []):
+        inner_valid, inner_reason = classify_ring_validity(inner_coords, 0.0)
+        if not inner_valid:
+            module_logger.warning(
+                "Hole bmesh inner rejected relation=%s outer_idx=%s inner_idx=%s reason=%s",
+                relation_id,
+                outer_idx,
+                inner_idx,
+                inner_reason,
+            )
+            continue
+        valid_inners.append(inner_coords)
+        all_edges.extend(_build_loop_edges(inner_coords))
+
+    telemetry["holes_applied"] = len(valid_inners)
+
+    if all_edges:
+        try:
+            bmesh.ops.edgenet_prepare(bm, edges=all_edges)
+        except Exception:
+            pass
+        bmesh.ops.triangle_fill(bm, edges=all_edges, use_beauty=True, use_dissolve=False)
+
+    to_delete = []
+    for face in bm.faces:
+        c = face.calc_center_median()
+        cxy = (c.x, c.y)
+        if not _point_in_ring_2d(cxy, outer_coords):
+            to_delete.append(face)
+            continue
+        for inner in valid_inners:
+            if _point_in_ring_2d(cxy, inner):
+                to_delete.append(face)
+                break
+
+    if to_delete:
+        bmesh.ops.delete(bm, geom=to_delete, context='FACES')
+
+    pre_faces = len(bm.faces)
+    pre_edges = len(bm.edges)
+
+    bmesh.ops.dissolve_limit(bm, angle_limit=0.001, verts=bm.verts, edges=bm.edges)
+
+    telemetry["delta_faces"] = len(bm.faces) - pre_faces
+    telemetry["delta_edges"] = len(bm.edges) - pre_edges
+    telemetry["boolean_changed_mesh"] = telemetry["holes_applied"] > 0
+    telemetry["prep"] = time.perf_counter() - prep_started
+
+    if not bm.faces:
+        bm.free()
+        bpy.data.objects.remove(tobj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        return None, telemetry
+
+    bm.to_mesh(mesh)
+    bm.free()
+    _debug_preserve_created_object_if_enabled(tobj, creation_type="FACE")
+    return tobj, telemetry
+
+
 def calculate_polygon_area_2d(coords):
     area = 0.0
     
@@ -6276,54 +6393,56 @@ def build_coloring_layer(map,kind = "WATER"):
                                 )
 
                         pre_health = _mesh_health_stats(None)
-                        tobj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}", outer_coords)
+                        tobj, hole_telemetry = col_create_face_mesh_with_holes(
+                            f"Relation_{relation_id}_{i}_{j}",
+                            outer_coords,
+                            assigned_inners,
+                            relation_id=relation_id,
+                            outer_idx=j,
+                        )
                         if not tobj:
                             waterDeleted += 1
                             continue
                         pre_health = _mesh_health_stats(tobj)
-                        hole_telemetry = apply_hole_difference(
-                            tobj,
-                            assigned_inners,
-                            name_prefix=f"Hole_{relation_id}_{i}_{j}"
-                        )
-                        holes_applied_total += hole_telemetry["cutter_faces_created"]
+                        holes_applied_total += hole_telemetry["holes_applied"]
                         module_logger.info(
-                            "Hole boolean telemetry relation=%s outer_idx=%s kind=%s prep=%.4fs apply=%.4fs candidate_holes=%s cutter_faces_created=%s boolean_changed_mesh=%s delta_faces=%s delta_edges=%s",
+                            "Hole non-boolean telemetry relation=%s outer_idx=%s kind=%s source=%s prep=%.4fs apply=%.4fs candidate_holes=%s holes_applied=%s mesh_changed=%s delta_faces=%s delta_edges=%s",
                             relation_id,
                             j,
                             kind,
+                            hole_telemetry.get("source"),
                             hole_telemetry["prep"],
                             hole_telemetry["apply"],
                             hole_telemetry["candidate_holes"],
-                            hole_telemetry["cutter_faces_created"],
+                            hole_telemetry["holes_applied"],
                             hole_telemetry["boolean_changed_mesh"],
                             hole_telemetry["delta_faces"],
                             hole_telemetry["delta_edges"],
                         )
                         post_health = _mesh_health_stats(tobj)
                         module_logger.info(
-                            "Hole boolean mesh health relation=%s outer_idx=%s kind=%s pre=%s post=%s",
+                            "Hole non-boolean mesh health relation=%s outer_idx=%s kind=%s pre=%s post=%s",
                             relation_id,
                             j,
                             kind,
                             pre_health,
                             post_health,
                         )
-                        if hole_telemetry["cutter_faces_created"] == 0 and valid_inners:
+                        if hole_telemetry["holes_applied"] == 0 and valid_inners:
                             module_logger.warning(
-                                "Hole boolean yielded zero holes despite valid inner rings relation=%s kind=%s outer_idx=%s valid_inners=%s",
+                                "Hole non-boolean yielded zero holes despite valid inner rings relation=%s kind=%s outer_idx=%s valid_inners=%s",
                                 relation_id,
                                 kind,
                                 j,
                                 len(valid_inners),
                             )
-                        if hole_telemetry["cutter_faces_created"] > 0 and not hole_telemetry["boolean_changed_mesh"]:
+                        if hole_telemetry["holes_applied"] > 0 and not hole_telemetry["boolean_changed_mesh"]:
                             module_logger.warning(
-                                "Hole boolean created cutter faces but did not change outer mesh relation=%s kind=%s outer_idx=%s cutter_faces_created=%s candidate_holes=%s",
+                                "Hole non-boolean generated holes but mesh_changed flag is false relation=%s kind=%s outer_idx=%s holes_applied=%s candidate_holes=%s",
                                 relation_id,
                                 kind,
                                 j,
-                                hole_telemetry["cutter_faces_created"],
+                                hole_telemetry["holes_applied"],
                                 hole_telemetry["candidate_holes"],
                             )
                         created_objects.append(tobj)
