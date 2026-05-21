@@ -5434,15 +5434,54 @@ def extract_multipolygon_bodies(elements, nodes):
 
 # --- COLOR MESH CREATION ---
 
-def col_create_line_mesh(name, coords):
+def col_create_line_mesh(name, coords, ribbon_width=0.6):
     mesh = bpy.data.meshes.new(name)
     tobj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(tobj)
 
     bm = bmesh.new()
-    verts = [bm.verts.new(c) for c in coords]
-    for i in range(len(verts) - 1):
-        bm.edges.new((verts[i], verts[i + 1]))
+    if len(coords) >= 2:
+        half_w = max(1e-5, float(ribbon_width) * 0.5)
+        prev_pair = None
+        created_faces = 0
+        for i in range(len(coords) - 1):
+            p0 = Vector(coords[i])
+            p1 = Vector(coords[i + 1])
+            seg = p1 - p0
+            seg_len = seg.length
+            if seg_len <= 1e-9:
+                continue
+            tangent = seg / seg_len
+            perp = Vector((-tangent.y, tangent.x, 0.0))
+            if perp.length <= 1e-9:
+                perp = Vector((1.0, 0.0, 0.0))
+            perp.normalize()
+            off = perp * half_w
+            l0 = bm.verts.new((p0 + off))
+            r0 = bm.verts.new((p0 - off))
+            l1 = bm.verts.new((p1 + off))
+            r1 = bm.verts.new((p1 - off))
+            if prev_pair is not None:
+                # Stitch at joints for continuity.
+                l0 = prev_pair[0]
+                r0 = prev_pair[1]
+            try:
+                bm.faces.new((l0, l1, r1, r0))
+                created_faces += 1
+            except ValueError:
+                pass
+            prev_pair = (l1, r1)
+
+        # Fallback to edges if face creation failed.
+        if created_faces == 0:
+            verts = [bm.verts.new(c) for c in coords]
+            for i in range(len(verts) - 1):
+                try:
+                    bm.edges.new((verts[i], verts[i + 1]))
+                except ValueError:
+                    pass
+    else:
+        verts = [bm.verts.new(c) for c in coords]
     bm.to_mesh(mesh)
     bm.free()
     _debug_preserve_created_object_if_enabled(tobj, creation_type="LINE")
@@ -6918,15 +6957,28 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     map_world = map_obj.matrix_world
     map_direction_matrix = map_world.to_3x3()
 
+    tested_faces = 0
+    upward_faces = 0
+    ray_hits = 0
+
     for i, f in enumerate(bm.faces):
+        tested_faces += 1
         normal_world = (map_direction_matrix @ f.normal).normalized()
         dot = normal_world.dot(up)
         # Only consider faces facing upward
         if dot > up_threshold:
+            upward_faces += 1
             center = f.calc_center_median()
             center_world = map_world @ center
             ray_dir = normal_world
-            loc, norm, idx, dist = bvh.ray_cast(center_world, ray_dir, 1000)
+            epsilon_start = 1e-4
+            cast_origin = center_world + (normal_world * epsilon_start)
+            loc, norm, idx, dist = bvh.ray_cast(cast_origin, ray_dir, 1000)
+
+            if loc is None:
+                # Fallback to world-up ray which is more robust for mostly-flat water overlays.
+                fallback_origin = center_world + Vector((0.0, 0.0, epsilon_start))
+                loc, norm, idx, dist = bvh.ray_cast(fallback_origin, up, 1000)
 
             if i % debug_every == 0:
                 print(
@@ -6951,7 +7003,8 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
                         "None" if dist is None else f"{dist:.9f}",
                     )
 
-            if loc is not None and dist is not None and dist > 1e-6:
+            if loc is not None and dist is not None and dist >= 0.0:
+                ray_hits += 1
                 # Assign terrain material to this face
                 f.material_index = mat_index
                 colored_count += 1
@@ -6959,6 +7012,15 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     bm.to_mesh(map_mesh)
     bm.free()
 
+    module_logger.info(
+        "Terrain paint summary | map=%s terrain=%s tested_faces=%s upward_faces=%s ray_hits=%s colored_faces=%s",
+        map_obj.name,
+        terrain_obj.name,
+        tested_faces,
+        upward_faces,
+        ray_hits,
+        colored_count,
+    )
     print(f"Colored {colored_count} faces on {map_obj.name} based on {terrain_obj.name}")
 
 
