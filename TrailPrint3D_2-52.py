@@ -429,6 +429,7 @@ class MyProperties(bpy.types.PropertyGroup):
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
     col_WaterSpotCleanup: bpy.props.BoolProperty(name="Water Spot Cleanup", default=True, description = "Remove tiny WATER paint spots and optionally fill tiny BASE holes")
     col_WaterSpotCleanupMul: bpy.props.FloatProperty(name="Water Cleanup Threshold Mult", default=2.0, min=0.0, description="Cluster threshold in multiples of median map face area")
+    col_WaterHoleFillEnabled: bpy.props.BoolProperty(name="Water Hole Fill", default=False, description="Promote small enclosed BASE holes to WATER during cleanup")
     col_WaterHoleFillMul: bpy.props.FloatProperty(name="Water Hole Fill Mult", default=1.0, min=0.0, description="BASE hole-fill threshold in multiples of median map face area")
 
     mountain_treshold:bpy.props.IntProperty(name="Mountain Treshold", default = 60, min = 0, max = 100,subtype='PERCENTAGE', description="Height Treshold to Color Mountians")
@@ -1642,7 +1643,9 @@ class MY_PT_Advanced(bpy.types.Panel):
                 boxer.prop(props, "col_WaterSpotCleanup")
                 if props.col_WaterSpotCleanup:
                     boxer.prop(props, "col_WaterSpotCleanupMul")
-                    boxer.prop(props, "col_WaterHoleFillMul")
+                    boxer.prop(props, "col_WaterHoleFillEnabled")
+                    if props.col_WaterHoleFillEnabled:
+                        boxer.prop(props, "col_WaterHoleFillMul")
             
         
         #PIN
@@ -6439,6 +6442,7 @@ def paint_coloring_layer(map_obj, layer_artifact):
                 water_material_name="WATER",
                 base_material_name="BASE",
                 tiny_cluster_mul=bpy.context.scene.tp3d.col_WaterSpotCleanupMul,
+                hole_fill_enabled=bpy.context.scene.tp3d.col_WaterHoleFillEnabled,
                 hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
             )
         mesh_data = merged_object.data
@@ -6636,7 +6640,7 @@ def _extract_thin_bridge_faces(cluster_faces, area_scale):
             if f.calc_area() <= area_scale:
                 bridge_faces.append(f)
     return bridge_faces
-def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_material_name="BASE", tiny_cluster_mul=2.0, hole_fill_mul=1.0):
+def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_material_name="BASE", tiny_cluster_mul=2.0, hole_fill_enabled=False, hole_fill_mul=1.0, hole_fill_min_faces=2):
     if not _is_valid_blender_object(map_obj) or map_obj.type != 'MESH':
         return
 
@@ -6746,29 +6750,38 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
 
     filled_holes = 0
     filled_area = 0.0
-    if hole_fill_threshold > 0.0:
+    base_clusters_considered = 0
+    enclosed_clusters_promoted = 0
+    promoted_area = 0.0
+    if hole_fill_enabled and hole_fill_threshold > 0.0:
         base_clusters = _face_clusters_by_material(bm, base_index)
         for faces, area in base_clusters:
-            if area >= hole_fill_threshold:
+            if area >= hole_fill_threshold or len(faces) < hole_fill_min_faces:
                 continue
-            boundary_touches_non_water = False
+            base_clusters_considered += 1
+            cluster_face_set = set(faces)
+            enclosed_by_water = True
+            touches_mesh_boundary = False
             for f in faces:
                 for e in f.edges:
                     link_faces = e.link_faces
                     if len(link_faces) == 1:
-                        boundary_touches_non_water = True
+                        touches_mesh_boundary = True
+                        enclosed_by_water = False
                         break
                     for lf in link_faces:
-                        if lf not in faces and lf.material_index != water_index:
-                            boundary_touches_non_water = True
+                        if lf not in cluster_face_set and lf.material_index != water_index:
+                            enclosed_by_water = False
                             break
-                    if boundary_touches_non_water:
+                    if not enclosed_by_water:
                         break
-                if boundary_touches_non_water:
+                if not enclosed_by_water:
                     break
-            if not boundary_touches_non_water:
+            if enclosed_by_water and not touches_mesh_boundary:
                 filled_holes += 1
                 filled_area += area
+                enclosed_clusters_promoted += 1
+                promoted_area += area
                 for f in faces:
                     f.material_index = water_index
 
@@ -6781,17 +6794,22 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     bm.free()
 
     module_logger.info(
-        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_threshold=%.8f clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f thin_kept_clusters=%s bridge_faces_reclassified=%s largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f",
+        "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_enabled=%s hole_fill_threshold=%.8f hole_fill_min_faces=%s clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f base_clusters_considered=%s enclosed_clusters_promoted=%s promoted_area=%.8f thin_kept_clusters=%s bridge_faces_reclassified=%s largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f",
         map_obj.name,
         median_face_area,
         tiny_cluster_threshold,
+        hole_fill_enabled,
         hole_fill_threshold,
+        hole_fill_min_faces,
         len(water_clusters_before),
         len(water_clusters_after),
         removed_clusters,
         removed_area,
         filled_holes,
         filled_area,
+        base_clusters_considered,
+        enclosed_clusters_promoted,
+        promoted_area,
         flagged_thin_kept_clusters,
         bridge_faces_reclassified,
         largest_before,
