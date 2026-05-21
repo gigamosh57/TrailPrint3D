@@ -13,6 +13,10 @@ import os
 import sys
 import time
 from typing import Any, Dict
+
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.plot import show
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -25,11 +29,12 @@ DEFAULT_UNITS = "Meters"
 DEFAULT_WKID = 4326
 DEFAULT_TIMEOUT_SECONDS = 12.0
 
-# Small bbox around downtown Denver for default 3DEP coverage test.
-DEFAULT_MIN_LON = -105.01
-DEFAULT_MIN_LAT = 39.72
-DEFAULT_MAX_LON = -104.97
-DEFAULT_MAX_LAT = 39.76
+# Large bbox (100 miles per side) centered near Moab, UT for default 3DEP coverage test.
+# Center: 38.5733 N, 109.5508 W
+DEFAULT_MIN_LON = -110.47767052558159
+DEFAULT_MIN_LAT = 37.84866231884058
+DEFAULT_MAX_LON = -108.6239294744184
+DEFAULT_MAX_LAT = 39.297937681159425
 DEFAULT_WIDTH = 512
 DEFAULT_HEIGHT = 512
 
@@ -54,6 +59,22 @@ def write_3dep_cache(args: argparse.Namespace, metadata: Dict[str, Any], raster_
         f_raster.write(raster_body)
     logger.info("3DEP cache saved | metadata=%s | raster=%s", paths["metadata"], paths["raster"])
 
+
+
+
+def display_3dep_raster(raster_path: str, logger: logging.Logger) -> None:
+    logger.info("Rendering 3DEP raster preview | path=%s", raster_path)
+    with rasterio.open(raster_path) as src:
+        elevation = src.read(1)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        show(elevation, transform=src.transform, ax=ax, cmap="terrain")
+        ax.set_title("Elevation Map")
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        im = ax.imshow(elevation, cmap="terrain")
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label("Elevation")
+        plt.show()
 
 def configure_logging(verbose: bool) -> logging.Logger:
     logger = logging.getLogger("tnm_query_debug")
@@ -254,6 +275,12 @@ def run_3dep(args: argparse.Namespace, logger: logging.Logger) -> int:
                 len(raster_result["body"]),
             )
             write_3dep_cache(args, payload, raster_result["body"], logger)
+            if args.show_tif:
+                cache_paths = build_3dep_cache_paths(args)
+                try:
+                    display_3dep_raster(cache_paths["raster"], logger)
+                except Exception as exc:
+                    logger.warning("Unable to render 3DEP raster preview | path=%s | error=%s", cache_paths["raster"], exc)
         else:
             logger.warning("3DEP JSON response did not include href; payload keys=%s", sorted(payload.keys()))
             logger.info("SUCCESS | provider=3dep | json response received")
@@ -289,6 +316,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-format", default="tiff")
     parser.add_argument("--pixel-type", default="F32")
     parser.add_argument("--response-format", choices=["json", "image"], default="json")
+    parser.add_argument("--show-tif", action="store_true", default=True)
+    parser.add_argument("--no-show-tif", action="store_false", dest="show_tif")
 
     # Optional base-url override, provider dependent
     parser.add_argument("--base-url", default=None)
