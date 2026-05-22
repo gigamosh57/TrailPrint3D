@@ -6907,23 +6907,39 @@ def coloring_main(map,kind = "WATER"):
     return layer_artifact.get("merged_object")
 
 def paint_islands_on_map(map_obj, island_objects):
+    map_name = map_obj.name if map_obj else None
+    counters = {
+        "islands_total": len(island_objects or []),
+        "islands_valid_mesh": 0,
+        "islands_invalid": 0,
+        "islands_with_zero_polys": 0,
+        "islands_painted_success": 0,
+        "islands_painted_zero_faces": 0,
+    }
+
     if not island_objects:
-        module_logger.info("Island paint pass skipped: no pending islands for map=%s", map_obj.name if map_obj else None)
+        module_logger.info("Island paint pass skipped: no pending islands for map=%s", map_name)
+        module_logger.info("Island paint summary | map=%s %s", map_name, counters)
         return
 
     for island_obj in island_objects:
         if _is_valid_blender_object(island_obj) and island_obj.type == 'MESH':
+            counters["islands_valid_mesh"] += 1
+            polygon_count = len(island_obj.data.polygons) if island_obj.data else 0
+            if polygon_count == 0:
+                counters["islands_with_zero_polys"] += 1
+
             island_min_z, island_max_z = _mesh_z_range(island_obj)
             map_min_z, map_max_z = _mesh_z_range(map_obj)
             island_mat_names = [m.name for m in island_obj.data.materials] if island_obj.data else []
             map_mat_names = [m.name for m in map_obj.data.materials] if map_obj and map_obj.data else []
             module_logger.info(
                 "Island final paint debug: map=%s island=%s island_obj_type=%s island_verts=%s island_polys=%s island_z_range=(%s,%s) map_z_range=(%s,%s) island_loc=(%.6f,%.6f,%.6f) map_loc=(%.6f,%.6f,%.6f) island_mats=%s map_mats=%s",
-                map_obj.name if map_obj else None,
+                map_name,
                 island_obj.name,
                 island_obj.get("Object type") if "Object type" in island_obj else None,
                 len(island_obj.data.vertices) if island_obj.data else 0,
-                len(island_obj.data.polygons) if island_obj.data else 0,
+                polygon_count,
                 island_min_z,
                 island_max_z,
                 map_min_z,
@@ -6937,7 +6953,37 @@ def paint_islands_on_map(map_obj, island_objects):
                 island_mat_names,
                 map_mat_names,
             )
-            color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE")
+            island_metrics = color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE", return_metrics=True) or {}
+            faces_colored = int(island_metrics.get("faces_colored", 0) or 0)
+            faces_checked_up = int(island_metrics.get("faces_checked_up", 0) or 0)
+            ray_hits = int(island_metrics.get("ray_hits", 0) or 0)
+            hit_rate = (ray_hits / faces_checked_up) if faces_checked_up > 0 else 0.0
+            if faces_colored > 0:
+                counters["islands_painted_success"] += 1
+            else:
+                counters["islands_painted_zero_faces"] += 1
+
+            module_logger.info(
+                "Island paint metrics | map=%s island=%s polygon_count=%s faces_colored=%s hit_rate=%.4f faces_checked_up=%s ray_hits=%s material_name_used=%s",
+                map_name,
+                island_obj.name,
+                polygon_count,
+                faces_colored,
+                hit_rate,
+                faces_checked_up,
+                ray_hits,
+                island_metrics.get("material_name_used"),
+            )
+            if faces_colored == 0 and polygon_count > 0:
+                module_logger.warning(
+                    "Island paint zero-face warning | map=%s island=%s polygon_count=%s faces_colored=%s hit_rate=%.4f",
+                    map_name,
+                    island_obj.name,
+                    polygon_count,
+                    faces_colored,
+                    hit_rate,
+                )
+
             mesh_data = island_obj.data
             _debug_preserve_object_if_enabled(
                 island_obj,
@@ -6947,12 +6993,14 @@ def paint_islands_on_map(map_obj, island_objects):
             bpy.data.objects.remove(island_obj, do_unlink=True)
             bpy.data.meshes.remove(mesh_data)
         else:
+            counters["islands_invalid"] += 1
             module_logger.warning(
                 "Island final paint skipped invalid island object: island=%s valid=%s type=%s",
                 getattr(island_obj, "name", None),
                 _is_valid_blender_object(island_obj),
                 getattr(island_obj, "type", None),
             )
+        module_logger.info("Island paint summary | map=%s %s", map_name, counters)
     
 
 
@@ -7293,7 +7341,7 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     )
 
 
-def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_material_name=None):
+def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_material_name=None, return_metrics=False):
     """
     Loops through every face of map_obj.
     If face is facing upwards, raycasts upwards to see if terrain_obj is above.
@@ -7346,6 +7394,8 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
 
     up = Vector((0, 0, 1))
     colored_count = 0
+    faces_checked_up = 0
+    ray_hits = 0
     debug_samples = 5
     debug_every = max(1, len(bm.faces) // debug_samples)
     map_world = map_obj.matrix_world
@@ -7356,6 +7406,7 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
         dot = normal_world.dot(up)
         # Only consider faces facing upward
         if dot > up_threshold:
+            faces_checked_up += 1
             center = f.calc_center_median()
             center_world = map_world @ center
             primary_ray_dir = Vector((0, 0, 1))
@@ -7399,6 +7450,7 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
                     )
 
             if loc is not None and dist is not None and dist > 1e-6:
+                ray_hits += 1
                 # Assign terrain material to this face
                 f.material_index = mat_index
                 colored_count += 1
@@ -7407,6 +7459,14 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     bm.free()
 
     print(f"Colored {colored_count} faces on {map_obj.name} based on {terrain_obj.name}")
+    if return_metrics:
+        return {
+            "faces_checked_up": faces_checked_up,
+            "ray_hits": ray_hits,
+            "faces_colored": colored_count,
+            "material_name_used": mat.name if mat else None,
+        }
+    return None
 
 
 def build_terrain_surface(map_obj):
@@ -7477,9 +7537,19 @@ def apply_water_layer(map_obj, layer_objects):
 
 
 def apply_island_layer(map_obj, layer_objects):
-    if bpy.context.scene.tp3d.col_PaintMap == 1 and bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True)):
-        water_layer = layer_objects.get("WATER") if layer_objects else None
-        island_objects = water_layer.get("island_objects") if water_layer else None
+    water_layer = layer_objects.get("WATER") if layer_objects else None
+    island_objects = water_layer.get("island_objects") if water_layer else None
+    island_count = len(island_objects) if island_objects else 0
+    col_paint_map = bpy.context.scene.tp3d.col_PaintMap
+    col_process_islands = bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True))
+    module_logger.info(
+        "Island layer apply start | map=%s col_PaintMap=%s col_ProcessIslands=%s island_object_count=%s",
+        map_obj.name if map_obj else None,
+        col_paint_map,
+        col_process_islands,
+        island_count,
+    )
+    if col_paint_map == 1 and col_process_islands:
         paint_islands_on_map(map_obj, island_objects)
 
 
