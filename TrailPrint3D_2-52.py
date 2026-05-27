@@ -7460,6 +7460,14 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     bm.free()
 
     print(f"Colored {colored_count} faces on {map_obj.name} based on {terrain_obj.name}")
+    if return_metrics:
+        return {
+            "faces_checked_up": faces_checked_up,
+            "ray_hits": ray_hits,
+            "faces_colored": colored_count,
+            "material_name_used": mat.name if mat else None,
+        }
+    return None
 
     if return_metrics:
         return {
