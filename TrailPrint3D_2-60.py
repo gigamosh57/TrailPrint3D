@@ -202,6 +202,77 @@ def logging_settings_update(self, context):
     init_module_logger(context)
 
 
+def _get_query_batch_scale():
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    raw_scale = getattr(props, "col_QueryBatchScale", 1.0) if props else 1.0
+    try:
+        return max(0.25, min(4.0, float(raw_scale)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _scaled_int(base_value, min_value, max_value, scale=None):
+    scale = _get_query_batch_scale() if scale is None else scale
+    return max(min_value, min(max_value, int(round(base_value * scale))))
+
+
+def _scaled_bytes(base_value, min_value, max_value, scale=None):
+    return _scaled_int(base_value, min_value, max_value, scale=scale)
+
+
+def _osm_query_limits(kind):
+    scale = _get_query_batch_scale()
+    return {
+        "scale": scale,
+        "max_elements": _scaled_int(35000, 5000, 120000, scale),
+        "max_bytes_estimate": _scaled_bytes(12 * 1024 * 1024, 3 * 1024 * 1024, 48 * 1024 * 1024, scale),
+        "max_polygons": _scaled_int(4000, 500, 16000, scale),
+        "max_requests": (
+            _scaled_int(getattr(bpy.context.scene.tp3d, "col_glMaxRequests", 300), 1, 5000, scale)
+            if kind == "GLACIER"
+            else _scaled_int(40, 10, 160, scale)
+        ),
+        "max_cumulative_bytes": _scaled_bytes(40 * 1024 * 1024, 10 * 1024 * 1024, 160 * 1024 * 1024, scale),
+        "tile_scale": math.sqrt(scale),
+        "tile_throttle_seconds": max(0.0, 1.0 / scale),
+    }
+
+
+def _elevation_batch_size(provider):
+    scale = _get_query_batch_scale()
+    if provider == "OPENTOPODATA":
+        return _scaled_int(100, 25, 400, scale)
+    if provider == "OPEN-ELEVATION":
+        return _scaled_int(1000, 250, 4000, scale)
+    return _scaled_int(100, 25, 400, scale)
+
+
+def _usgs_tnm_raster_size():
+    scale = _get_query_batch_scale()
+    return _scaled_int(1024, 512, 2048, math.sqrt(scale))
+
+
+def _throttle_osm_tile_request(elapsed_time, limits):
+    sleep_for = float(limits.get("tile_throttle_seconds", 1.0)) - float(elapsed_time or 0.0)
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+
+
+_OSM_PROBE_CACHE = {}
+
+
+def _get_cached_osm_probe(bbox, kind):
+    scale = _get_query_batch_scale()
+    rounded_bbox = tuple(round(float(v), 7) for v in bbox)
+    cache_key = (kind, rounded_bbox, round(scale, 3))
+    cached = _OSM_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    probe = _probe_osm_payload(bbox, kind)
+    _OSM_PROBE_CACHE[cache_key] = probe
+    return probe
+
+
 def log_workflow(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -430,6 +501,7 @@ class MyProperties(bpy.types.PropertyGroup):
     col_glActive: bpy.props.BoolProperty(name="Include Glaciers", default=False, description = "Include Glaciers (If there are any)")
     col_glArea: bpy.props.FloatProperty(name="Glacier Size Treshold", default = 1, description = "Glaciers smaller than the treshold wont be included")
     col_glMaxRequests: bpy.props.IntProperty(name="Glacier OSM Tile Budget", default = 300, min = 1, max = 5000, description = "Maximum number of OSM tile requests for glaciers before aborting")
+    col_QueryBatchScale: bpy.props.FloatProperty(name="Query Batch Scale", default=1.0, min=0.25, max=4.0, description="Scale OSM tile/API request sizes. Higher is faster when providers allow larger requests; lower is safer.")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
     col_WaterSpotCleanup: bpy.props.BoolProperty(name="Water Spot Cleanup", default=True, description = "Remove tiny WATER paint spots and optionally fill tiny BASE holes")
@@ -1646,6 +1718,7 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.prop(props, "col_glActive")
             box.prop(props, "col_glArea")
             box.prop(props, "col_glMaxRequests")
+            boxer.prop(props, "col_QueryBatchScale")
 
             #layout.prop(props, "col_KeepManifold")
             boxer.prop(props,"col_PaintMap")
@@ -3186,7 +3259,7 @@ def get_elevation_openTopoData(coords, lenv = 0, pointsDone = 0):
     
     #coords = [convert_to_geo(y, x, v[0], v[1]) for v in vertices]
     #elevations = []
-    batch_size = 100
+    batch_size = _elevation_batch_size("OPENTOPODATA")
     for i in range(0, len(coords_to_fetch), batch_size):
         batch = coords_to_fetch[i:i + batch_size]
         query = "|".join([f"{c[0]},{c[1]}" for c in batch])
@@ -3301,8 +3374,9 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
         pad,
     )
 
+    raster_size = _usgs_tnm_raster_size()
     cache_key = hashlib.sha1(
-        f"{min_lon},{min_lat},{max_lon},{max_lat}|1024x1024|4326|tiff|F32".encode("utf-8")
+        f"{min_lon},{min_lat},{max_lon},{max_lat}|{raster_size}x{raster_size}|4326|tiff|F32".encode("utf-8")
     ).hexdigest()
     raster_path = os.path.join(tnm_3dep_cache_dir, f"{cache_key}.tif")
     raster_exists = os.path.exists(raster_path)
@@ -3321,7 +3395,7 @@ def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
             "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
             "bboxSR": 4326,
             "imageSR": 4326,
-            "size": "1024,1024",
+            "size": f"{raster_size},{raster_size}",
             "format": "tiff",
             "pixelType": "F32",
             "f": "json",
@@ -3441,7 +3515,7 @@ def get_elevation_openElevation(coords, lenv = 0, pointsDone = 0):
     """Fetches real elevation for each vertex using Open-Elevation with request batching."""
     
     elevations = []
-    batch_size = 1000
+    batch_size = _elevation_batch_size("OPEN-ELEVATION")
     for i in range(0, len(coords), batch_size):
         batch = coords[i:i + batch_size]
         # Open-Elevation expects a POST request with JSON body
@@ -3663,7 +3737,7 @@ def get_elevation_path_openElevation(vertices):
     v = vertices
     coords = [(v[0], v[1], v[2], v[3]) for v in vertices]
     elevations = []
-    batch_size = 1000
+    batch_size = _elevation_batch_size("OPEN-ELEVATION")
     for i in range(0, len(coords), batch_size):
         batch = coords[i:i + batch_size]
         # Open-Elevation expects a POST request with JSON body
@@ -3703,7 +3777,7 @@ def get_elevation_path_openTopoData(vertices):
     v = vertices
     coords = [(v[0], v[1], v[2], v[3]) for v in vertices]
     elevations = []
-    batch_size = 100
+    batch_size = _elevation_batch_size("OPENTOPODATA")
     for i in range(0, len(coords), batch_size):
         batch = coords[i:i + batch_size]
         query = "|".join([f"{c[0]},{c[1]}" for c in batch])
@@ -6716,13 +6790,16 @@ def build_coloring_layer(map,kind = "WATER"):
     created_objects = []
     island_objects_to_paint = []
     global_bbox = (minLat, minLon, maxLat, maxLon)
+    query_limits = _osm_query_limits(kind)
     tile_lat, tile_lon = derive_osm_tile_size_from_scale(global_bbox, num_subdivisions, scaleHor if scaleHor else 1.0)
-    probe = _probe_osm_payload(global_bbox, kind)
-    max_elements = 35000
-    max_bytes_estimate = 12 * 1024 * 1024
-    max_polygons = 4000
-    max_requests = bpy.context.scene.tp3d.col_glMaxRequests if kind == "GLACIER" else 40
-    max_cumulative_bytes = 40 * 1024 * 1024
+    tile_lat *= query_limits["tile_scale"]
+    tile_lon *= query_limits["tile_scale"]
+    probe = _get_cached_osm_probe(global_bbox, kind)
+    max_elements = query_limits["max_elements"]
+    max_bytes_estimate = query_limits["max_bytes_estimate"]
+    max_polygons = query_limits["max_polygons"]
+    max_requests = query_limits["max_requests"]
+    max_cumulative_bytes = query_limits["max_cumulative_bytes"]
     cumulative_bytes = 0
     request_count = 0
     seen_way_ids = set()
@@ -6737,6 +6814,20 @@ def build_coloring_layer(map,kind = "WATER"):
         module_logger.info("OSM probe kind=%s bbox=%s elements=%s estimated_bytes=%s", kind, global_bbox, probe["element_count"], probe["estimated_bytes"])
     else:
         module_logger.warning("OSM probe failed kind=%s bbox=%s", kind, global_bbox)
+
+    module_logger.info(
+        "OSM query limits kind=%s scale=%.3f tile_lat=%.6f tile_lon=%.6f max_elements=%s max_bytes=%s max_polygons=%s max_requests=%s max_cumulative_bytes=%s throttle=%.3f",
+        kind,
+        query_limits["scale"],
+        tile_lat,
+        tile_lon,
+        max_elements,
+        max_bytes_estimate,
+        max_polygons,
+        max_requests,
+        max_cumulative_bytes,
+        query_limits["tile_throttle_seconds"],
+    )
 
     use_single = probe.get("ok") and probe["element_count"] <= max_elements and probe["estimated_bytes"] <= max_bytes_estimate and probe["element_count"] <= max_polygons
     bboxes = [global_bbox] if use_single else _subdivide_bbox_grid(global_bbox, tile_lat, tile_lon)
@@ -6939,9 +7030,10 @@ def build_coloring_layer(map,kind = "WATER"):
                         outer_coords = outer_polygon["coordinates"]
                         assigned_inners = outer_polygon.get("holes", [])
 
+                        should_collect_mesh_diagnostics = module_logger.isEnabledFor(logging.INFO)
                         relation_quality_log = {
-                            "pre_clean_stats": _mesh_health_stats(None),
-                            "post_clean_stats": _mesh_health_stats(None),
+                            "pre_clean_stats": _mesh_health_stats(None) if should_collect_mesh_diagnostics else {},
+                            "post_clean_stats": _mesh_health_stats(None) if should_collect_mesh_diagnostics else {},
                             "cleaning_actions": [],
                             "quality_gate_passed": False,
                         }
@@ -6964,7 +7056,8 @@ def build_coloring_layer(map,kind = "WATER"):
                                     hole_telemetry,
                                 )
                                 continue
-                            relation_quality_log["post_clean_stats"] = _mesh_health_stats(tobj)
+                            if should_collect_mesh_diagnostics:
+                                relation_quality_log["post_clean_stats"] = _mesh_health_stats(tobj)
                             relation_quality_log["quality_gate_passed"] = True
                         else:
                             outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}_outer", outer_coords)
@@ -7030,22 +7123,23 @@ def build_coloring_layer(map,kind = "WATER"):
                             hole_telemetry["delta_faces"],
                             hole_telemetry["delta_edges"],
                         )
-                        post_health = _mesh_health_stats(tobj)
-                        module_logger.info(
-                            "Hole non-boolean mesh health relation=%s outer_idx=%s kind=%s pre=%s post=%s",
-                            relation_id,
-                            j,
-                            kind,
-                            pre_health,
-                            post_health,
-                        )
-                        module_logger.info(
-                            "Hole relation quality relation=%s outer_idx=%s kind=%s quality=%s",
-                            relation_id,
-                            j,
-                            kind,
-                            relation_quality_log,
-                        )
+                        if should_collect_mesh_diagnostics:
+                            post_health = _mesh_health_stats(tobj)
+                            module_logger.info(
+                                "Hole non-boolean mesh health relation=%s outer_idx=%s kind=%s pre=%s post=%s",
+                                relation_id,
+                                j,
+                                kind,
+                                pre_health,
+                                post_health,
+                            )
+                            module_logger.info(
+                                "Hole relation quality relation=%s outer_idx=%s kind=%s quality=%s",
+                                relation_id,
+                                j,
+                                kind,
+                                relation_quality_log,
+                            )
                         if hole_telemetry["holes_applied"] == 0 and valid_inners:
                             module_logger.warning(
                                 "Hole non-boolean yielded zero holes despite valid inner rings relation=%s kind=%s outer_idx=%s valid_inners=%s",
@@ -7161,7 +7255,7 @@ def build_coloring_layer(map,kind = "WATER"):
                         waterCreated += 1
                         standalone_ways_rendered += 1
                     
-                time.sleep(1)  # Pause to prevent request throttling
+                _throttle_osm_tile_request(time.perf_counter() - started, query_limits)
             
     # --- Merge all created water meshes into one ---
 
@@ -7480,6 +7574,198 @@ def paint_coloring_layer(map_obj, layer_artifact):
     return layer_artifact.get("merged_object")
 
 
+def _ensure_material_slot(mesh, material_name):
+    mat = bpy.data.materials.get(material_name)
+    if mat is None:
+        mat = bpy.data.materials.new(name=material_name)
+    if material_name not in [m.name for m in mesh.materials if m]:
+        mesh.materials.append(mat)
+    return mesh.materials.find(material_name)
+
+
+def _build_world_bvh_for_object(obj):
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data or not obj.data.polygons:
+        return None
+    world = obj.matrix_world
+    verts = [world @ v.co for v in obj.data.vertices]
+    polys = [p.vertices for p in obj.data.polygons]
+    if not verts or not polys:
+        return None
+    return bvhtree.BVHTree.FromPolygons(verts, polys)
+
+
+def _ray_hits_bvh_from_point(bvh, point, max_dist=1000):
+    for ray_dir in (Vector((0, 0, 1)), Vector((0, 0, -1))):
+        loc, norm, idx, dist = bvh.ray_cast(point, ray_dir, max_dist)
+        if loc is not None and dist is not None and dist > 1e-6:
+            return True
+    return False
+
+
+def _make_paint_entry(kind, material_name, objects):
+    valid_objects = [obj for obj in (objects or []) if _is_valid_blender_object(obj) and obj.type == 'MESH']
+    bvh_records = []
+    for obj in valid_objects:
+        bvh = _build_world_bvh_for_object(obj)
+        if bvh is not None:
+            bvh_records.append({"object": obj, "bvh": bvh})
+    return {
+        "kind": kind,
+        "material_name": material_name,
+        "objects": valid_objects,
+        "bvh_records": bvh_records,
+        "faces_colored": 0,
+        "ray_hits": 0,
+    }
+
+
+def _layer_objects_for_kind(layer_objects, kind):
+    layer = layer_objects.get(kind) if layer_objects else None
+    obj = layer.get("merged_object") if layer else None
+    return [obj] if _is_valid_blender_object(obj) else []
+
+
+def _island_objects_for_water_layer(layer_objects):
+    water_layer = layer_objects.get("WATER") if layer_objects else None
+    return water_layer.get("island_objects") if water_layer else []
+
+
+def _cleanup_painted_layer_sources(layer_objects):
+    seen_objects = set()
+    for layer in (layer_objects or {}).values():
+        if not layer:
+            continue
+        source_objects = []
+        merged_object = layer.get("merged_object")
+        if _is_valid_blender_object(merged_object):
+            source_objects.append(merged_object)
+        source_objects.extend(layer.get("island_objects") or [])
+        for obj in source_objects:
+            if not _is_valid_blender_object(obj) or obj.name in seen_objects:
+                continue
+            seen_objects.add(obj.name)
+            mesh_data = obj.data if obj.type == 'MESH' else None
+            _debug_preserve_object_if_enabled(
+                obj,
+                _format_debug_step_name(layer.get("kind", "LAYER"), "POST_PAINT", "CLEANUP"),
+                kind=layer.get("kind", ""),
+            )
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh_data:
+                bpy.data.meshes.remove(mesh_data)
+        layer["merged_object"] = None
+        layer["island_objects"] = []
+
+
+def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
+    if not _is_valid_blender_object(map_obj) or map_obj.type != 'MESH':
+        return {}
+
+    active_entries = [entry for entry in paint_entries if entry.get("bvh_records")]
+    if not active_entries:
+        return {}
+
+    recalculateNormals(map_obj)
+    mesh = map_obj.data
+    material_indices = {
+        entry["material_name"]: _ensure_material_slot(mesh, entry["material_name"])
+        for entry in active_entries
+    }
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+
+    up = Vector((0, 0, 1))
+    map_world = map_obj.matrix_world
+    map_direction_matrix = map_world.to_3x3()
+    faces_checked_up = 0
+
+    for face in bm.faces:
+        normal_world = (map_direction_matrix @ face.normal).normalized()
+        if normal_world.dot(up) <= up_threshold:
+            continue
+
+        faces_checked_up += 1
+        center_world = map_world @ face.calc_center_median()
+        winning_entry = None
+        for entry in reversed(active_entries):
+            hit = False
+            for record in entry["bvh_records"]:
+                if _ray_hits_bvh_from_point(record["bvh"], center_world):
+                    hit = True
+                    break
+            if hit:
+                entry["ray_hits"] += 1
+                winning_entry = entry
+                break
+
+        if winning_entry:
+            face.material_index = material_indices[winning_entry["material_name"]]
+            winning_entry["faces_colored"] += 1
+
+    bm.to_mesh(mesh)
+    bm.free()
+
+    metrics = {
+        entry["kind"]: {
+            "faces_checked_up": faces_checked_up,
+            "ray_hits": entry["ray_hits"],
+            "faces_colored": entry["faces_colored"],
+            "material_name_used": entry["material_name"],
+            "source_objects": len(entry["objects"]),
+            "bvh_count": len(entry["bvh_records"]),
+        }
+        for entry in active_entries
+    }
+    module_logger.info(
+        "Batch layer paint complete map=%s faces_checked_up=%s metrics=%s",
+        getattr(map_obj, "name", None),
+        faces_checked_up,
+        metrics,
+    )
+    return metrics
+
+
+def batch_paint_coloring_layers(map_obj, layer_objects):
+    if not layer_objects or not bpy.context.scene.tp3d.col_PaintMap:
+        return {}
+
+    island_objects = _island_objects_for_water_layer(layer_objects)
+    paint_entries = [
+        _make_paint_entry("WATER", "WATER", _layer_objects_for_kind(layer_objects, "WATER")),
+        _make_paint_entry("WATER_ISLANDS", "BASE", island_objects),
+        _make_paint_entry("FOREST", "FOREST", _layer_objects_for_kind(layer_objects, "FOREST")),
+        _make_paint_entry("CITY", "CITY", _layer_objects_for_kind(layer_objects, "CITY")),
+        _make_paint_entry("GLACIER", "GLACIER", _layer_objects_for_kind(layer_objects, "GLACIER")),
+    ]
+
+    metrics = paint_map_faces_by_layers(map_obj, paint_entries)
+
+    if metrics.get("WATER") and bpy.context.scene.tp3d.col_WaterSpotCleanup:
+        _debug_preserve_object_if_enabled(
+            map_obj,
+            _format_debug_step_name("WATER", "PRE_SPOT_CLEANUP_MAP"),
+            kind="WATER",
+        )
+        _cleanup_water_paint_clusters(
+            map_obj,
+            water_material_name="WATER",
+            base_material_name="BASE",
+            tiny_cluster_mul=bpy.context.scene.tp3d.col_WaterSpotCleanupMul,
+            hole_fill_enabled=bpy.context.scene.tp3d.col_WaterHoleFillEnabled,
+            hole_fill_mul=bpy.context.scene.tp3d.col_WaterHoleFillMul,
+        )
+        _debug_preserve_object_if_enabled(
+            map_obj,
+            _format_debug_step_name("WATER", "POST_SPOT_CLEANUP_MAP"),
+            kind="WATER",
+        )
+
+    _cleanup_painted_layer_sources(layer_objects)
+    return metrics
+
+
 def coloring_main(map,kind = "WATER"):
     layer_artifact = build_coloring_layer(map, kind)
     paint_coloring_layer(map, layer_artifact)
@@ -7501,6 +7787,7 @@ def paint_islands_on_map(map_obj, island_objects):
         module_logger.info("Island paint summary | map=%s %s", map_name, counters)
         return
 
+    valid_island_objects = []
     for island_obj in island_objects:
         if _is_valid_blender_object(island_obj) and island_obj.type == 'MESH':
             counters["islands_valid_mesh"] += 1
@@ -7508,70 +7795,33 @@ def paint_islands_on_map(map_obj, island_objects):
             if polygon_count == 0:
                 counters["islands_with_zero_polys"] += 1
 
-            island_min_z, island_max_z = _mesh_z_range(island_obj)
-            map_min_z, map_max_z = _mesh_z_range(map_obj)
-            island_mat_names = [m.name for m in island_obj.data.materials] if island_obj.data else []
-            map_mat_names = [m.name for m in map_obj.data.materials] if map_obj and map_obj.data else []
-            module_logger.info(
-                "Island final paint debug: map=%s island=%s island_obj_type=%s island_verts=%s island_polys=%s island_z_range=(%s,%s) map_z_range=(%s,%s) island_loc=(%.6f,%.6f,%.6f) map_loc=(%.6f,%.6f,%.6f) island_mats=%s map_mats=%s",
-                map_name,
-                island_obj.name,
-                island_obj.get("Object type") if "Object type" in island_obj else None,
-                len(island_obj.data.vertices) if island_obj.data else 0,
-                polygon_count,
-                island_min_z,
-                island_max_z,
-                map_min_z,
-                map_max_z,
-                island_obj.location.x,
-                island_obj.location.y,
-                island_obj.location.z,
-                map_obj.location.x if map_obj else 0.0,
-                map_obj.location.y if map_obj else 0.0,
-                map_obj.location.z if map_obj else 0.0,
-                island_mat_names,
-                map_mat_names,
-            )
-            _log_map_island_world_aabb_debug(map_obj, island_obj)
-            island_metrics = color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE", return_metrics=True) or {}
-            faces_colored = int(island_metrics.get("faces_colored", 0) or 0)
-            faces_checked_up = int(island_metrics.get("faces_checked_up", 0) or 0)
-            ray_hits = int(island_metrics.get("ray_hits", 0) or 0)
-            hit_rate = (ray_hits / faces_checked_up) if faces_checked_up > 0 else 0.0
-            if faces_colored > 0:
-                counters["islands_painted_success"] += 1
-            else:
-                counters["islands_painted_zero_faces"] += 1
-
-            module_logger.info(
-                "Island paint metrics | map=%s island=%s polygon_count=%s faces_colored=%s hit_rate=%.4f faces_checked_up=%s ray_hits=%s material_name_used=%s",
-                map_name,
-                island_obj.name,
-                polygon_count,
-                faces_colored,
-                hit_rate,
-                faces_checked_up,
-                ray_hits,
-                island_metrics.get("material_name_used"),
-            )
-            if faces_colored == 0 and polygon_count > 0:
-                module_logger.warning(
-                    "Island paint zero-face warning | map=%s island=%s polygon_count=%s faces_colored=%s hit_rate=%.4f",
+            if module_logger.isEnabledFor(logging.INFO):
+                island_min_z, island_max_z = _mesh_z_range(island_obj)
+                map_min_z, map_max_z = _mesh_z_range(map_obj)
+                island_mat_names = [m.name for m in island_obj.data.materials] if island_obj.data else []
+                map_mat_names = [m.name for m in map_obj.data.materials] if map_obj and map_obj.data else []
+                module_logger.info(
+                    "Island final paint debug: map=%s island=%s island_obj_type=%s island_verts=%s island_polys=%s island_z_range=(%s,%s) map_z_range=(%s,%s) island_loc=(%.6f,%.6f,%.6f) map_loc=(%.6f,%.6f,%.6f) island_mats=%s map_mats=%s",
                     map_name,
                     island_obj.name,
+                    island_obj.get("Object type") if "Object type" in island_obj else None,
+                    len(island_obj.data.vertices) if island_obj.data else 0,
                     polygon_count,
-                    faces_colored,
-                    hit_rate,
+                    island_min_z,
+                    island_max_z,
+                    map_min_z,
+                    map_max_z,
+                    island_obj.location.x,
+                    island_obj.location.y,
+                    island_obj.location.z,
+                    map_obj.location.x if map_obj else 0.0,
+                    map_obj.location.y if map_obj else 0.0,
+                    map_obj.location.z if map_obj else 0.0,
+                    island_mat_names,
+                    map_mat_names,
                 )
-
-            mesh_data = island_obj.data
-            _debug_preserve_object_if_enabled(
-                island_obj,
-                _format_debug_step_name("WATER", "ISLAND_PAINT", "SOURCE"),
-                kind="WATER",
-            )
-            bpy.data.objects.remove(island_obj, do_unlink=True)
-            bpy.data.meshes.remove(mesh_data)
+                _log_map_island_world_aabb_debug(map_obj, island_obj)
+            valid_island_objects.append(island_obj)
         else:
             counters["islands_invalid"] += 1
             module_logger.warning(
@@ -7580,6 +7830,24 @@ def paint_islands_on_map(map_obj, island_objects):
                 _is_valid_blender_object(island_obj),
                 getattr(island_obj, "type", None),
             )
+
+    if valid_island_objects:
+        metrics = paint_map_faces_by_layers(
+            map_obj,
+            [_make_paint_entry("WATER_ISLANDS", "BASE", valid_island_objects)],
+        ).get("WATER_ISLANDS", {})
+        faces_colored = int(metrics.get("faces_colored", 0) or 0)
+        counters["islands_painted_success"] = 1 if faces_colored > 0 else 0
+        counters["islands_painted_zero_faces"] = 0 if faces_colored > 0 else len(valid_island_objects)
+        for island_obj in valid_island_objects:
+            mesh_data = island_obj.data
+            _debug_preserve_object_if_enabled(
+                island_obj,
+                _format_debug_step_name("WATER", "ISLAND_PAINT", "SOURCE"),
+                kind="WATER",
+            )
+            bpy.data.objects.remove(island_obj, do_unlink=True)
+            bpy.data.meshes.remove(mesh_data)
 
     module_logger.info("Island paint summary | map=%s %s", map_name, counters)
     
@@ -7838,9 +8106,10 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     bm = bmesh.new()
     bm.from_mesh(mesh)
     bm.faces.ensure_lookup_table()
-    hist_before = _material_face_histogram(bm, mesh)
+    collect_cleanup_diagnostics = module_logger.isEnabledFor(logging.INFO)
+    hist_before = _material_face_histogram(bm, mesh) if collect_cleanup_diagnostics else {}
 
-    map_face_areas = sorted(f.calc_area() for f in bm.faces if f.calc_area() > 0)
+    map_face_areas = sorted(area for area in (f.calc_area() for f in bm.faces) if area > 0)
     median_face_area = map_face_areas[len(map_face_areas)//2] if map_face_areas else 0.0
     tiny_cluster_threshold = median_face_area * max(0.0, tiny_cluster_mul)
     hole_fill_threshold = median_face_area * max(0.0, hole_fill_mul)
@@ -7975,14 +8244,9 @@ def _cleanup_water_paint_clusters(map_obj, water_material_name="WATER", base_mat
     largest_after = water_areas_after[0] if water_areas_after else 0.0
     median_after = water_areas_after[len(water_areas_after)//2] if water_areas_after else 0.0
 
+    hist_after = _material_face_histogram(bm, mesh) if collect_cleanup_diagnostics else {}
     bm.to_mesh(mesh)
     bm.free()
-
-    bm_hist_after = bmesh.new()
-    bm_hist_after.from_mesh(mesh)
-    bm_hist_after.faces.ensure_lookup_table()
-    hist_after = _material_face_histogram(bm_hist_after, mesh)
-    bm_hist_after.free()
 
     module_logger.info(
         "WATER spot cleanup map=%s median_face_area=%.8f tiny_cluster_threshold=%.8f hole_fill_enabled=%s hole_fill_threshold=%.8f hole_fill_min_faces=%s clusters_before=%s clusters_after=%s removed_clusters=%s removed_painted_area=%.8f filled_holes=%s filled_area=%.8f base_clusters_considered=%s enclosed_clusters_promoted=%s promoted_area=%.8f thin_kept_clusters=%s bridge_faces_reclassified=%s largest_cluster_before=%.8f median_cluster_before=%.8f largest_cluster_after=%.8f median_cluster_after=%.8f material_faces_before=[%s] material_faces_after=[%s]",
@@ -8068,6 +8332,7 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     faces_checked_up = 0
     ray_hits = 0
     debug_samples = 5
+    paint_debug_enabled = module_logger.isEnabledFor(logging.DEBUG)
     debug_every = max(1, len(bm.faces) // debug_samples)
     map_world = map_obj.matrix_world
     map_direction_matrix = map_world.to_3x3()
@@ -8095,7 +8360,7 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
                 hit_direction_vec = primary_ray_dir
                 loc = norm = idx = dist = None
 
-            if i % debug_every == 0:
+            if paint_debug_enabled and i % debug_every == 0:
                 print(
                     f"[terrain paint debug] face={i} center_world={tuple(round(v, 4) for v in center_world)} "
                     f"ray_dir={tuple(round(v, 4) for v in hit_direction_vec)} "
@@ -8282,9 +8547,19 @@ def run_layer_pipeline(map_obj):
         bool(layer_objects.get("GLACIER")),
     )
     paint_entire_map_base(map_obj, base_material='BASE')
-    water_obj = apply_water_layer(map_obj, layer_objects)
-    apply_island_layer(map_obj, layer_objects)
-    overlay_objs = apply_overlay_layers(map_obj, layer_objects)
+    if bpy.context.scene.tp3d.col_PaintMap:
+        batch_metrics = batch_paint_coloring_layers(map_obj, layer_objects)
+        water_obj = None
+        overlay_objs = {
+            "FOREST": None,
+            "CITY": None,
+            "GLACIER": None,
+        }
+        module_logger.info("Layer batch paint metrics map=%s metrics=%s", getattr(map_obj, "name", None), batch_metrics)
+    else:
+        water_obj = apply_water_layer(map_obj, layer_objects)
+        apply_island_layer(map_obj, layer_objects)
+        overlay_objs = apply_overlay_layers(map_obj, layer_objects)
     return {
         "water": water_obj,
         "overlays": overlay_objs,
@@ -8815,6 +9090,7 @@ def runGeneration(type):
     
     start_time = time.time()
     init_module_logger(bpy.context)
+    _OSM_PROBE_CACHE.clear()
 
     toggle_console()
     
