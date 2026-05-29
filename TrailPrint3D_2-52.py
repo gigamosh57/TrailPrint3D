@@ -6953,6 +6953,7 @@ def paint_islands_on_map(map_obj, island_objects):
                 island_mat_names,
                 map_mat_names,
             )
+            _log_map_island_world_aabb_debug(map_obj, island_obj)
             island_metrics = color_map_faces_by_terrain(map_obj, island_obj, paint_material_name="BASE", return_metrics=True) or {}
             faces_colored = int(island_metrics.get("faces_colored", 0) or 0)
             faces_checked_up = int(island_metrics.get("faces_checked_up", 0) or 0)
@@ -7021,6 +7022,96 @@ def _mesh_z_range(obj):
         return None, None
     zs = [v.co.z for v in obj.data.vertices]
     return min(zs), max(zs)
+
+
+def _world_vertex_aabb(obj):
+    """Return world-space AABB min/max vectors computed from transformed mesh vertices."""
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data or not obj.data.vertices:
+        return None, None
+
+    world_matrix = obj.matrix_world
+    transformed_verts = [world_matrix @ v.co for v in obj.data.vertices]
+    min_corner = Vector((
+        min(v.x for v in transformed_verts),
+        min(v.y for v in transformed_verts),
+        min(v.z for v in transformed_verts),
+    ))
+    max_corner = Vector((
+        max(v.x for v in transformed_verts),
+        max(v.y for v in transformed_verts),
+        max(v.z for v in transformed_verts),
+    ))
+    return min_corner, max_corner
+
+
+def _aabb_centroid(min_corner, max_corner):
+    if min_corner is None or max_corner is None:
+        return None
+    return (min_corner + max_corner) * 0.5
+
+
+def _xy_aabbs_overlap(a_min, a_max, b_min, b_max):
+    if any(corner is None for corner in (a_min, a_max, b_min, b_max)):
+        return None
+    return (a_min.x <= b_max.x and a_max.x >= b_min.x and a_min.y <= b_max.y and a_max.y >= b_min.y)
+
+
+def _xy_aabb_nearest_distance(a_min, a_max, b_min, b_max):
+    if any(corner is None for corner in (a_min, a_max, b_min, b_max)):
+        return None
+    dx = max(a_min.x - b_max.x, b_min.x - a_max.x, 0.0)
+    dy = max(a_min.y - b_max.y, b_min.y - a_max.y, 0.0)
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def _log_map_island_world_aabb_debug(map_obj, island_obj):
+    map_min, map_max = _world_vertex_aabb(map_obj)
+    island_min, island_max = _world_vertex_aabb(island_obj)
+
+    if any(corner is None for corner in (map_min, map_max, island_min, island_max)):
+        module_logger.warning(
+            "Island world AABB debug unavailable | map=%s island=%s map_aabb_present=%s island_aabb_present=%s",
+            getattr(map_obj, "name", None),
+            getattr(island_obj, "name", None),
+            map_min is not None and map_max is not None,
+            island_min is not None and island_max is not None,
+        )
+        return
+
+    map_centroid = _aabb_centroid(map_min, map_max)
+    island_centroid = _aabb_centroid(island_min, island_max)
+    centroid_distance_xy = math.sqrt(
+        (map_centroid.x - island_centroid.x) ** 2 +
+        (map_centroid.y - island_centroid.y) ** 2
+    )
+    centroid_distance_z = abs(map_centroid.z - island_centroid.z)
+    xy_overlap = _xy_aabbs_overlap(map_min, map_max, island_min, island_max)
+    nearest_xy_distance = _xy_aabb_nearest_distance(map_min, map_max, island_min, island_max)
+
+    module_logger.info(
+        "Island world AABB debug | map=%s island=%s "
+        "map_world_aabb_min=(%.6f,%.6f,%.6f) map_world_aabb_max=(%.6f,%.6f,%.6f) "
+        "island_world_aabb_min=(%.6f,%.6f,%.6f) island_world_aabb_max=(%.6f,%.6f,%.6f) "
+        "xy_aabb_overlap=%s centroid_distance_xy=%.6f centroid_distance_z=%.6f nearest_point_xy_distance=%.6f",
+        map_obj.name,
+        island_obj.name,
+        map_min.x,
+        map_min.y,
+        map_min.z,
+        map_max.x,
+        map_max.y,
+        map_max.z,
+        island_min.x,
+        island_min.y,
+        island_min.z,
+        island_max.x,
+        island_max.y,
+        island_max.z,
+        xy_overlap,
+        centroid_distance_xy,
+        centroid_distance_z,
+        nearest_xy_distance,
+    )
 
 
 def _apply_deterministic_z_offset(land_obj, water_obj, relation_id, land_offset=0.0005, water_offset=0.0):
