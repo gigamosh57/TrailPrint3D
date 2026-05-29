@@ -35,7 +35,7 @@ bl_info = {
     "blender": (4, 5, 2),
     "category": "Object",
     "author": "EmGi",
-    "version": (2,52),
+    "version": (2,53),
     "description": "Create 3D Printable Miniature Maps of your Adventures",
     "warning": "",
     "doc_url": "",
@@ -44,7 +44,7 @@ bl_info = {
 }
 
 category = "TrailPrint3D"
-AddonVersion = (2, 52)
+AddonVersion = (2, 53)
 
 
 import bpy # type: ignore
@@ -1462,7 +1462,7 @@ class MY_PT_Generate(bpy.types.Panel):
         layout.operator("wm.open_website",text = "Support me on Patreon", icon='URL')  # Open website
         layout.operator("wm.join_discord",text = "Join Discord", icon='URL')  # Open website
         layout.label(text = "Created by: EmGi, updated by gigamosh57")
-        layout.label(text = "Premium Version: 2.52")
+        layout.label(text = "Premium Version: 2.53")
         layout.separator()  # Adds a horizontal line
         # Add the script execution button
         layout.label(text = "Create the File")
@@ -5274,7 +5274,7 @@ def fetch_osm_query(query, kind="WATER", overpass_endpoints=None, connect_timeou
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     ]
     headers = {
-        "User-Agent": "TrailPrint3D/2.52 (OSM Overpass client)",
+        "User-Agent": "TrailPrint3D/2.53 (OSM Overpass client)",
         "Accept": "application/json,text/plain,*/*",
     }
     result = {"ok": False, "status_code": None, "error_type": None, "payload_size_bytes": 0, "json_data": None, "endpoint": None}
