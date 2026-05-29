@@ -5194,6 +5194,17 @@ def build_osm_nodes(data):
 
 
 
+def format_latlon_bounds(latlon_coords):
+    if not latlon_coords:
+        return "empty"
+
+    lats = [coord[0] for coord in latlon_coords]
+    lons = [coord[1] for coord in latlon_coords]
+    return (
+        f"lat=({min(lats):.6f},{max(lats):.6f}) "
+        f"lon=({min(lons):.6f},{max(lons):.6f})"
+    )
+
 def coloring_main(map,kind = "WATER"):
 
     col_KeepManifold = (bpy.context.scene.tp3d.col_KeepManifold)
@@ -5263,6 +5274,11 @@ def coloring_main(map,kind = "WATER"):
         bbox, depth = tile_queue.popleft()
         processed_tiles += 1
         print(f"loop: {processed_tiles} (queue={len(tile_queue)} depth={depth})")
+        if kind == "FOREST":
+            tp3d_log(
+                f"FOREST OSM tile processing: bbox={bbox} depth={depth} "
+                f"queue_remaining={len(tile_queue)}"
+            )
 
         data = []
         #data = fetch_osm_data(bbox, kind)
@@ -5328,6 +5344,11 @@ def coloring_main(map,kind = "WATER"):
         nodes = build_osm_nodes(data)
         bodies = extract_multipolygon_bodies(data['elements'], nodes)
         tp3d_log(f"Parsed OSM data for kind={kind} bbox={bbox}: elements={tile_elements}, nodes={len(nodes)}, multipolygons={len(bodies)}")
+        if kind == "FOREST":
+            tp3d_log(
+                f"FOREST parsed tile detail: bbox={bbox} depth={depth} elements={tile_elements} "
+                f"nodes={len(nodes)} multipolygons={len(bodies)}"
+            )
         #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
 
         for i, body in enumerate(bodies):
@@ -5345,6 +5366,12 @@ def coloring_main(map,kind = "WATER"):
 
             outer = body.get("outer", [])
             inners = body.get("inners", [])
+            if kind == "FOREST":
+                tp3d_log(
+                    f"FOREST relation detail: relation={relation_id} outer_vertices={len(outer)} "
+                    f"inner_rings={len(inners)} bounds={format_latlon_bounds(outer)} "
+                    f"bbox={bbox} depth={depth}"
+                )
 
             if relation_id not in aggregate_relation_stats:
                 aggregate_relation_stats[relation_id] = {
@@ -5449,15 +5476,25 @@ def coloring_main(map,kind = "WATER"):
                 seen_way_ids.add(way_id)
 
                 coords = []
+                way_latlon_coords = []
                 for node_id in element.get('nodes', []):
                     if node_id in nodes:
                         node = nodes[node_id]
+                        way_latlon_coords.append((node['lat'], node['lon'], 0))
                         coord = convert_to_blender_coordinates(
                             node['lat'], node['lon'], 0,0
                         )
                         coords.append(coord)
                 tArea = calculate_polygon_area_2d(coords)
                 #print(f"tArea2: {tArea}")
+                if kind == "FOREST":
+                    way_closed = len(coords) >= 2 and coords[0] == coords[-1]
+                    way_shape = "closed" if way_closed else "open"
+                    tp3d_log(
+                        f"FOREST way detail: way_id={way_id} shape={way_shape} "
+                        f"closed_by_coords={way_closed} nodes={len(coords)} "
+                        f"bounds={format_latlon_bounds(way_latlon_coords)} bbox={bbox} depth={depth}"
+                    )
                 if len(coords) < 2 or tArea < col_Area:
                     waterDeleted += 1
                     continue
@@ -5468,6 +5505,11 @@ def coloring_main(map,kind = "WATER"):
                     created_objects.append(tobj)
                     waterCreated += 1
                 else:
+                    if kind == "FOREST":
+                        tp3d_log(
+                            f"FOREST open way mesh created: way_id={way_id} nodes={len(coords)} "
+                            f"bounds={format_latlon_bounds(way_latlon_coords)} bbox={bbox} depth={depth}"
+                        )
                     tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
                     created_objects.append(tobj)
                     waterCreated += 1
