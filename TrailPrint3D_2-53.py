@@ -6654,6 +6654,14 @@ def build_coloring_layer(map,kind = "WATER"):
     process_islands = bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True))
     should_process_water_islands = (kind == "WATER" and process_islands)
     min_area_effective = _compute_effective_min_area(kind, col_Area)
+    module_logger.info(
+        "OSM layer build start kind=%s map=%s active=True paint_map=%s min_area=%.8f effective_min_area=%.8f",
+        kind,
+        getattr(map, "name", None),
+        col_PaintMap,
+        col_Area,
+        min_area_effective,
+    )
 
     global exportformat
     if col_PaintMap == True:
@@ -7101,6 +7109,15 @@ def build_coloring_layer(map,kind = "WATER"):
                         created_objects.append(tobj)
                         waterCreated += 1
                         standalone_ways_rendered += 1
+                    elif kind != "WATER":
+                        waterDeleted += 1
+                        module_logger.info(
+                            "Open OSM way skipped for polygon layer kind=%s way_id=%s node_count=%s tags=%s",
+                            kind,
+                            element.get("id"),
+                            len(coords),
+                            tags,
+                        )
                     else:
                         tobj = col_create_line_mesh(f"OpenObject_{i}", coords)
                         created_objects.append(tobj)
@@ -7148,8 +7165,8 @@ def build_coloring_layer(map,kind = "WATER"):
                 mesh_data = tobj.data
                 _debug_preserve_object_if_enabled(
                     tobj,
-                    _format_debug_step_name("WATER", "AREA_FILTERED", "FRAGMENT"),
-                    kind="WATER",
+                    _format_debug_step_name(kind, "AREA_FILTERED", "FRAGMENT"),
+                    kind=kind,
                 )
                 bpy.data.objects.remove(tobj, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
@@ -7297,8 +7314,8 @@ def build_coloring_layer(map,kind = "WATER"):
                 mesh_data = merged_object.data
                 _debug_preserve_object_if_enabled(
                     merged_object,
-                    _format_debug_step_name("WATER", "POST_BOOLEAN", "MERGED"),
-                    kind="WATER",
+                    _format_debug_step_name(kind, "POST_BOOLEAN", "MERGED"),
+                    kind=kind,
                 )
                 bpy.data.objects.remove(merged_object, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
@@ -7313,7 +7330,7 @@ def build_coloring_layer(map,kind = "WATER"):
             merged_object.data.materials.append(mat)
             recalculateNormals(merged_object)
             module_logger.info(
-                "Post-boolean water normals refreshed object=%s kind=%s material_slots=%s",
+                "Post-boolean layer normals refreshed object=%s kind=%s material_slots=%s",
                 merged_object.name,
                 kind,
                 [m.name for m in merged_object.data.materials],
@@ -7364,9 +7381,27 @@ def paint_coloring_layer(map_obj, layer_artifact):
     merged_object = layer_artifact.get("merged_object")
     island_objects = layer_artifact.get("island_objects") or []
     col_PaintMap = bpy.context.scene.tp3d.col_PaintMap
+    module_logger.info(
+        "Layer paint start kind=%s map=%s merged_object=%s paint_map=%s island_objects=%s",
+        kind,
+        getattr(map_obj, "name", None),
+        merged_object.name if _is_valid_blender_object(merged_object) else None,
+        col_PaintMap,
+        len(island_objects),
+    )
 
     if col_PaintMap and _is_valid_blender_object(merged_object):
-        color_map_faces_by_terrain(map_obj, merged_object)
+        paint_metrics = color_map_faces_by_terrain(map_obj, merged_object, return_metrics=True) or {}
+        module_logger.info(
+            "Layer paint metrics kind=%s map=%s terrain=%s faces_colored=%s faces_checked_up=%s ray_hits=%s material_name_used=%s",
+            kind,
+            getattr(map_obj, "name", None),
+            merged_object.name,
+            paint_metrics.get("faces_colored"),
+            paint_metrics.get("faces_checked_up"),
+            paint_metrics.get("ray_hits"),
+            paint_metrics.get("material_name_used"),
+        )
         if kind == "WATER" and bpy.context.scene.tp3d.col_WaterSpotCleanup:
             _debug_preserve_object_if_enabled(
                 map_obj,
@@ -7389,12 +7424,21 @@ def paint_coloring_layer(map_obj, layer_artifact):
         mesh_data = merged_object.data
         _debug_preserve_object_if_enabled(
             merged_object,
-            _format_debug_step_name("WATER", "POST_PAINT", "CLEANUP"),
-            kind="WATER",
+            _format_debug_step_name(kind, "POST_PAINT", "CLEANUP"),
+            kind=kind,
         )
         bpy.data.objects.remove(merged_object, do_unlink=True)
         bpy.data.meshes.remove(mesh_data)
         layer_artifact["merged_object"] = None
+        module_logger.info("Layer paint cleanup complete kind=%s map=%s", kind, getattr(map_obj, "name", None))
+    else:
+        module_logger.info(
+            "Layer paint skipped kind=%s map=%s paint_map=%s merged_object_valid=%s",
+            kind,
+            getattr(map_obj, "name", None),
+            col_PaintMap,
+            _is_valid_blender_object(merged_object),
+        )
 
     return layer_artifact.get("merged_object")
 
@@ -8088,6 +8132,14 @@ def collect_osm_layers(map_obj):
     include_forest = bool(getattr(props, "col_fActive", False))
     include_city = bool(getattr(props, "col_cActive", False))
     include_glacier = bool(getattr(props, "col_glActive", False))
+    module_logger.info(
+        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s GLACIER=%s",
+        getattr(map_obj, "name", None),
+        include_water,
+        include_forest,
+        include_city,
+        include_glacier,
+    )
 
     if include_water:
         layers["WATER"] = build_coloring_layer(map_obj, "WATER")
@@ -8097,6 +8149,14 @@ def collect_osm_layers(map_obj):
         layers["CITY"] = build_coloring_layer(map_obj, "CITY")
     if include_glacier:
         layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
+    module_logger.info(
+        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s GLACIER=%s",
+        getattr(map_obj, "name", None),
+        bool(layers.get("WATER")),
+        bool(layers.get("FOREST")),
+        bool(layers.get("CITY")),
+        bool(layers.get("GLACIER")),
+    )
     return layers
 
 
