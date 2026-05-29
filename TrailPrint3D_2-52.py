@@ -57,6 +57,7 @@ from datetime import date
 from datetime import datetime
 import bmesh # type: ignore
 from mathutils import Vector, bvhtree, Euler
+from mathutils.geometry import tessellate_polygon
 import os
 import sys
 import json
@@ -5753,6 +5754,181 @@ def col_create_face_mesh_with_holes(name, outer_coords, assigned_inners, relatio
     return tobj, telemetry
 
 
+
+def _polygon_ring_without_closure(coords):
+    ring = list(coords or [])
+    if len(ring) > 1 and ring[0] == ring[-1]:
+        ring = ring[:-1]
+    return ring
+
+
+def _triangle_area_2d(a, b, c):
+    return abs(((b[0] - a[0]) * (c[1] - a[1])) - ((c[0] - a[0]) * (b[1] - a[1]))) * 0.5
+
+
+def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=None, outer_idx=None, kind="WATER"):
+    """Create a polygon-with-holes mesh from explicit triangle faces.
+
+    Blender's large-ngon face creation path is fragile for large OSM water
+    multipolygons.  This helper tessellates the normalized outer ring and its
+    valid holes first, then creates only triangle faces via Mesh.from_pydata.
+    """
+
+    prep_started = time.perf_counter()
+    outer_coords = list((polygon_with_holes or {}).get("coordinates") or [])
+    assigned_inners = list((polygon_with_holes or {}).get("holes") or [])
+    candidate_holes = len(assigned_inners)
+    telemetry = {
+        "candidate_holes": candidate_holes,
+        "holes_applied": 0,
+        "dropped_invalid_holes": 0,
+        "boolean_changed_mesh": False,
+        "delta_faces": 0,
+        "delta_edges": 0,
+        "prep": 0.0,
+        "apply": 0.0,
+        "source": "triangulated_polygon_mesh",
+        "source_outer_nodes": len(outer_coords),
+        "source_inner_rings": candidate_holes,
+        "final_vertices": 0,
+        "final_triangles": 0,
+    }
+
+    outer_valid, outer_reason = classify_ring_validity(outer_coords, 0.0)
+    if not outer_valid:
+        telemetry["prep"] = time.perf_counter() - prep_started
+        module_logger.warning(
+            "Triangulated water polygon outer rejected relation=%s outer_idx=%s kind=%s reason=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            relation_id,
+            outer_idx,
+            kind,
+            outer_reason,
+            telemetry["source_outer_nodes"],
+            telemetry["source_inner_rings"],
+            candidate_holes,
+        )
+        telemetry["dropped_invalid_holes"] = candidate_holes
+        return None, telemetry
+
+    valid_inners = []
+    for inner_idx, inner_coords in enumerate(assigned_inners):
+        inner_valid, inner_reason = classify_ring_validity(inner_coords, 0.0)
+        contained = inner_valid and _is_ring_contained_by_outer(inner_coords, outer_coords)
+        if not inner_valid or not contained:
+            telemetry["dropped_invalid_holes"] += 1
+            module_logger.warning(
+                "Triangulated water polygon hole rejected relation=%s outer_idx=%s inner_idx=%s kind=%s reason=%s contained=%s ring_points=%s",
+                relation_id,
+                outer_idx,
+                inner_idx,
+                kind,
+                inner_reason if not inner_valid else "not_contained_by_outer",
+                contained,
+                len(inner_coords or []),
+            )
+            continue
+        valid_inners.append(inner_coords)
+
+    contours = [_polygon_ring_without_closure(outer_coords)] + [
+        _polygon_ring_without_closure(inner) for inner in valid_inners
+    ]
+    contours = [contour for contour in contours if len(contour) >= 3]
+    if not contours or len(contours[0]) < 3:
+        telemetry["prep"] = time.perf_counter() - prep_started
+        module_logger.warning(
+            "Triangulated water polygon skipped relation=%s outer_idx=%s kind=%s reason=no_valid_outer_contour source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            relation_id,
+            outer_idx,
+            kind,
+            telemetry["source_outer_nodes"],
+            telemetry["source_inner_rings"],
+            telemetry["dropped_invalid_holes"],
+        )
+        return None, telemetry
+
+    flat_vertices = [tuple(coord) for contour in contours for coord in contour]
+    tessellation_contours = [[Vector(coord) for coord in contour] for contour in contours]
+
+    try:
+        tessellated_faces = tessellate_polygon(tessellation_contours)
+    except Exception:
+        telemetry["prep"] = time.perf_counter() - prep_started
+        module_logger.exception(
+            "Triangulated water polygon tessellation failed relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            relation_id,
+            outer_idx,
+            kind,
+            telemetry["source_outer_nodes"],
+            telemetry["source_inner_rings"],
+            telemetry["dropped_invalid_holes"],
+        )
+        return None, telemetry
+
+    triangle_faces = []
+    for tri in tessellated_faces:
+        if len(tri) != 3 or len(set(tri)) != 3:
+            continue
+        try:
+            a, b, c = (flat_vertices[tri[0]], flat_vertices[tri[1]], flat_vertices[tri[2]])
+        except (IndexError, TypeError):
+            continue
+        if _triangle_area_2d(a, b, c) <= 1e-12:
+            continue
+        centroid = ((a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0)
+        if not _point_in_ring_2d(centroid, outer_coords):
+            continue
+        if any(_point_in_ring_2d(centroid, inner) for inner in valid_inners):
+            continue
+        triangle_faces.append(tuple(tri))
+
+    if not triangle_faces:
+        telemetry["prep"] = time.perf_counter() - prep_started
+        module_logger.warning(
+            "Triangulated water polygon produced no triangles relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            relation_id,
+            outer_idx,
+            kind,
+            telemetry["source_outer_nodes"],
+            telemetry["source_inner_rings"],
+            telemetry["dropped_invalid_holes"],
+        )
+        return None, telemetry
+
+    used_indices = sorted({idx for tri in triangle_faces for idx in tri})
+    index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(used_indices)}
+    final_vertices = [flat_vertices[idx] for idx in used_indices]
+    final_faces = [tuple(index_map[idx] for idx in tri) for tri in triangle_faces]
+
+    mesh = bpy.data.meshes.new(name)
+    tobj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(tobj)
+    mesh.from_pydata(final_vertices, [], final_faces)
+    mesh.update(calc_edges=True)
+
+    telemetry["holes_applied"] = len(valid_inners)
+    telemetry["boolean_changed_mesh"] = telemetry["holes_applied"] > 0
+    telemetry["prep"] = time.perf_counter() - prep_started
+    telemetry["final_vertices"] = len(final_vertices)
+    telemetry["final_triangles"] = len(final_faces)
+    telemetry["delta_faces"] = len(final_faces)
+    telemetry["delta_edges"] = len(mesh.edges)
+
+    module_logger.info(
+        "Triangulated water polygon mesh relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s final_vertices=%s final_triangles=%s dropped_invalid_holes=%s holes_applied=%s",
+        relation_id,
+        outer_idx,
+        kind,
+        telemetry["source_outer_nodes"],
+        telemetry["source_inner_rings"],
+        telemetry["final_vertices"],
+        telemetry["final_triangles"],
+        telemetry["dropped_invalid_holes"],
+        telemetry["holes_applied"],
+    )
+
+    _debug_preserve_created_object_if_enabled(tobj, creation_type="FACE")
+    return tobj, telemetry
+
 def _signed_polygon_area_2d(coords):
     area = 0.0
 
@@ -6701,27 +6877,18 @@ def build_coloring_layer(map,kind = "WATER"):
                     island_objects_created = 0
                     island_objects_failed = 0
 
-                    # Explicitly create visible island meshes from valid inner rings so islands remain
-                    # present even when hole visibility is affected by viewport/render filtering.
+                    # Water multipolygons now preserve islands by triangulating the primary
+                    # water mesh with holes.  Do not create repaint-only island meshes here; those
+                    # objects used to compensate for hole-carving failures and are no longer the
+                    # source of truth for land preservation.
                     island_objects = []
-                    if should_process_water_islands:
-                        for inner_idx, inner_coords in enumerate(valid_inners):
-                            island_obj = col_create_face_mesh(f"Island_{relation_id}_{i}_{inner_idx}", inner_coords)
-                            if not island_obj:
-                                island_objects_failed += 1
-                                continue
-                            island_obj.hide_set(False)
-                            island_obj.hide_viewport = False
-                            island_obj.hide_render = False
-                            writeMetadata(island_obj, "MAP")
-                            island_mat = bpy.data.materials.get("MAP") or bpy.data.materials.get("CITY") or bpy.data.materials.get("FOREST")
-                            if island_mat:
-                                island_obj.data.materials.clear()
-                                island_obj.data.materials.append(island_mat)
-                            island_objects.append(island_obj)
-                            island_objects_to_paint.append(island_obj)
-                            relation_debug_pairs.append((relation_id, island_obj.name, None))
-                            island_objects_created += 1
+                    if should_process_water_islands and valid_inners:
+                        module_logger.info(
+                            "Water island repaint helper skipped relation=%s kind=%s valid_inners=%s reason=primary_mesh_triangulates_holes",
+                            relation_id,
+                            kind,
+                            len(valid_inners),
+                        )
 
                     for j, outer_polygon in enumerate(normalized_outer_polygons):
                         outer_coords = outer_polygon["coordinates"]
@@ -6734,52 +6901,73 @@ def build_coloring_layer(map,kind = "WATER"):
                             "quality_gate_passed": False,
                         }
 
-                        outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}_outer", outer_coords)
-                        if not outer_obj:
-                            waterDeleted += 1
-                            module_logger.warning("Outer water mesh build failed before hole carving relation=%s kind=%s outer_idx=%s reason=outer_creation_failed", relation_id, kind, j)
-                            continue
-
-                        relation_quality_log["pre_clean_stats"] = _mesh_health_stats(outer_obj)
-                        relation_quality_log["cleaning_actions"] = _sanitize_water_outer_mesh(outer_obj)
-                        relation_quality_log["post_clean_stats"] = _mesh_health_stats(outer_obj)
-
-                        non_manifold_threshold = int(getattr(bpy.context.scene.tp3d, "col_WaterMeshNonManifoldEdgeThreshold", 0))
-                        post_stats = relation_quality_log["post_clean_stats"]
-                        quality_gate_passed = (
-                            post_stats.get("zero_area_faces", 0) == 0 and
-                            post_stats.get("loose_edges", 0) == 0 and
-                            post_stats.get("non_manifold_edges", 0) <= non_manifold_threshold
-                        )
-                        relation_quality_log["quality_gate_passed"] = quality_gate_passed
-
-                        if quality_gate_passed:
-                            tobj, hole_telemetry = col_create_face_mesh_with_holes(
+                        if kind == "WATER":
+                            tobj, hole_telemetry = col_create_triangulated_polygon_mesh(
                                 f"Relation_{relation_id}_{i}_{j}",
-                                outer_coords,
-                                assigned_inners,
+                                outer_polygon,
                                 relation_id=relation_id,
                                 outer_idx=j,
+                                kind=kind,
                             )
-                            bpy.data.objects.remove(outer_obj, do_unlink=True)
                             if not tobj:
                                 waterDeleted += 1
-                                module_logger.warning("Hole carving failed after quality pass relation=%s kind=%s outer_idx=%s reason=hole_mesh_creation_failed quality_log=%s", relation_id, kind, j, relation_quality_log)
+                                module_logger.warning(
+                                    "Triangulated water mesh build failed relation=%s kind=%s outer_idx=%s reason=triangulated_mesh_creation_failed telemetry=%s",
+                                    relation_id,
+                                    kind,
+                                    j,
+                                    hole_telemetry,
+                                )
                                 continue
+                            relation_quality_log["post_clean_stats"] = _mesh_health_stats(tobj)
+                            relation_quality_log["quality_gate_passed"] = True
                         else:
-                            gate_reason = f"quality_gate_failed(non_manifold={post_stats.get('non_manifold_edges', 0)}/{non_manifold_threshold}, zero_area={post_stats.get('zero_area_faces', 0)}, loose_edges={post_stats.get('loose_edges', 0)})"
-                            module_logger.warning("Skipping hole carving and falling back to sanitized outer mesh relation=%s kind=%s outer_idx=%s reason=%s quality_log=%s", relation_id, kind, j, gate_reason, relation_quality_log)
-                            tobj = outer_obj
-                            hole_telemetry = {
-                                "candidate_holes": len(assigned_inners or []),
-                                "holes_applied": 0,
-                                "boolean_changed_mesh": False,
-                                "delta_faces": 0,
-                                "delta_edges": 0,
-                                "prep": 0.0,
-                                "apply": 0.0,
-                                "source": "fallback_outer_mesh_quality_gate_failed",
-                            }
+                            outer_obj = col_create_face_mesh(f"Relation_{relation_id}_{i}_{j}_outer", outer_coords)
+                            if not outer_obj:
+                                waterDeleted += 1
+                                module_logger.warning("Outer water mesh build failed before hole carving relation=%s kind=%s outer_idx=%s reason=outer_creation_failed", relation_id, kind, j)
+                                continue
+
+                            relation_quality_log["pre_clean_stats"] = _mesh_health_stats(outer_obj)
+                            relation_quality_log["cleaning_actions"] = _sanitize_water_outer_mesh(outer_obj)
+                            relation_quality_log["post_clean_stats"] = _mesh_health_stats(outer_obj)
+
+                            non_manifold_threshold = int(getattr(bpy.context.scene.tp3d, "col_WaterMeshNonManifoldEdgeThreshold", 0))
+                            post_stats = relation_quality_log["post_clean_stats"]
+                            quality_gate_passed = (
+                                post_stats.get("zero_area_faces", 0) == 0 and
+                                post_stats.get("loose_edges", 0) == 0 and
+                                post_stats.get("non_manifold_edges", 0) <= non_manifold_threshold
+                            )
+                            relation_quality_log["quality_gate_passed"] = quality_gate_passed
+
+                            if quality_gate_passed:
+                                tobj, hole_telemetry = col_create_face_mesh_with_holes(
+                                    f"Relation_{relation_id}_{i}_{j}",
+                                    outer_coords,
+                                    assigned_inners,
+                                    relation_id=relation_id,
+                                    outer_idx=j,
+                                )
+                                bpy.data.objects.remove(outer_obj, do_unlink=True)
+                                if not tobj:
+                                    waterDeleted += 1
+                                    module_logger.warning("Hole carving failed after quality pass relation=%s kind=%s outer_idx=%s reason=hole_mesh_creation_failed quality_log=%s", relation_id, kind, j, relation_quality_log)
+                                    continue
+                            else:
+                                gate_reason = f"quality_gate_failed(non_manifold={post_stats.get('non_manifold_edges', 0)}/{non_manifold_threshold}, zero_area={post_stats.get('zero_area_faces', 0)}, loose_edges={post_stats.get('loose_edges', 0)})"
+                                module_logger.warning("Skipping hole carving and falling back to sanitized outer mesh relation=%s kind=%s outer_idx=%s reason=%s quality_log=%s", relation_id, kind, j, gate_reason, relation_quality_log)
+                                tobj = outer_obj
+                                hole_telemetry = {
+                                    "candidate_holes": len(assigned_inners or []),
+                                    "holes_applied": 0,
+                                    "boolean_changed_mesh": False,
+                                    "delta_faces": 0,
+                                    "delta_edges": 0,
+                                    "prep": 0.0,
+                                    "apply": 0.0,
+                                    "source": "fallback_outer_mesh_quality_gate_failed",
+                                }
 
                         pre_health = relation_quality_log["post_clean_stats"]
                         holes_applied_total += hole_telemetry["holes_applied"]
@@ -6841,13 +7029,22 @@ def build_coloring_layer(map,kind = "WATER"):
                         waterCreated += 1
 
                     if holes_applied_total > 0 and island_objects_created == 0:
-                        module_logger.warning(
-                            "Holes were applied but no island objects were created relation=%s kind=%s holes_applied=%s valid_inners=%s",
-                            relation_id,
-                            kind,
-                            holes_applied_total,
-                            len(valid_inners),
-                        )
+                        if kind == "WATER":
+                            module_logger.info(
+                                "Holes preserved by primary triangulated water mesh relation=%s kind=%s holes_applied=%s valid_inners=%s",
+                                relation_id,
+                                kind,
+                                holes_applied_total,
+                                len(valid_inners),
+                            )
+                        else:
+                            module_logger.warning(
+                                "Holes were applied but no island objects were created relation=%s kind=%s holes_applied=%s valid_inners=%s",
+                                relation_id,
+                                kind,
+                                holes_applied_total,
+                                len(valid_inners),
+                            )
 
                     normalized_hole_count = sum(len(outer.get("holes", [])) for outer in normalized_outer_polygons)
                     module_logger.info(
