@@ -4,6 +4,13 @@
 Supports:
 - EPQS point query (legacy script behavior)
 - 3DEP ImageServer exportImage metadata requests for bbox coverage testing
+
+Optional USGS API access:
+- Create an API key at https://api.waterdata.usgs.gov/signup/
+- Put it in the local environment as USGS_API_KEY before running this script
+- PowerShell session example: $env:USGS_API_KEY = "your-key"
+- Persistent Windows example: setx USGS_API_KEY "your-key"
+- USGS_API_TOKEN is still accepted for older bearer-token setups
 """
 import argparse
 import hashlib
@@ -88,11 +95,16 @@ def configure_logging(verbose: bool) -> logging.Logger:
 
 
 def get_usgs_auth_headers(logger: logging.Logger) -> Dict[str, str]:
+    """Build optional USGS auth headers from the local environment."""
+    api_key = os.environ.get("USGS_API_KEY", "").strip()
+    if api_key:
+        logger.debug("USGS_API_KEY detected; X-Api-Key header will be sent")
+        return {"X-Api-Key": api_key}
     token = os.environ.get("USGS_API_TOKEN", "").strip()
     if token:
         logger.debug("USGS_API_TOKEN detected; Authorization header will be sent")
         return {"Authorization": f"Bearer {token}"}
-    logger.debug("USGS_API_TOKEN not set; no Authorization header")
+    logger.debug("No USGS_API_KEY or USGS_API_TOKEN set; no auth headers")
     return {}
 
 

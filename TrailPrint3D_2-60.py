@@ -17,6 +17,10 @@
 #Map data © OpenStreetMap contributors
 
 '''
+Version 2.60
+- Made the Logging command group collapsible and moved it to the end of the Advanced panel groups.
+- Documented USGS API key setup, water-island processing, and the updated coloring pipeline.
+
 Version 2.5
 - Added Icons to Buttons
 - Added Preset Feature
@@ -35,7 +39,7 @@ bl_info = {
     "blender": (4, 5, 2),
     "category": "Object",
     "author": "EmGi",
-    "version": (2,53),
+    "version": (2,60),
     "description": "Create 3D Printable Miniature Maps of your Adventures",
     "warning": "",
     "doc_url": "",
@@ -44,7 +48,7 @@ bl_info = {
 }
 
 category = "TrailPrint3D"
-AddonVersion = (2, 53)
+AddonVersion = (2, 60)
 
 
 import bpy # type: ignore
@@ -449,6 +453,7 @@ class MyProperties(bpy.types.PropertyGroup):
     show_api: bpy.props.BoolProperty(name="API", default=False)
     show_attribution: bpy.props.BoolProperty(name="Attribution", default = False)
     show_preset: bpy.props.BoolProperty(name="Preset", default=False)
+    show_logging: bpy.props.BoolProperty(name="Logging", default=False)
 
     cityname: bpy.props.StringProperty(name="Cityname", default="Berlin", description = "Get coordinates of a City")
     pinLat: bpy.props.FloatProperty(name="Latitude", default = 48.00)
@@ -639,7 +644,23 @@ class MY_OT_TestElevationAPI(bpy.types.Operator):
 
 
 def get_usgs_auth_headers():
-    """Build auth headers for USGS requests using a local environment token."""
+    """Build optional USGS auth headers from local environment variables.
+
+    USGS TNM/3DEP requests can run without a key, but USGS API access may
+    require or benefit from a key for higher limits. Create one at:
+    https://api.waterdata.usgs.gov/signup/
+
+    Preferred local setup:
+    - Windows PowerShell: $env:USGS_API_KEY = "your-key"
+    - Windows persistent env: setx USGS_API_KEY "your-key"
+    - macOS/Linux shell: export USGS_API_KEY="your-key"
+
+    USGS_API_TOKEN remains supported for older local setups that used a
+    bearer-style token.
+    """
+    api_key = os.environ.get("USGS_API_KEY", "").strip()
+    if api_key:
+        return {"X-Api-Key": api_key}
     token = os.environ.get("USGS_API_TOKEN", "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
@@ -1518,19 +1539,6 @@ class MY_PT_Advanced(bpy.types.Panel):
         box.operator("wm.exportstl", icon="EXPORT")
         box.operator("wm.exportobj", icon = "EXPORT")
 
-        log_box = layout.box()
-        log_box.label(text="Logging")
-        log_box.prop(props, "debug_logging_enabled", text="Enable/Disable Logging", toggle=True)
-        log_box.prop(props, "debug_keep_temporary_objects", text="Keep Temporary Objects", toggle=True)
-        if props.debug_keep_temporary_objects:
-            warn_row = log_box.row()
-            warn_row.label(text="Warning: Keeping temporary objects may clutter the scene.", icon="ERROR")
-        if props.debug_logging_enabled:
-            log_box.prop(props, "debug_log_level")
-            log_box.prop(props, "debug_log_filename")
-            log_box.operator("wm.open_log_folder", icon="FILE_FOLDER")
-
-
         #MAP
         layout.prop(props,"show_map", icon="TRIA_DOWN" if props.show_map else "TRIA_RIGHT", emboss=True)
         if props.show_map:
@@ -1782,6 +1790,21 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.label(text = "Elevation data from USGS TNM, The National Map elevation query service (USGS).")
             box.label(text = "Water, Forests, City data © OpenStreetMap contributors")
             box.label(text = "Terrain data from Mapzen, based on data © OpenStreetMap contributors, NASA SRTM, and USGS.")
+            layout.separator()  # Adds a horizontal line
+
+        #LOGGING
+        layout.prop(props,"show_logging", icon="TRIA_DOWN" if props.show_logging else "TRIA_RIGHT", emboss=True)
+        if props.show_logging:
+            log_box = layout.box()
+            log_box.prop(props, "debug_logging_enabled", text="Enable/Disable Logging", toggle=True)
+            log_box.prop(props, "debug_keep_temporary_objects", text="Keep Temporary Objects", toggle=True)
+            if props.debug_keep_temporary_objects:
+                warn_row = log_box.row()
+                warn_row.label(text="Warning: Keeping temporary objects may clutter the scene.", icon="ERROR")
+            if props.debug_logging_enabled:
+                log_box.prop(props, "debug_log_level")
+                log_box.prop(props, "debug_log_filename")
+                log_box.operator("wm.open_log_folder", icon="FILE_FOLDER")
             layout.separator()  # Adds a horizontal line
 
 class MY_PT_Shapes(bpy.types.Panel):
@@ -3200,7 +3223,13 @@ def get_elevation_openTopoData(coords, lenv = 0, pointsDone = 0):
 
 
 def get_elevation_usgs_tnm(coords, lenv=0, pointsDone=0):
-    """Fetches real elevation for each vertex using USGS TNM 3DEP exportImage raster query."""
+    """Fetch real elevation for each vertex using USGS TNM 3DEP rasters.
+
+    The function requests one exportImage raster covering the uncached
+    coordinate batch, samples it locally with rasterio, and stores point and
+    raster cache entries. Optional USGS auth headers come from
+    get_usgs_auth_headers().
+    """
     if rasterio is None:
         print("USGS TNM 3DEP unavailable: rasterio is not installed")
         return [0] * len(coords)
@@ -6639,6 +6668,14 @@ def build_osm_nodes(data):
 
 @log_workflow
 def build_coloring_layer(map,kind = "WATER"):
+    """Build one OSM-derived coloring layer for the generated terrain map.
+
+    Coloring now separates layer construction from map painting: this function
+    fetches and normalizes OSM features, creates temporary layer geometry, and
+    returns a layer artifact for the later paint pass. Water multipolygons keep
+    islands by triangulating the primary water mesh with inner holes; when
+    painting the map, any pending island helpers are repainted back to BASE.
+    """
 
     col_KeepManifold = (bpy.context.scene.tp3d.col_KeepManifold)
     if kind == "WATER":
@@ -8125,6 +8162,12 @@ def build_terrain_surface(map_obj):
 
 
 def collect_osm_layers(map_obj):
+    """Collect all requested OSM coloring layers before painting the map.
+
+    Water, forest, city, and glacier layers are built independently so the
+    updated coloring pipeline can paint the base material once, apply water,
+    restore island/base areas, and then apply overlay layers in a stable order.
+    """
     layers = {}
 
     props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
@@ -8196,6 +8239,7 @@ def apply_water_layer(map_obj, layer_objects):
 
 
 def apply_island_layer(map_obj, layer_objects):
+    """Apply the final water-island repaint pass when map painting is enabled."""
     water_layer = layer_objects.get("WATER") if layer_objects else None
     island_objects = water_layer.get("island_objects") if water_layer else None
     island_count = len(island_objects) if island_objects else 0
@@ -8221,6 +8265,13 @@ def apply_overlay_layers(map_obj, layer_objects):
 
 
 def run_layer_pipeline(map_obj):
+    """Run the updated map coloring pipeline.
+
+    The order is intentional: reset the whole map to BASE, paint water, repaint
+    processed water islands as BASE, then paint forest, city, and glacier
+    overlays. This keeps islands visible while allowing later overlays to win
+    where they overlap the terrain.
+    """
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
     module_logger.info(
