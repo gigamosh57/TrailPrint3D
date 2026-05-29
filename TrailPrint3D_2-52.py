@@ -5753,18 +5753,22 @@ def col_create_face_mesh_with_holes(name, outer_coords, assigned_inners, relatio
     return tobj, telemetry
 
 
-def calculate_polygon_area_2d(coords):
+def _signed_polygon_area_2d(coords):
     area = 0.0
-    
+
     if len(coords) >= 3:
-    
-        n = len(coords)
+        pts = coords[:-1] if coords[0] == coords[-1] else coords
+        n = len(pts)
         for i in range(n):
-            x0, y0, z0 = coords[i]
-            x1, y1, z1 = coords[(i + 1) % n]  # Wrap around to the first point
+            x0, y0, z0 = pts[i]
+            x1, y1, z1 = pts[(i + 1) % n]  # Wrap around to the first point
             area += (x0 * y1) - (x1 * y0)
-    
-    return abs(area) * 0.5
+
+    return area * 0.5
+
+
+def calculate_polygon_area_2d(coords):
+    return abs(_signed_polygon_area_2d(coords))
 
 
 def _ring_bbox_2d(coords):
@@ -5993,6 +5997,185 @@ def _point_in_ring_2d(point, ring):
         if intersects:
             inside = not inside
     return inside
+
+
+def _point_distance_sq_3d(a, b):
+    return ((a[0] - b[0]) * (a[0] - b[0]) +
+            (a[1] - b[1]) * (a[1] - b[1]) +
+            (a[2] - b[2]) * (a[2] - b[2]))
+
+
+def _empty_multipolygon_normalization_diagnostics():
+    return {
+        "rejected": {"outer": {}, "inner": {}},
+        "repair_actions": {
+            "consecutive_duplicates_removed": 0,
+            "zero_length_edges_removed": 0,
+            "explicit_closures_added": 0,
+            "orientation_reversed": 0,
+            "inner_assignment_failed": 0,
+        },
+        "rejected_rings": [],
+    }
+
+
+def _record_multipolygon_rejection(diagnostics, role, ring_index, reason, coords, area=0.0):
+    role_rejections = diagnostics["rejected"].setdefault(role, {})
+    role_rejections[reason] = role_rejections.get(reason, 0) + 1
+    diagnostics["rejected_rings"].append({
+        "role": role,
+        "index": ring_index,
+        "reason": reason,
+        "point_count": len(coords or []),
+        "area": area,
+        "bbox": _ring_bbox_2d(coords),
+    })
+
+
+def _normalize_multipolygon_ring(coords, role, min_area=0.0, close_tolerance=1e-5, edge_tolerance=1e-12):
+    actions = {
+        "consecutive_duplicates_removed": 0,
+        "zero_length_edges_removed": 0,
+        "explicit_closures_added": 0,
+        "orientation_reversed": 0,
+    }
+    original = list(coords or [])
+    if not original:
+        return None, 0.0, "empty", actions
+
+    edge_tolerance_sq = edge_tolerance * edge_tolerance
+    close_tolerance_sq = close_tolerance * close_tolerance
+
+    deduped = []
+    for pt in original:
+        if deduped and pt == deduped[-1]:
+            actions["consecutive_duplicates_removed"] += 1
+            actions["zero_length_edges_removed"] += 1
+            continue
+        if deduped and _point_distance_sq_3d(pt, deduped[-1]) <= edge_tolerance_sq:
+            actions["zero_length_edges_removed"] += 1
+            continue
+        deduped.append(pt)
+
+    if len(deduped) < 2:
+        return deduped, 0.0, "too_few_points", actions
+
+    if deduped[0] != deduped[-1]:
+        if _point_distance_sq_3d(deduped[0], deduped[-1]) <= close_tolerance_sq:
+            deduped[-1] = deduped[0]
+            actions["explicit_closures_added"] += 1
+        else:
+            return deduped, 0.0, "not_closed", actions
+
+    ring = deduped[:-1]
+    cleaned = []
+    for pt in ring:
+        if cleaned and _point_distance_sq_3d(pt, cleaned[-1]) <= edge_tolerance_sq:
+            actions["zero_length_edges_removed"] += 1
+            continue
+        cleaned.append(pt)
+
+    if len(cleaned) >= 2 and _point_distance_sq_3d(cleaned[0], cleaned[-1]) <= edge_tolerance_sq:
+        cleaned.pop()
+        actions["zero_length_edges_removed"] += 1
+
+    unique_points = set(cleaned)
+    if len(unique_points) < 3:
+        return cleaned + ([cleaned[0]] if cleaned else []), 0.0, "too_few_points", actions
+
+    normalized = cleaned + [cleaned[0]]
+    if not is_ring_simple_2d(normalized):
+        return normalized, calculate_polygon_area_2d(normalized), "self_intersecting", actions
+
+    signed_area = _signed_polygon_area_2d(normalized)
+    abs_area = abs(signed_area)
+    if abs_area <= min_area:
+        return normalized, abs_area, "area_below_threshold", actions
+
+    should_be_ccw = role == "outer"
+    is_ccw = signed_area > 0
+    if is_ccw != should_be_ccw:
+        normalized = list(reversed(normalized))
+        actions["orientation_reversed"] += 1
+        signed_area = _signed_polygon_area_2d(normalized)
+
+    return normalized, abs(signed_area), None, actions
+
+
+def _is_ring_contained_by_outer(inner_ring, outer_ring):
+    inner_points = inner_ring[:-1] if inner_ring and inner_ring[0] == inner_ring[-1] else inner_ring
+    if not inner_points:
+        return False
+    centroid = _ring_centroid_2d(inner_ring)
+    if not centroid or not _point_in_ring_2d(centroid, outer_ring):
+        return False
+    # Test vertices as well as the centroid so holes are not assigned to an outer
+    # that contains only the hole's center while edges spill outside the boundary.
+    return all(_point_in_ring_2d((pt[0], pt[1]), outer_ring) for pt in inner_points)
+
+
+def normalize_osm_multipolygon_relation(relation_record, min_outer_area=0.0, min_inner_area=0.0):
+    diagnostics = _empty_multipolygon_normalization_diagnostics()
+    relation_id = relation_record.get("relation_id") if isinstance(relation_record, dict) else None
+    normalized_outers = []
+    normalized_inners = []
+
+    for role, source_key, min_area, target in (
+        ("outer", "outers", min_outer_area, normalized_outers),
+        ("inner", "inners", min_inner_area, normalized_inners),
+    ):
+        for ring_idx, coords in enumerate((relation_record or {}).get(source_key, []) or []):
+            normalized, area, reason, actions = _normalize_multipolygon_ring(coords, role, min_area=min_area)
+            for action, count in actions.items():
+                diagnostics["repair_actions"][action] = diagnostics["repair_actions"].get(action, 0) + count
+            if reason:
+                _record_multipolygon_rejection(diagnostics, role, ring_idx, reason, normalized or coords, area)
+                continue
+            target.append({
+                "index": ring_idx,
+                "coordinates": normalized,
+                "area": area,
+                "signed_area": _signed_polygon_area_2d(normalized),
+                "bbox": _ring_bbox_2d(normalized),
+            })
+
+    outer_polygons = []
+    for outer in normalized_outers:
+        outer_polygons.append({
+            "index": outer["index"],
+            "coordinates": outer["coordinates"],
+            "area": outer["area"],
+            "bbox": outer["bbox"],
+            "holes": [],
+        })
+
+    for inner in normalized_inners:
+        containing_outer_idx = None
+        containing_outer_area = None
+        for outer_idx, outer in enumerate(outer_polygons):
+            if not _is_ring_contained_by_outer(inner["coordinates"], outer["coordinates"]):
+                continue
+            if containing_outer_area is None or outer["area"] < containing_outer_area:
+                containing_outer_idx = outer_idx
+                containing_outer_area = outer["area"]
+        if containing_outer_idx is None:
+            diagnostics["repair_actions"]["inner_assignment_failed"] += 1
+            _record_multipolygon_rejection(
+                diagnostics,
+                "inner",
+                inner["index"],
+                "no_containing_outer",
+                inner["coordinates"],
+                inner["area"],
+            )
+            continue
+        outer_polygons[containing_outer_idx]["holes"].append(inner["coordinates"])
+
+    return {
+        "relation_id": relation_id,
+        "outer_polygons": outer_polygons,
+        "diagnostics": diagnostics,
+    }
 
 
 def _sanitize_water_outer_mesh(obj, merge_distance=1e-6):
@@ -6412,59 +6595,33 @@ def build_coloring_layer(map,kind = "WATER"):
                     relation_id = body.get("relation_id")
                     outer_rings = body.get("outers", [])
                     inner_rings = body.get("inners", [])
-                    outer_rejections_by_reason = {
-                        "not_closed": 0,
-                        "too_few_points": 0,
-                        "self_intersecting": 0,
-                        "area_below_threshold": 0,
-                    }
                     multipolygon_outer_area_threshold = min_area_effective
-
-                    valid_outers = []
-                    outer_rejections_by_reason = {
-                        "empty": 0,
-                        "not_closed": 0,
-                        "too_few_points": 0,
-                        "self_intersecting": 0,
-                        "area_below_threshold": 0,
-                    }
-                    for outer_idx, ring in enumerate(outer_rings):
-                        blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
-                        is_valid_outer, rejection_reason = classify_ring_validity(blender_ring, multipolygon_outer_area_threshold)
-                        if is_valid_outer:
-                            valid_outers.append(blender_ring)
-                        else:
-                            outer_rejections_by_reason[rejection_reason] = outer_rejections_by_reason.get(rejection_reason, 0) + 1
-                            waterDeleted += 1
-                            module_logger.info(
-                                "Outer ring rejected relation=%s kind=%s outer_idx=%s reason=%s ring_points=%s area=%.8f threshold=%.8f",
-                                relation_id,
-                                kind,
-                                outer_idx,
-                                rejection_reason,
-                                len(blender_ring),
-                                calculate_polygon_area_2d(blender_ring),
-                                multipolygon_outer_area_threshold,
-                            )
-                            if rejection_reason == "self_intersecting":
-                                module_logger.warning(
-                                    "Non-simple outer ring relation=%s kind=%s outer_idx=%s point_count=%s bbox=%s",
-                                    relation_id,
-                                    kind,
-                                    outer_idx,
-                                    len(blender_ring),
-                                    _ring_bbox_2d(blender_ring),
-                                )
-
-                    valid_inners = []
-                    inner_rejections_by_reason = {
-                        "empty": 0,
-                        "not_closed": 0,
-                        "too_few_points": 0,
-                        "self_intersecting": 0,
-                        "area_below_threshold": 0,
-                    }
                     inner_area_threshold = min_area_effective
+
+                    blender_relation_record = {
+                        "relation_id": relation_id,
+                        "outers": [
+                            [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
+                            for ring in outer_rings
+                        ],
+                        "inners": [
+                            [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
+                            for ring in inner_rings
+                        ],
+                    }
+                    normalized_relation = normalize_osm_multipolygon_relation(
+                        blender_relation_record,
+                        min_outer_area=multipolygon_outer_area_threshold,
+                        min_inner_area=inner_area_threshold,
+                    )
+                    normalized_outer_polygons = normalized_relation["outer_polygons"]
+                    normalization_diagnostics = normalized_relation["diagnostics"]
+                    outer_rejections_by_reason = normalization_diagnostics["rejected"].get("outer", {})
+                    inner_rejections_by_reason = normalization_diagnostics["rejected"].get("inner", {})
+                    valid_outers = [outer["coordinates"] for outer in normalized_outer_polygons]
+                    valid_inners = [hole for outer in normalized_outer_polygons for hole in outer.get("holes", [])]
+
+                    waterDeleted += sum(outer_rejections_by_reason.values())
                     module_logger.info(
                         "Multipolygon relation settings relation=%s kind=%s process_inner_holes=%s create_island_objects=%s inner_area_threshold=%.8f",
                         relation_id,
@@ -6473,35 +6630,72 @@ def build_coloring_layer(map,kind = "WATER"):
                         should_process_water_islands,
                         inner_area_threshold,
                     )
-                    for inner_idx, ring in enumerate(inner_rings):
-                        blender_ring = [convert_to_blender_coordinates(lat, lon, ele, 0) for lat, lon, ele in ring]
-                        is_valid_inner, rejection_reason = classify_ring_validity(blender_ring, inner_area_threshold)
-                        if is_valid_inner:
-                            valid_inners.append(blender_ring)
+
+                    for rejected in normalization_diagnostics.get("rejected_rings", []):
+                        role = rejected.get("role")
+                        if role == "outer":
+                            module_logger.info(
+                                "Outer ring rejected relation=%s kind=%s outer_idx=%s reason=%s ring_points=%s area=%.8f threshold=%.8f",
+                                relation_id,
+                                kind,
+                                rejected.get("index"),
+                                rejected.get("reason"),
+                                rejected.get("point_count"),
+                                rejected.get("area") or 0.0,
+                                multipolygon_outer_area_threshold,
+                            )
+                            if rejected.get("reason") == "self_intersecting":
+                                module_logger.warning(
+                                    "Non-simple outer ring relation=%s kind=%s outer_idx=%s point_count=%s bbox=%s",
+                                    relation_id,
+                                    kind,
+                                    rejected.get("index"),
+                                    rejected.get("point_count"),
+                                    rejected.get("bbox"),
+                                )
                         else:
-                            inner_rejections_by_reason[rejection_reason] = inner_rejections_by_reason.get(rejection_reason, 0) + 1
                             module_logger.info(
                                 "Inner ring rejected relation=%s kind=%s inner_idx=%s reason=%s ring_points=%s area=%.8f threshold=%.8f",
                                 relation_id,
                                 kind,
-                                inner_idx,
-                                rejection_reason,
-                                len(blender_ring),
-                                calculate_polygon_area_2d(blender_ring),
+                                rejected.get("index"),
+                                rejected.get("reason"),
+                                rejected.get("point_count"),
+                                rejected.get("area") or 0.0,
                                 inner_area_threshold,
                             )
-                    for outer_idx, outer_coords in enumerate(valid_outers):
-                        outer_bbox = _ring_bbox_2d(outer_coords)
-                        outer_area = calculate_polygon_area_2d(outer_coords)
+
+                    for outer_idx, outer_polygon in enumerate(normalized_outer_polygons):
+                        outer_coords = outer_polygon["coordinates"]
+                        outer_bbox = outer_polygon.get("bbox")
+                        outer_area = outer_polygon.get("area") or calculate_polygon_area_2d(outer_coords)
                         module_logger.info(
-                            "Outer ring geometry relation=%s kind=%s outer_idx=%s ring_points=%s area=%.8f bbox=%s",
+                            "Outer ring geometry relation=%s kind=%s outer_idx=%s ring_points=%s area=%.8f bbox=%s assigned_holes=%s",
                             relation_id,
                             kind,
                             outer_idx,
                             len(outer_coords),
                             outer_area,
                             outer_bbox,
+                            len(outer_polygon.get("holes", [])),
                         )
+                        for inner_idx, inner_coords in enumerate(outer_polygon.get("holes", [])):
+                            inner_bbox = _ring_bbox_2d(inner_coords)
+                            inner_area = calculate_polygon_area_2d(inner_coords)
+                            inner_centroid = _ring_centroid_2d(inner_coords)
+                            module_logger.info(
+                                "Inner assignment relation=%s kind=%s outer_idx=%s inner_idx=%s ring_points=%s area=%.8f centroid=%s bbox=%s contained=%s assigned_to_outer_idx=%s",
+                                relation_id,
+                                kind,
+                                outer_idx,
+                                inner_idx,
+                                len(inner_coords),
+                                inner_area,
+                                inner_centroid,
+                                inner_bbox,
+                                True,
+                                outer_idx,
+                            )
 
                     holes_applied_total = 0
                     island_objects_created = 0
@@ -6529,39 +6723,9 @@ def build_coloring_layer(map,kind = "WATER"):
                             relation_debug_pairs.append((relation_id, island_obj.name, None))
                             island_objects_created += 1
 
-                    for j, outer_coords in enumerate(valid_outers):
-                        assigned_inners = []
-                        for inner_idx, inner_coords in enumerate(valid_inners):
-                            inner_bbox = _ring_bbox_2d(inner_coords)
-                            inner_area = calculate_polygon_area_2d(inner_coords)
-                            inner_centroid = _ring_centroid_2d(inner_coords)
-                            contained = _point_in_ring_2d(inner_centroid, outer_coords) if inner_centroid else False
-                            module_logger.info(
-                                "Inner assignment relation=%s kind=%s outer_idx=%s inner_idx=%s ring_points=%s area=%.8f centroid=%s bbox=%s contained=%s assigned_to_outer_idx=%s",
-                                relation_id,
-                                kind,
-                                j,
-                                inner_idx,
-                                len(inner_coords),
-                                inner_area,
-                                inner_centroid,
-                                inner_bbox,
-                                contained,
-                                j if contained else None,
-                            )
-                            if contained:
-                                assigned_inners.append(inner_coords)
-                            else:
-                                module_logger.warning(
-                                    "Inner ring skipped due to containment mismatch relation=%s kind=%s outer_idx=%s inner_idx=%s centroid=%s outer_bbox=%s inner_bbox=%s",
-                                    relation_id,
-                                    kind,
-                                    j,
-                                    inner_idx,
-                                    inner_centroid,
-                                    _ring_bbox_2d(outer_coords),
-                                    inner_bbox,
-                                )
+                    for j, outer_polygon in enumerate(normalized_outer_polygons):
+                        outer_coords = outer_polygon["coordinates"]
+                        assigned_inners = outer_polygon.get("holes", [])
 
                         relation_quality_log = {
                             "pre_clean_stats": _mesh_health_stats(None),
@@ -6685,14 +6849,18 @@ def build_coloring_layer(map,kind = "WATER"):
                             len(valid_inners),
                         )
 
+                    normalized_hole_count = sum(len(outer.get("holes", [])) for outer in normalized_outer_polygons)
                     module_logger.info(
-                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s valid_outers=%s valid_inners=%s holes_applied=%s island_objects_created=%s island_objects_failed=%s outer_rejections_by_reason=%s inner_rejections_by_reason=%s inner_area_threshold=%.8f",
+                        "Multipolygon relation=%s kind=%s outer_rings=%s inner_rings=%s normalized_outers=%s normalized_holes=%s rejected_outers=%s rejected_inners=%s repair_actions=%s holes_applied=%s island_objects_created=%s island_objects_failed=%s outer_rejections_by_reason=%s inner_rejections_by_reason=%s inner_area_threshold=%.8f",
                         relation_id,
                         kind,
                         len(outer_rings),
                         len(inner_rings),
-                        len(valid_outers),
-                        len(valid_inners),
+                        len(normalized_outer_polygons),
+                        normalized_hole_count,
+                        sum(outer_rejections_by_reason.values()),
+                        sum(inner_rejections_by_reason.values()),
+                        normalization_diagnostics.get("repair_actions", {}),
                         holes_applied_total,
                         island_objects_created,
                         island_objects_failed,
