@@ -5350,83 +5350,216 @@ def fetch_osm_data(
 
 def extract_multipolygon_bodies(elements, nodes):
 
-    # Helper to get coordinates of a way by its node ids
-    def way_coords(way):
-        return [ (nodes[nid]['lat'], nodes[nid]['lon'], nodes[nid].get('elevation', 0)) for nid in way['nodes'] if nid in nodes ]
+    def _way_record(way, relation_id=None, role="outer"):
+        raw_node_ids = list(way.get("nodes") or [])
+        missing_node_ids = [nid for nid in raw_node_ids if nid not in nodes]
+        coordinates = [
+            (nodes[nid]['lat'], nodes[nid]['lon'], nodes[nid].get('elevation', 0))
+            for nid in raw_node_ids
+            if nid in nodes
+        ]
+        record = {
+            "way_id": way.get("id"),
+            "node_ids": raw_node_ids,
+            "coordinates": coordinates,
+            "missing_node_ids": missing_node_ids,
+        }
+        if missing_node_ids:
+            module_logger.warning(
+                "Multipolygon member way has missing nodes relation=%s role=%s member_way_ids=%s missing_node_ids=%s node_count=%s closure_status=%s stitch_failure_reason=%s",
+                relation_id,
+                role,
+                [way.get("id")],
+                missing_node_ids,
+                len(raw_node_ids),
+                raw_node_ids[0] == raw_node_ids[-1] if len(raw_node_ids) > 1 else False,
+                "way_missing_nodes",
+            )
+        return record
 
-    # Store multipolygons as records with outer and inner rings.
+    def _log_ring_event(level, relation_id, role, member_way_ids, node_ids, closure_status, reason):
+        logger = module_logger.warning if level == "warning" else module_logger.info
+        logger(
+            "Multipolygon ring validation relation=%s role=%s member_way_ids=%s node_count=%s closure_status=%s stitch_failure_reason=%s",
+            relation_id,
+            role,
+            member_way_ids,
+            len(node_ids),
+            closure_status,
+            reason,
+        )
+
+    def _has_duplicate_node_ids_inside_ring(node_ids):
+        if len(node_ids) < 2:
+            return False, []
+        interior_ids = node_ids[:-1] if node_ids[0] == node_ids[-1] else node_ids
+        seen = set()
+        duplicates = []
+        for node_id in interior_ids:
+            if node_id in seen and node_id not in duplicates:
+                duplicates.append(node_id)
+            seen.add(node_id)
+        return bool(duplicates), duplicates
+
+    def _node_ring_to_coords(node_ids):
+        return [(nodes[nid]['lat'], nodes[nid]['lon'], nodes[nid].get('elevation', 0)) for nid in node_ids]
+
+    def _stitch_ways(way_records, relation_id, role):
+        loops = []
+        remaining = [record for record in way_records if not record["missing_node_ids"] and record["node_ids"]]
+
+        skipped_records = [record for record in way_records if record["missing_node_ids"] or not record["node_ids"]]
+        for record in skipped_records:
+            reason = "way_missing_nodes" if record["missing_node_ids"] else "way_has_no_nodes"
+            _log_ring_event(
+                "warning",
+                relation_id,
+                role,
+                [record["way_id"]],
+                record["node_ids"],
+                record["node_ids"][0] == record["node_ids"][-1] if len(record["node_ids"]) > 1 else False,
+                reason,
+            )
+
+        while remaining:
+            current = remaining.pop(0)
+            current_node_ids = list(current["node_ids"])
+            current_way_ids = [current["way_id"]]
+            changed = True
+
+            while changed:
+                changed = False
+                i = 0
+                while i < len(remaining):
+                    candidate = remaining[i]
+                    candidate_node_ids = candidate["node_ids"]
+                    if not candidate_node_ids or not current_node_ids:
+                        i += 1
+                        continue
+
+                    if current_node_ids[-1] == candidate_node_ids[0]:
+                        current_node_ids.extend(candidate_node_ids[1:])
+                    elif current_node_ids[-1] == candidate_node_ids[-1]:
+                        current_node_ids.extend(reversed(candidate_node_ids[:-1]))
+                    elif current_node_ids[0] == candidate_node_ids[-1]:
+                        current_node_ids = candidate_node_ids[:-1] + current_node_ids
+                    elif current_node_ids[0] == candidate_node_ids[0]:
+                        current_node_ids = list(reversed(candidate_node_ids[1:])) + current_node_ids
+                    else:
+                        i += 1
+                        continue
+
+                    current_way_ids.append(candidate["way_id"])
+                    remaining.pop(i)
+                    changed = True
+
+            closure_status = bool(len(current_node_ids) > 1 and current_node_ids[0] == current_node_ids[-1])
+            if not closure_status:
+                _log_ring_event(
+                    "warning",
+                    relation_id,
+                    role,
+                    current_way_ids,
+                    current_node_ids,
+                    closure_status,
+                    "open_chain_cannot_be_closed",
+                )
+                continue
+
+            has_duplicates, duplicate_node_ids = _has_duplicate_node_ids_inside_ring(current_node_ids)
+            if has_duplicates:
+                _log_ring_event(
+                    "warning",
+                    relation_id,
+                    role,
+                    current_way_ids,
+                    current_node_ids,
+                    closure_status,
+                    f"duplicate_node_ids_inside_ring:{duplicate_node_ids}",
+                )
+                continue
+
+            # Convert the completed node-id ring to coordinates only after it is
+            # closed and has passed node-level validation.
+            loops.append(_node_ring_to_coords(current_node_ids))
+            _log_ring_event(
+                "info",
+                relation_id,
+                role,
+                current_way_ids,
+                current_node_ids,
+                closure_status,
+                "ok",
+            )
+
+        if len(loops) > 1:
+            module_logger.warning(
+                "Multipolygon has multiple disconnected loops relation=%s role=%s member_way_ids=%s node_count=%s closure_status=%s loop_count=%s stitch_failure_reason=%s",
+                relation_id,
+                role,
+                [record["way_id"] for record in way_records],
+                sum(len(record["node_ids"]) for record in way_records),
+                True,
+                len(loops),
+                f"multiple_disconnected_{role}_loops",
+            )
+
+        return loops
+
     multipolygon_lakes = []
-
-    # Index ways by their id for quick lookup
-    way_dict = {el['id']: el for el in elements if el['type'] == 'way'}
+    way_dict = {el['id']: el for el in elements if el.get('type') == 'way'}
 
     for el in elements:
-        if el['type'] in ('relation', 'way'):
-            # Collect outer and inner member ways
-            outer_ways = []
-            inner_ways = []
+        if el.get('type') == 'relation':
+            relation_id = el.get("id")
+            outer_way_records = []
+            inner_way_records = []
 
             for member in el.get('members', []):
-                if member['type'] != 'way':
-                    continue
-                way = way_dict.get(member['ref'])
-                if not way:
+                if member.get('type') != 'way':
                     continue
 
                 role = member.get('role', '')
+                if role not in {'outer', 'inner'}:
+                    continue
+
+                way = way_dict.get(member.get('ref'))
+                if not way:
+                    module_logger.warning(
+                        "Multipolygon missing member way relation=%s role=%s member_way_ids=%s node_count=%s closure_status=%s stitch_failure_reason=%s",
+                        relation_id,
+                        role,
+                        [member.get('ref')],
+                        0,
+                        False,
+                        "missing_member_way",
+                    )
+                    continue
+
+                record = _way_record(way, relation_id=relation_id, role=role)
                 if role == 'outer':
-                    outer_ways.append(way)
-                elif role == 'inner':
-                    inner_ways.append(way)
+                    outer_way_records.append(record)
+                else:
+                    inner_way_records.append(record)
 
-            # Stitch ways to closed loops for outer and inner rings
-            def stitch_ways(ways):
-                loops = []
-                # Convert ways to list of coords
-                ways_coords = [way_coords(w) for w in ways]
-
-                while ways_coords:
-                    current = ways_coords.pop(0)
-                    changed = True
-                    while changed:
-                        changed = False
-                        i = 0
-                        while i < len(ways_coords):
-                            w = ways_coords[i]
-
-                            # Check if current end connects to w start or end
-                            if w:
-                                if current[-1] == w[0]:
-                                    current.extend(w[1:])
-                                    ways_coords.pop(i)
-                                    changed = True
-                                elif current[-1] == w[-1]:
-                                    current.extend(reversed(w[:-1]))
-                                    ways_coords.pop(i)
-                                    changed = True
-                                # Also check if current start connects to w end or start
-                                elif current[0] == w[-1]:
-                                    current = w[:-1] + current
-                                    ways_coords.pop(i)
-                                    changed = True
-                                elif current[0] == w[0]:
-                                    current = list(reversed(w[1:])) + current
-                                    ways_coords.pop(i)
-                                    changed = True
-                                else:
-                                    i += 1
-                    loops.append(current)
-
-                return loops
-
-            outer_loops = stitch_ways(outer_ways)
-            inner_loops = stitch_ways(inner_ways)
+            outer_loops = _stitch_ways(outer_way_records, relation_id, 'outer')
+            inner_loops = _stitch_ways(inner_way_records, relation_id, 'inner')
 
             if outer_loops or inner_loops:
                 multipolygon_lakes.append({
-                    "relation_id": el.get("id"),
+                    "relation_id": relation_id,
                     "outers": outer_loops,
                     "inners": inner_loops,
+                })
+
+        elif el.get('type') == 'way':
+            record = _way_record(el, relation_id=el.get("id"), role="outer")
+            outer_loops = _stitch_ways([record], el.get("id"), 'outer')
+            if outer_loops:
+                multipolygon_lakes.append({
+                    "relation_id": el.get("id"),
+                    "outers": outer_loops,
+                    "inners": [],
                 })
 
     return multipolygon_lakes
