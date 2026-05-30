@@ -60,8 +60,10 @@ CacheSize: The CacheSize for Opentopodata and Open-elevation
 Custom Maps (Patreon Version): Allows you to Extend your Map or to Generate Maps based on Coordinates
 Multi Generation (Patreon Version): Allows you to Generate a Map from multiple .GPX files
 Include Elements:
-Include Water/Forests/City Boundaries: Automatic Coloring of Water, Forests and Cities
-Size Treshold: Only generates them if the elements are bigger than X Blender Units
+Include Water/Forests/City Boundaries/Roads: Automatic Coloring of Water, Forests, Cities, and Roads
+Road Buffer Size: Base width used to paint roads. Larger roads are automatically buffered wider and smaller road/path types narrower.
+Minimum Road Type: Chooses the smallest OSM highway class included in road painting, from Highways only through All Paths.
+Size Treshold: Only generates area elements if the elements are bigger than X Blender Units
 Paint Map: Choose if you want those Elements to be directly painted onto the map or generate them as separate objects
 Pin:
 Latitude/Longitude: Input a Point
