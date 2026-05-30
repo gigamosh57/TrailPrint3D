@@ -143,6 +143,7 @@ objForest = None
 objCity = None
 objGlacier = None
 objRoad = None
+objBoundary = None
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -518,6 +519,30 @@ class MyProperties(bpy.types.PropertyGroup):
         ],
         default="MAIN",
     )
+    col_boundaryActive: bpy.props.BoolProperty(name="Include Admin Boundaries", default=False, description="Include OSM administrative boundaries as a separate painted layer")
+    col_boundaryAdminLevel: bpy.props.EnumProperty(
+        name="Boundary Admin Level",
+        description="OSM administrative level(s) to fetch for city/town boundaries. City levels vary by country and are commonly 8, 9, or 10.",
+        items=[
+            ("8|9|10", "City/Town (8-10)", "Include administrative levels 8, 9, and 10"),
+            ("8", "Admin 8", "Common city/municipality boundary level"),
+            ("9", "Admin 9", "Common town/sub-municipality boundary level"),
+            ("10", "Admin 10", "Common neighbourhood/local boundary level"),
+        ],
+        default="8|9|10",
+    )
+    col_boundaryMode: bpy.props.EnumProperty(
+        name="Boundary Rendering",
+        description="Render administrative boundaries as filled polygons, buffered outlines, or both",
+        items=[
+            ("OUTLINE", "Outlines", "Draw buffered boundary outlines"),
+            ("FILL", "Filled Areas", "Fill administrative boundary polygons"),
+            ("BOTH", "Both", "Draw filled polygons plus buffered outlines"),
+        ],
+        default="OUTLINE",
+    )
+    col_boundaryWidth: bpy.props.FloatProperty(name="Boundary Buffer Size", default=0.12, min=0.01, max=10.0, description="Boundary outline paint width in map units")
+    col_boundaryArea: bpy.props.FloatProperty(name="Boundary Size Treshold", default=1, description="Filled boundaries smaller than the threshold wont be included")
     col_QueryBatchScale: bpy.props.FloatProperty(name="Query Batch Scale", default=1.0, min=0.25, max=4.0, description="Scale OSM tile/API request sizes. Higher is faster when providers allow larger requests; lower is safer.")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
@@ -920,7 +945,7 @@ class MY_OT_thicken(bpy.types.Operator):
             # Check if the custom property 'Object type' exists
             if "Object type" in zobj:
                 print(zobj.name)
-                if zobj["Object type"] in {"TRAIL", "WATER", "FOREST", "CITY", "BUILDING", "GLACIER", "ROAD"}:
+                if zobj["Object type"] in {"TRAIL", "WATER", "FOREST", "CITY", "BUILDING", "GLACIER", "ROAD", "BOUNDARY"}:
                     zobj.location.z += val
                 elif zobj["Object type"] == "MAP" :
                     zobj.select_set(True)
@@ -1744,6 +1769,14 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.prop(props, "col_rActive")
             box.prop(props, "col_rMinType")
             box.prop(props, "col_rWidth")
+            box = boxer.box()
+            box.label(text = "Administrative Boundaries")
+            box.prop(props, "col_boundaryActive")
+            box.prop(props, "col_boundaryAdminLevel")
+            box.prop(props, "col_boundaryMode")
+            box.prop(props, "col_boundaryWidth")
+            if props.col_boundaryMode in {"FILL", "BOTH"}:
+                box.prop(props, "col_boundaryArea")
             boxer.prop(props, "col_QueryBatchScale")
 
             #layout.prop(props, "col_KeepManifold")
@@ -2885,6 +2918,41 @@ def setupColors():
 
     # Set base color
     bsdf.inputs["Base Color"].default_value = (0.12, 0.12, 0.12, 1.0)
+
+    #-------------------------------------------------------------------------------------------------------------------
+
+
+    #Create or get purple administrative boundary material
+    mat_name = "BOUNDARY"
+    if mat_name not in bpy.data.materials:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+    else:
+        mat = bpy.data.materials[mat_name]
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    # Find Principled BSDF by type
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+    # If none exists, create one
+    if not bsdf:
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+
+    # Find Material Output
+    output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if not output:
+        output = nodes.new(type="ShaderNodeOutputMaterial")
+        output.location = (300, 0)
+
+    # Connect BSDF → Output
+    if not bsdf.outputs["BSDF"].is_linked:
+        links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+    # Set base color
+    bsdf.inputs["Base Color"].default_value = (0.45, 0.12, 0.85, 1.0)
 
     #-------------------------------------------------------------------------------------------------------------------
 
@@ -5465,6 +5533,33 @@ def _road_buffer_width_for_tags(tags):
     return base_width * multiplier
 
 
+def _boundary_admin_level_regex():
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    admin_level = str(getattr(props, "col_boundaryAdminLevel", "8|9|10") or "8|9|10")
+    allowed = {"8", "9", "10"}
+    selected = [level for level in admin_level.split("|") if level in allowed]
+    return "|".join(selected) if selected else "8|9|10"
+
+
+def _boundary_render_mode():
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    mode = getattr(props, "col_boundaryMode", "OUTLINE")
+    return mode if mode in {"OUTLINE", "FILL", "BOTH"} else "OUTLINE"
+
+
+def _boundary_buffer_width():
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    return max(0.01, float(getattr(props, "col_boundaryWidth", 0.12) or 0.12))
+
+
+def _boundary_should_create_outlines():
+    return _boundary_render_mode() in {"OUTLINE", "BOTH"}
+
+
+def _boundary_should_create_fills():
+    return _boundary_render_mode() in {"FILL", "BOTH"}
+
+
 def _osm_selector_lines(kind, south, west, north, east):
     if kind == "WATER":
         return [
@@ -5490,6 +5585,9 @@ def _osm_selector_lines(kind, south, west, north, east):
         road_min_type = getattr(props, "col_rMinType", "MAIN")
         highway_regex = _road_highway_regex_for_min_type(road_min_type)
         return [f'way["highway"~"^({highway_regex})$"]({south},{west},{north},{east});']
+    if kind == "BOUNDARY":
+        admin_level_regex = _boundary_admin_level_regex()
+        return [f'relation["boundary"="administrative"]["admin_level"~"^({admin_level_regex})$"]({south},{west},{north},{east});']
     return []
 
 
@@ -6989,6 +7087,8 @@ def build_coloring_layer(map,kind = "WATER"):
         col_Area = (bpy.context.scene.tp3d.col_glArea)
     if kind == "ROAD":
         col_Area = 0.0
+    if kind == "BOUNDARY":
+        col_Area = (bpy.context.scene.tp3d.col_boundaryArea) if _boundary_should_create_fills() else 0.0
     
     col_PaintMap = (bpy.context.scene.tp3d.col_PaintMap)
     process_islands = bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True))
@@ -7267,6 +7367,35 @@ def build_coloring_layer(map,kind = "WATER"):
                             "quality_gate_passed": False,
                         }
 
+                        if kind == "BOUNDARY" and _boundary_should_create_outlines():
+                            outline_width = _boundary_buffer_width()
+                            boundary_outline_obj = col_create_buffered_line_mesh(
+                                f"BoundaryOutline_{relation_id}_{i}_{j}",
+                                outer_coords,
+                                outline_width,
+                            )
+                            if boundary_outline_obj:
+                                created_objects.append(boundary_outline_obj)
+                                waterCreated += 1
+                                module_logger.debug(
+                                    "Boundary relation outline buffered relation=%s outer_idx=%s width=%.4f points=%s",
+                                    relation_id,
+                                    j,
+                                    outline_width,
+                                    len(outer_coords),
+                                )
+                            else:
+                                waterDeleted += 1
+                                module_logger.warning(
+                                    "Boundary relation outline mesh build failed relation=%s kind=%s outer_idx=%s reason=outline_creation_failed",
+                                    relation_id,
+                                    kind,
+                                    j,
+                                )
+
+                            if not _boundary_should_create_fills():
+                                continue
+
                         if kind == "WATER":
                             tobj, hole_telemetry = col_create_triangulated_polygon_mesh(
                                 f"Relation_{relation_id}_{i}_{j}",
@@ -7480,6 +7609,21 @@ def build_coloring_layer(map,kind = "WATER"):
                             )
                         else:
                             waterDeleted += 1
+                    elif kind == "BOUNDARY" and _boundary_should_create_outlines():
+                        boundary_width = _boundary_buffer_width()
+                        tobj = col_create_buffered_line_mesh(f"BoundaryObject_{i}", coords, boundary_width)
+                        if tobj:
+                            created_objects.append(tobj)
+                            waterCreated += 1
+                            standalone_ways_rendered += 1
+                            module_logger.debug(
+                                "Boundary way buffered way_id=%s node_count=%s width=%.4f",
+                                element.get("id"),
+                                len(coords),
+                                boundary_width,
+                            )
+                        else:
+                            waterDeleted += 1
                     elif is_closed_way:
                         if tArea < min_area_effective:
                             waterDeleted += 1
@@ -7537,7 +7681,7 @@ def build_coloring_layer(map,kind = "WATER"):
             #print(f"Area: {area}")
             if area > biggestArea:
                 biggestArea = area
-            if kind == "ROAD" or area >= min_area_effective:
+            if kind == "ROAD" or (kind == "BOUNDARY" and _boundary_should_create_outlines()) or area >= min_area_effective:
                 found = 1
                 tobj.select_set(True)
                 ctx.view_layer.objects.active = tobj
@@ -7577,7 +7721,7 @@ def build_coloring_layer(map,kind = "WATER"):
 
         print(f"Biggest {kind} Found has a Area of: {biggestArea}")
 
-        if biggestArea == 0 and kind != "ROAD":
+        if biggestArea == 0 and kind != "ROAD" and not (kind == "BOUNDARY" and _boundary_should_create_outlines()):
             print(f"No {kind} Found on Tile")
             return _build_empty_coloring_layer_artifact(
                 kind,
@@ -8005,6 +8149,7 @@ def batch_paint_coloring_layers(map_obj, layer_objects):
         _make_paint_entry("GLACIER", "GLACIER", _layer_objects_for_kind(layer_objects, "GLACIER")),
         _make_paint_entry("BUILDING", "BUILDING", _layer_objects_for_kind(layer_objects, "BUILDING")),
         _make_paint_entry("ROAD", "ROAD", _layer_objects_for_kind(layer_objects, "ROAD")),
+        _make_paint_entry("BOUNDARY", "BOUNDARY", _layer_objects_for_kind(layer_objects, "BOUNDARY")),
     ]
 
     metrics = paint_map_faces_by_layers(map_obj, paint_entries)
@@ -8709,8 +8854,9 @@ def collect_osm_layers(map_obj):
     include_building = bool(getattr(props, "col_bActive", False))
     include_glacier = bool(getattr(props, "col_glActive", False))
     include_road = bool(getattr(props, "col_rActive", False))
+    include_boundary = bool(getattr(props, "col_boundaryActive", False))
     module_logger.info(
-        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s",
+        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s BOUNDARY=%s",
         getattr(map_obj, "name", None),
         include_water,
         include_forest,
@@ -8718,6 +8864,7 @@ def collect_osm_layers(map_obj):
         include_building,
         include_glacier,
         include_road,
+        include_boundary,
     )
 
     if include_water:
@@ -8732,8 +8879,10 @@ def collect_osm_layers(map_obj):
         layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
     if include_road:
         layers["ROAD"] = build_coloring_layer(map_obj, "ROAD")
+    if include_boundary:
+        layers["BOUNDARY"] = build_coloring_layer(map_obj, "BOUNDARY")
     module_logger.info(
-        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s",
+        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s BOUNDARY=%s",
         getattr(map_obj, "name", None),
         bool(layers.get("WATER")),
         bool(layers.get("FOREST")),
@@ -8741,6 +8890,7 @@ def collect_osm_layers(map_obj):
         bool(layers.get("BUILDING")),
         bool(layers.get("GLACIER")),
         bool(layers.get("ROAD")),
+        bool(layers.get("BOUNDARY")),
     )
     return layers
 
@@ -8805,6 +8955,7 @@ def apply_overlay_layers(map_obj, layer_objects):
         "GLACIER": paint_coloring_layer(map_obj, layer_objects.get("GLACIER")),
         "BUILDING": paint_coloring_layer(map_obj, layer_objects.get("BUILDING")),
         "ROAD": paint_coloring_layer(map_obj, layer_objects.get("ROAD")),
+        "BOUNDARY": paint_coloring_layer(map_obj, layer_objects.get("BOUNDARY")),
     }
 
 
@@ -8813,19 +8964,20 @@ def run_layer_pipeline(map_obj):
 
     The order is intentional: reset the whole map to BASE, paint water, repaint
     processed water islands as BASE, then paint forest, city, glacier, building,
-    and road overlays. This keeps islands visible while allowing later overlays to win
+    road, and boundary overlays. This keeps islands visible while allowing later overlays to win
     where they overlap the terrain.
     """
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
     module_logger.info(
-        "Layer paint routing | WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s via=paint_coloring_layer->color_map_faces_by_terrain",
+        "Layer paint routing | WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s BOUNDARY=%s via=paint_coloring_layer->color_map_faces_by_terrain",
         bool(layer_objects.get("WATER")),
         bool(layer_objects.get("FOREST")),
         bool(layer_objects.get("CITY")),
         bool(layer_objects.get("BUILDING")),
         bool(layer_objects.get("GLACIER")),
         bool(layer_objects.get("ROAD")),
+        bool(layer_objects.get("BOUNDARY")),
     )
     paint_entire_map_base(map_obj, base_material='BASE')
     if bpy.context.scene.tp3d.col_PaintMap:
@@ -8837,6 +8989,7 @@ def run_layer_pipeline(map_obj):
             "BUILDING": None,
             "GLACIER": None,
             "ROAD": None,
+            "BOUNDARY": None,
         }
         module_logger.info("Layer batch paint metrics map=%s metrics=%s", getattr(map_obj, "name", None), batch_metrics)
     else:
@@ -9241,6 +9394,11 @@ def writeMetadata(obj, type = "MAP"):
         obj["col_rActive"] = bpy.context.scene.tp3d.col_rActive
         obj["col_rWidth"] = bpy.context.scene.tp3d.col_rWidth
         obj["col_rMinType"] = bpy.context.scene.tp3d.col_rMinType
+        obj["col_boundaryActive"] = bpy.context.scene.tp3d.col_boundaryActive
+        obj["col_boundaryAdminLevel"] = bpy.context.scene.tp3d.col_boundaryAdminLevel
+        obj["col_boundaryMode"] = bpy.context.scene.tp3d.col_boundaryMode
+        obj["col_boundaryWidth"] = bpy.context.scene.tp3d.col_boundaryWidth
+        obj["col_boundaryArea"] = bpy.context.scene.tp3d.col_boundaryArea
 
 
 
@@ -9251,7 +9409,7 @@ def writeMetadata(obj, type = "MAP"):
 
         obj["overwritePathElevation"] = bpy.context.scene.tp3d.overwritePathElevation
     
-    if type in {"CITY", "WATER", "FOREST", "BUILDING", "GLACIER", "ROAD"}:
+    if type in {"CITY", "WATER", "FOREST", "BUILDING", "GLACIER", "ROAD", "BOUNDARY"}:
         obj["Object type"] = type
         obj["Addon"] = category
         obj["Version"] = str(AddonVersion[0]) + "," + str(AddonVersion[1])
@@ -10022,7 +10180,7 @@ def runGeneration(type):
     
     
     layer_pipeline_result = run_layer_pipeline(obj)
-    global objWater, objForest, objCity, objBuilding, objGlacier, objRoad
+    global objWater, objForest, objCity, objBuilding, objGlacier, objRoad, objBoundary
     objWater = layer_pipeline_result["water"]
     overlay_layers = layer_pipeline_result["overlays"]
     objForest = overlay_layers.get("FOREST")
@@ -10030,6 +10188,7 @@ def runGeneration(type):
     objBuilding = overlay_layers.get("BUILDING")
     objGlacier = overlay_layers.get("GLACIER")
     objRoad = overlay_layers.get("ROAD")
+    objBoundary = overlay_layers.get("BOUNDARY")
 
 
     
