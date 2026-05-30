@@ -142,6 +142,7 @@ objWater = None
 objForest = None
 objCity = None
 objGlacier = None
+objRoad = None
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -501,6 +502,20 @@ class MyProperties(bpy.types.PropertyGroup):
     col_glActive: bpy.props.BoolProperty(name="Include Glaciers", default=False, description = "Include Glaciers (If there are any)")
     col_glArea: bpy.props.FloatProperty(name="Glacier Size Treshold", default = 1, description = "Glaciers smaller than the treshold wont be included")
     col_glMaxRequests: bpy.props.IntProperty(name="Glacier OSM Tile Budget", default = 300, min = 1, max = 5000, description = "Maximum number of OSM tile requests for glaciers before aborting")
+    col_rActive: bpy.props.BoolProperty(name="Include Roads", default=False, description="Include OSM roads as a dark gray painted layer")
+    col_rWidth: bpy.props.FloatProperty(name="Road Buffer Size", default=0.15, min=0.01, max=10.0, description="Base road paint width in map units. Major roads are buffered wider and minor roads narrower.")
+    col_rMinType: bpy.props.EnumProperty(
+        name="Minimum Road Type",
+        description="Smallest OSM highway class to include in the road layer",
+        items=[
+            ("MAJOR", "Highways", "Only motorway, trunk, and primary roads"),
+            ("MAIN", "Main Roads", "Include major highways plus secondary and tertiary roads"),
+            ("LOCAL", "Local Roads", "Include main roads plus residential and unclassified roads"),
+            ("SERVICE", "Service/Tracks", "Include local roads plus service roads and tracks"),
+            ("ALL", "All Paths", "Include roads plus cycleways, footways, paths, and steps"),
+        ],
+        default="MAIN",
+    )
     col_QueryBatchScale: bpy.props.FloatProperty(name="Query Batch Scale", default=1.0, min=0.25, max=4.0, description="Scale OSM tile/API request sizes. Higher is faster when providers allow larger requests; lower is safer.")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
@@ -903,7 +918,7 @@ class MY_OT_thicken(bpy.types.Operator):
             # Check if the custom property 'Object type' exists
             if "Object type" in zobj:
                 print(zobj.name)
-                if zobj["Object type"] == "TRAIL" or zobj["Object type"] == "WATER" or zobj["Object type"] == "FOREST" or zobj["Object type"] == "CITY":
+                if zobj["Object type"] in {"TRAIL", "WATER", "FOREST", "CITY", "GLACIER", "ROAD"}:
                     zobj.location.z += val
                 elif zobj["Object type"] == "MAP" :
                     zobj.select_set(True)
@@ -1718,6 +1733,11 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.prop(props, "col_glActive")
             box.prop(props, "col_glArea")
             box.prop(props, "col_glMaxRequests")
+            box = boxer.box()
+            box.label(text = "Roads")
+            box.prop(props, "col_rActive")
+            box.prop(props, "col_rMinType")
+            box.prop(props, "col_rWidth")
             boxer.prop(props, "col_QueryBatchScale")
 
             #layout.prop(props, "col_KeepManifold")
@@ -2792,6 +2812,41 @@ def setupColors():
 
 
     
+    #Create or get dark gray road material
+    mat_name = "ROAD"
+    if mat_name not in bpy.data.materials:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+    else:
+        mat = bpy.data.materials[mat_name]
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    # Find Principled BSDF by type
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+    # If none exists, create one
+    if not bsdf:
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+
+    # Find Material Output
+    output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if not output:
+        output = nodes.new(type="ShaderNodeOutputMaterial")
+        output.location = (300, 0)
+
+    # Connect BSDF → Output
+    if not bsdf.outputs["BSDF"].is_linked:
+        links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+    # Set base color
+    bsdf.inputs["Base Color"].default_value = (0.12, 0.12, 0.12, 1.0)
+
+    #-------------------------------------------------------------------------------------------------------------------
+
+
     #Create or get Black material
     mat_name = "BLACK"
     if mat_name not in bpy.data.materials:
@@ -5309,6 +5364,65 @@ def single_color_mode(crv, mapName):
 
 # --- OSM FETCHING ---
 
+ROAD_HIGHWAY_GROUPS = {
+    "MAJOR": ["motorway", "trunk", "primary"],
+    "MAIN": ["secondary", "tertiary"],
+    "LOCAL": ["unclassified", "residential", "living_street", "road"],
+    "SERVICE": ["service", "track"],
+    "ALL": ["cycleway", "footway", "path", "pedestrian", "steps", "bridleway"],
+}
+
+ROAD_HIGHWAY_MULTIPLIERS = {
+    "motorway": 2.6,
+    "trunk": 2.3,
+    "primary": 2.0,
+    "secondary": 1.6,
+    "tertiary": 1.3,
+    "unclassified": 1.0,
+    "residential": 1.0,
+    "living_street": 0.9,
+    "road": 1.0,
+    "service": 0.75,
+    "track": 0.65,
+    "cycleway": 0.55,
+    "footway": 0.45,
+    "path": 0.45,
+    "pedestrian": 0.55,
+    "steps": 0.4,
+    "bridleway": 0.45,
+}
+
+ROAD_MIN_TYPE_ORDER = ["MAJOR", "MAIN", "LOCAL", "SERVICE", "ALL"]
+
+
+def _road_highway_values_for_min_type(min_type):
+    """Return OSM highway values included by the selected minimum road class."""
+    min_type = min_type if min_type in ROAD_MIN_TYPE_ORDER else "MAIN"
+    max_idx = ROAD_MIN_TYPE_ORDER.index(min_type)
+    values = []
+    for group in ROAD_MIN_TYPE_ORDER[:max_idx + 1]:
+        values.extend(ROAD_HIGHWAY_GROUPS[group])
+    return values
+
+
+def _road_highway_regex_for_min_type(min_type):
+    return "|".join(_road_highway_values_for_min_type(min_type))
+
+
+def _road_highway_is_included(highway_value):
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    min_type = getattr(props, "col_rMinType", "MAIN")
+    return highway_value in set(_road_highway_values_for_min_type(min_type))
+
+
+def _road_buffer_width_for_tags(tags):
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    base_width = max(0.01, float(getattr(props, "col_rWidth", 0.15) or 0.15))
+    highway_value = (tags or {}).get("highway", "road")
+    multiplier = ROAD_HIGHWAY_MULTIPLIERS.get(highway_value, 1.0)
+    return base_width * multiplier
+
+
 def _osm_selector_lines(kind, south, west, north, east):
     if kind == "WATER":
         return [
@@ -5327,6 +5441,11 @@ def _osm_selector_lines(kind, south, west, north, east):
         return [f'nwr["landuse"~"residential|urban|commercial|industrial"]({south},{west},{north},{east});']
     if kind == "GLACIER":
         return [f'nwr["natural"="glacier"]({south},{west},{north},{east});']
+    if kind == "ROAD":
+        props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+        road_min_type = getattr(props, "col_rMinType", "MAIN")
+        highway_regex = _road_highway_regex_for_min_type(road_min_type)
+        return [f'way["highway"~"^({highway_regex})$"]({south},{west},{north},{east});']
     return []
 
 
@@ -5684,6 +5803,54 @@ def col_create_line_mesh(name, coords):
     bm.to_mesh(mesh)
     bm.free()
     _debug_preserve_created_object_if_enabled(tobj, creation_type="LINE")
+    return tobj
+
+
+def col_create_buffered_line_mesh(name, coords, width):
+    """Create a paintable strip mesh around an open OSM way."""
+    if len(coords) < 2:
+        return None
+
+    mesh = bpy.data.meshes.new(name)
+    tobj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(tobj)
+
+    bm = bmesh.new()
+    half_width = max(0.0001, float(width or 0.0) / 2.0)
+    face_count = 0
+
+    for start, end in zip(coords[:-1], coords[1:]):
+        p1 = Vector(start)
+        p2 = Vector(end)
+        direction = p2 - p1
+        direction.z = 0
+        if direction.length <= 1e-9:
+            continue
+
+        direction.normalize()
+        perp = Vector((-direction.y, direction.x, 0.0)) * half_width
+        verts = [
+            bm.verts.new(tuple(p1 + perp)),
+            bm.verts.new(tuple(p1 - perp)),
+            bm.verts.new(tuple(p2 - perp)),
+            bm.verts.new(tuple(p2 + perp)),
+        ]
+        try:
+            bm.faces.new(verts)
+            face_count += 1
+        except ValueError:
+            continue
+
+    if face_count == 0:
+        bm.free()
+        bpy.data.objects.remove(tobj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        return None
+
+    bm.to_mesh(mesh)
+    bm.free()
+    _debug_preserve_created_object_if_enabled(tobj, creation_type="BUFFERED_LINE")
     return tobj
 
 
@@ -6740,6 +6907,20 @@ def build_osm_nodes(data):
 
 
 
+def _build_empty_coloring_layer_artifact(kind, objects_created=0, objects_ignored=0, relation_member_ways_skipped=0, standalone_ways_rendered=0, relation_member_way_ids=0):
+    return {
+        "kind": kind,
+        "merged_object": None,
+        "island_objects": [],
+        "cleanup_telemetry": {
+            "objects_created": objects_created,
+            "objects_ignored": objects_ignored,
+            "relation_member_ways_skipped": relation_member_ways_skipped,
+            "standalone_ways_rendered": standalone_ways_rendered,
+            "relation_member_way_ids": relation_member_way_ids,
+        },
+    }
+
 @log_workflow
 def build_coloring_layer(map,kind = "WATER"):
     """Build one OSM-derived coloring layer for the generated terrain map.
@@ -6760,6 +6941,8 @@ def build_coloring_layer(map,kind = "WATER"):
         col_Area = (bpy.context.scene.tp3d.col_cArea)
     if kind == "GLACIER":
         col_Area = (bpy.context.scene.tp3d.col_glArea)
+    if kind == "ROAD":
+        col_Area = 0.0
     
     col_PaintMap = (bpy.context.scene.tp3d.col_PaintMap)
     process_islands = bool(getattr(bpy.context.scene.tp3d, "col_ProcessIslands", True))
@@ -6900,7 +7083,7 @@ def build_coloring_layer(map,kind = "WATER"):
                         water_polygon_count,
                     )
                 nodes = build_osm_nodes({"elements": filtered_elements})
-                bodies = extract_multipolygon_bodies(filtered_elements, nodes)
+                bodies = [] if kind == "ROAD" else extract_multipolygon_bodies(filtered_elements, nodes)
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
 
                 for i, body in enumerate(bodies):
@@ -7224,22 +7407,44 @@ def build_coloring_layer(map,kind = "WATER"):
                                 node['lat'], node['lon'], 0,0
                             )
                             coords.append(coord)
-                    tArea = calculate_polygon_area_2d(coords)
                     #print(f"tArea2: {tArea}")
                     is_closed_way = len(coords) >= 3 and coords[0] == coords[-1]
+                    tArea = calculate_polygon_area_2d(coords) if is_closed_way else 0.0
                     if len(coords) < 2:
                         waterDeleted += 1
                         continue
-                    if is_closed_way and tArea < min_area_effective:
-                        waterDeleted += 1
-                        continue
-                    
                     tags = element.get("tags", {})
-                    if is_closed_way:
+                    if kind == "ROAD":
+                        highway_value = tags.get("highway")
+                        if not _road_highway_is_included(highway_value):
+                            waterDeleted += 1
+                            continue
+                        road_width = _road_buffer_width_for_tags(tags)
+                        tobj = col_create_buffered_line_mesh(f"RoadObject_{i}", coords, road_width)
+                        if tobj:
+                            created_objects.append(tobj)
+                            waterCreated += 1
+                            standalone_ways_rendered += 1
+                            module_logger.debug(
+                                "Road way buffered way_id=%s highway=%s node_count=%s width=%.4f",
+                                element.get("id"),
+                                highway_value,
+                                len(coords),
+                                road_width,
+                            )
+                        else:
+                            waterDeleted += 1
+                    elif is_closed_way:
+                        if tArea < min_area_effective:
+                            waterDeleted += 1
+                            continue
                         tobj = col_create_face_mesh(f"coloredObject_{i}", coords)
-                        created_objects.append(tobj)
-                        waterCreated += 1
-                        standalone_ways_rendered += 1
+                        if tobj:
+                            created_objects.append(tobj)
+                            waterCreated += 1
+                            standalone_ways_rendered += 1
+                        else:
+                            waterDeleted += 1
                     elif kind != "WATER":
                         waterDeleted += 1
                         module_logger.info(
@@ -7286,7 +7491,7 @@ def build_coloring_layer(map,kind = "WATER"):
             #print(f"Area: {area}")
             if area > biggestArea:
                 biggestArea = area
-            if area >= min_area_effective:
+            if kind == "ROAD" or area >= min_area_effective:
                 found = 1
                 tobj.select_set(True)
                 ctx.view_layer.objects.active = tobj
@@ -7326,9 +7531,16 @@ def build_coloring_layer(map,kind = "WATER"):
 
         print(f"Biggest {kind} Found has a Area of: {biggestArea}")
 
-        if biggestArea == 0:
-            print("No Water Found on Tile")
-            return
+        if biggestArea == 0 and kind != "ROAD":
+            print(f"No {kind} Found on Tile")
+            return _build_empty_coloring_layer_artifact(
+                kind,
+                objects_created=waterCreated,
+                objects_ignored=waterDeleted,
+                relation_member_ways_skipped=relation_member_ways_skipped,
+                standalone_ways_rendered=standalone_ways_rendered,
+                relation_member_way_ids=len(relation_member_way_ids),
+            )
         
         bpy.ops.object.join()  # This merges them into the active object
         
@@ -7450,7 +7662,14 @@ def build_coloring_layer(map,kind = "WATER"):
                 )
                 bpy.data.objects.remove(merged_object, do_unlink=True)
                 bpy.data.meshes.remove(mesh_data)
-                return
+                return _build_empty_coloring_layer_artifact(
+                    kind,
+                    objects_created=waterCreated,
+                    objects_ignored=waterDeleted,
+                    relation_member_ways_skipped=relation_member_ways_skipped,
+                    standalone_ways_rendered=standalone_ways_rendered,
+                    relation_member_way_ids=len(relation_member_way_ids),
+                )
             recalculateNormals(merged_object)
 
         if merged_object:
@@ -7738,6 +7957,7 @@ def batch_paint_coloring_layers(map_obj, layer_objects):
         _make_paint_entry("FOREST", "FOREST", _layer_objects_for_kind(layer_objects, "FOREST")),
         _make_paint_entry("CITY", "CITY", _layer_objects_for_kind(layer_objects, "CITY")),
         _make_paint_entry("GLACIER", "GLACIER", _layer_objects_for_kind(layer_objects, "GLACIER")),
+        _make_paint_entry("ROAD", "ROAD", _layer_objects_for_kind(layer_objects, "ROAD")),
     ]
 
     metrics = paint_map_faces_by_layers(map_obj, paint_entries)
@@ -8440,13 +8660,15 @@ def collect_osm_layers(map_obj):
     include_forest = bool(getattr(props, "col_fActive", False))
     include_city = bool(getattr(props, "col_cActive", False))
     include_glacier = bool(getattr(props, "col_glActive", False))
+    include_road = bool(getattr(props, "col_rActive", False))
     module_logger.info(
-        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s GLACIER=%s",
+        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s GLACIER=%s ROAD=%s",
         getattr(map_obj, "name", None),
         include_water,
         include_forest,
         include_city,
         include_glacier,
+        include_road,
     )
 
     if include_water:
@@ -8457,13 +8679,16 @@ def collect_osm_layers(map_obj):
         layers["CITY"] = build_coloring_layer(map_obj, "CITY")
     if include_glacier:
         layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
+    if include_road:
+        layers["ROAD"] = build_coloring_layer(map_obj, "ROAD")
     module_logger.info(
-        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s GLACIER=%s",
+        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s GLACIER=%s ROAD=%s",
         getattr(map_obj, "name", None),
         bool(layers.get("WATER")),
         bool(layers.get("FOREST")),
         bool(layers.get("CITY")),
         bool(layers.get("GLACIER")),
+        bool(layers.get("ROAD")),
     )
     return layers
 
@@ -8526,6 +8751,7 @@ def apply_overlay_layers(map_obj, layer_objects):
         "FOREST": paint_coloring_layer(map_obj, layer_objects.get("FOREST")),
         "CITY": paint_coloring_layer(map_obj, layer_objects.get("CITY")),
         "GLACIER": paint_coloring_layer(map_obj, layer_objects.get("GLACIER")),
+        "ROAD": paint_coloring_layer(map_obj, layer_objects.get("ROAD")),
     }
 
 
@@ -8540,11 +8766,12 @@ def run_layer_pipeline(map_obj):
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
     module_logger.info(
-        "Layer paint routing | WATER=%s FOREST=%s CITY=%s GLACIER=%s via=paint_coloring_layer->color_map_faces_by_terrain",
+        "Layer paint routing | WATER=%s FOREST=%s CITY=%s GLACIER=%s ROAD=%s via=paint_coloring_layer->color_map_faces_by_terrain",
         bool(layer_objects.get("WATER")),
         bool(layer_objects.get("FOREST")),
         bool(layer_objects.get("CITY")),
         bool(layer_objects.get("GLACIER")),
+        bool(layer_objects.get("ROAD")),
     )
     paint_entire_map_base(map_obj, base_material='BASE')
     if bpy.context.scene.tp3d.col_PaintMap:
@@ -8554,6 +8781,7 @@ def run_layer_pipeline(map_obj):
             "FOREST": None,
             "CITY": None,
             "GLACIER": None,
+            "ROAD": None,
         }
         module_logger.info("Layer batch paint metrics map=%s metrics=%s", getattr(map_obj, "name", None), batch_metrics)
     else:
@@ -8952,7 +9180,10 @@ def writeMetadata(obj, type = "MAP"):
         obj["col_cActive"] = bpy.context.scene.tp3d.col_cActive
         obj["col_cArea"] = bpy.context.scene.tp3d.col_cArea
         obj["col_glActive"] = bpy.context.scene.tp3d.col_glActive
-        obj["col_glArea"] = bpy.context.scene.tp3d.col_glArea 
+        obj["col_glArea"] = bpy.context.scene.tp3d.col_glArea
+        obj["col_rActive"] = bpy.context.scene.tp3d.col_rActive
+        obj["col_rWidth"] = bpy.context.scene.tp3d.col_rWidth
+        obj["col_rMinType"] = bpy.context.scene.tp3d.col_rMinType
 
 
 
@@ -8963,7 +9194,7 @@ def writeMetadata(obj, type = "MAP"):
 
         obj["overwritePathElevation"] = bpy.context.scene.tp3d.overwritePathElevation
     
-    if type == "CITY" or type == "WATER" or type == "FOREST":
+    if type in {"CITY", "WATER", "FOREST", "GLACIER", "ROAD"}:
         obj["Object type"] = type
         obj["Addon"] = category
         obj["Version"] = str(AddonVersion[0]) + "," + str(AddonVersion[1])
@@ -9733,11 +9964,13 @@ def runGeneration(type):
     
     
     layer_pipeline_result = run_layer_pipeline(obj)
+    global objWater, objForest, objCity, objGlacier, objRoad
     objWater = layer_pipeline_result["water"]
     overlay_layers = layer_pipeline_result["overlays"]
     objForest = overlay_layers.get("FOREST")
     objCity = overlay_layers.get("CITY")
     objGlacier = overlay_layers.get("GLACIER")
+    objRoad = overlay_layers.get("ROAD")
 
 
     
