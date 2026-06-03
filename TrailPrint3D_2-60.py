@@ -8197,6 +8197,58 @@ def _build_world_bvh_for_object(obj):
     return bvhtree.BVHTree.FromPolygons(verts, polys)
 
 
+def _world_vertices_for_object(obj):
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data or not obj.data.vertices:
+        return []
+    world = obj.matrix_world
+    return [world @ v.co for v in obj.data.vertices]
+
+
+def _xy_bbox_for_points(points):
+    if not points:
+        return None
+    xs = [p.x for p in points]
+    ys = [p.y for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _xy_bboxes_overlap(a, b, epsilon=1e-9):
+    if not a or not b:
+        return False
+    return not (a[2] < b[0] - epsilon or b[2] < a[0] - epsilon or a[3] < b[1] - epsilon or b[3] < a[1] - epsilon)
+
+
+def _point_in_face_xy(point, face_points, epsilon=1e-9):
+    if len(face_points) < 3:
+        return False
+
+    px, py = point.x, point.y
+    inside = False
+    n = len(face_points)
+    for i in range(n):
+        a = face_points[i]
+        b = face_points[(i + 1) % n]
+        ax, ay = a.x, a.y
+        bx, by = b.x, b.y
+        cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+        if abs(cross) <= epsilon and min(ax, bx) - epsilon <= px <= max(ax, bx) + epsilon and min(ay, by) - epsilon <= py <= max(ay, by) + epsilon:
+            return True
+        if (ay > py) != (by > py):
+            x_intersect = (bx - ax) * (py - ay) / ((by - ay) or epsilon) + ax
+            if px < x_intersect + epsilon:
+                inside = not inside
+    return inside
+
+
+def _face_sample_points_world(face, map_world):
+    verts = [map_world @ vert.co for vert in face.verts]
+    samples = [map_world @ face.calc_center_median()]
+    samples.extend(verts)
+    for idx, vert in enumerate(verts):
+        samples.append((vert + verts[(idx + 1) % len(verts)]) * 0.5)
+    return samples, verts
+
+
 def _ray_hits_bvh_from_point(bvh, point, max_dist=1000):
     for ray_dir in (Vector((0, 0, 1)), Vector((0, 0, -1))):
         loc, norm, idx, dist = bvh.ray_cast(point, ray_dir, max_dist)
@@ -8205,13 +8257,29 @@ def _ray_hits_bvh_from_point(bvh, point, max_dist=1000):
     return False
 
 
+def _ray_hits_bvh_from_points(bvh, points, max_dist=1000):
+    return any(_ray_hits_bvh_from_point(bvh, point, max_dist=max_dist) for point in points)
+
+
+def _record_projects_inside_face(record, face_points, face_bbox):
+    if not _xy_bboxes_overlap(face_bbox, record.get("xy_bbox")):
+        return False
+    return any(_point_in_face_xy(point, face_points) for point in record.get("world_vertices", []))
+
+
 def _make_paint_entry(kind, material_name, objects):
     valid_objects = [obj for obj in (objects or []) if _is_valid_blender_object(obj) and obj.type == 'MESH']
     bvh_records = []
     for obj in valid_objects:
         bvh = _build_world_bvh_for_object(obj)
         if bvh is not None:
-            bvh_records.append({"object": obj, "bvh": bvh})
+            world_vertices = _world_vertices_for_object(obj)
+            bvh_records.append({
+                "object": obj,
+                "bvh": bvh,
+                "world_vertices": world_vertices,
+                "xy_bbox": _xy_bbox_for_points(world_vertices),
+            })
     return {
         "kind": kind,
         "material_name": material_name,
@@ -8219,6 +8287,7 @@ def _make_paint_entry(kind, material_name, objects):
         "bvh_records": bvh_records,
         "faces_colored": 0,
         "ray_hits": 0,
+        "projected_vertex_hits": 0,
     }
 
 
@@ -8290,16 +8359,24 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
             continue
 
         faces_checked_up += 1
-        center_world = map_world @ face.calc_center_median()
+        sample_points, face_points = _face_sample_points_world(face, map_world)
+        face_bbox = _xy_bbox_for_points(face_points)
         winning_entry = None
         for entry in reversed(active_entries):
             hit = False
+            projected_vertex_hit = False
             for record in entry["bvh_records"]:
-                if _ray_hits_bvh_from_point(record["bvh"], center_world):
+                if _ray_hits_bvh_from_points(record["bvh"], sample_points):
                     hit = True
+                    break
+                if _record_projects_inside_face(record, face_points, face_bbox):
+                    hit = True
+                    projected_vertex_hit = True
                     break
             if hit:
                 entry["ray_hits"] += 1
+                if projected_vertex_hit:
+                    entry["projected_vertex_hits"] += 1
                 winning_entry = entry
                 break
 
@@ -8314,6 +8391,7 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
         entry["kind"]: {
             "faces_checked_up": faces_checked_up,
             "ray_hits": entry["ray_hits"],
+            "projected_vertex_hits": entry.get("projected_vertex_hits", 0),
             "faces_colored": entry["faces_colored"],
             "material_name_used": entry["material_name"],
             "source_objects": len(entry["objects"]),
@@ -8913,6 +8991,10 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     verts = [terrain_world @ v.co for v in terrain_mesh.vertices]
     polys = [p.vertices for p in terrain_mesh.polygons]
     bvh = bvhtree.BVHTree.FromPolygons(verts, polys)
+    terrain_record = {
+        "world_vertices": verts,
+        "xy_bbox": _xy_bbox_for_points(verts),
+    }
 
     # Get or create a material for terrain color
     if paint_material_name:
@@ -8950,18 +9032,27 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
         # Only consider faces facing upward
         if dot > up_threshold:
             faces_checked_up += 1
-            center = f.calc_center_median()
-            center_world = map_world @ center
+            sample_points, face_points = _face_sample_points_world(f, map_world)
+            center_world = sample_points[0]
+            face_bbox = _xy_bbox_for_points(face_points)
             primary_ray_dir = Vector((0, 0, 1))
             fallback_ray_dir = Vector((0, 0, -1))
             cast_results = []
-            for cast_name, ray_dir in (("up", primary_ray_dir), ("down", fallback_ray_dir)):
-                loc, norm, idx, dist = bvh.ray_cast(center_world, ray_dir, 1000)
-                if loc is not None and dist is not None and dist > 1e-6:
-                    cast_results.append((dist, cast_name, ray_dir, loc, norm, idx))
+            for sample_point in sample_points:
+                for cast_name, ray_dir in (("up", primary_ray_dir), ("down", fallback_ray_dir)):
+                    loc, norm, idx, dist = bvh.ray_cast(sample_point, ray_dir, 1000)
+                    if loc is not None and dist is not None and dist > 1e-6:
+                        cast_results.append((dist, cast_name, ray_dir, loc, norm, idx))
 
             if cast_results:
                 dist, hit_direction_name, hit_direction_vec, loc, norm, idx = min(cast_results, key=lambda x: x[0])
+            elif _record_projects_inside_face(terrain_record, face_points, face_bbox):
+                hit_direction_name = "projected_vertex"
+                hit_direction_vec = primary_ray_dir
+                loc = center_world
+                norm = None
+                idx = None
+                dist = 1e-5
             else:
                 hit_direction_name = None
                 hit_direction_vec = primary_ray_dir
