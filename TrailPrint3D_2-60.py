@@ -5997,6 +5997,11 @@ def extract_multipolygon_bodies(elements, nodes):
                     "relation_id": relation_id,
                     "outers": outer_loops,
                     "inners": inner_loops,
+                    "source_way_ids": [
+                        record["way_id"]
+                        for record in outer_way_records + inner_way_records
+                        if record.get("way_id") is not None
+                    ],
                 })
 
         elif el.get('type') == 'way':
@@ -6007,6 +6012,7 @@ def extract_multipolygon_bodies(elements, nodes):
                     "relation_id": el.get("id"),
                     "outers": outer_loops,
                     "inners": [],
+                    "source_way_ids": [el.get("id")] if el.get("id") is not None else [],
                 })
 
     return multipolygon_lakes
@@ -6263,7 +6269,7 @@ def _triangle_area_2d(a, b, c):
 def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=None, outer_idx=None, kind="WATER"):
     """Create a polygon-with-holes mesh from explicit triangle faces.
 
-    Blender's large-ngon face creation path is fragile for large OSM water
+    Blender's large-ngon face creation path is fragile for large OSM
     multipolygons.  This helper tessellates the normalized outer ring and its
     valid holes first, then creates only triangle faces via Mesh.from_pydata.
     """
@@ -6292,7 +6298,7 @@ def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=N
     if not outer_valid:
         telemetry["prep"] = time.perf_counter() - prep_started
         module_logger.warning(
-            "Triangulated water polygon outer rejected relation=%s outer_idx=%s kind=%s reason=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            "Triangulated polygon outer rejected relation=%s outer_idx=%s kind=%s reason=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
             relation_id,
             outer_idx,
             kind,
@@ -6311,7 +6317,7 @@ def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=N
         if not inner_valid or not contained:
             telemetry["dropped_invalid_holes"] += 1
             module_logger.warning(
-                "Triangulated water polygon hole rejected relation=%s outer_idx=%s inner_idx=%s kind=%s reason=%s contained=%s ring_points=%s",
+                "Triangulated polygon hole rejected relation=%s outer_idx=%s inner_idx=%s kind=%s reason=%s contained=%s ring_points=%s",
                 relation_id,
                 outer_idx,
                 inner_idx,
@@ -6330,7 +6336,7 @@ def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=N
     if not contours or len(contours[0]) < 3:
         telemetry["prep"] = time.perf_counter() - prep_started
         module_logger.warning(
-            "Triangulated water polygon skipped relation=%s outer_idx=%s kind=%s reason=no_valid_outer_contour source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            "Triangulated polygon skipped relation=%s outer_idx=%s kind=%s reason=no_valid_outer_contour source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
             relation_id,
             outer_idx,
             kind,
@@ -6348,7 +6354,7 @@ def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=N
     except Exception:
         telemetry["prep"] = time.perf_counter() - prep_started
         module_logger.exception(
-            "Triangulated water polygon tessellation failed relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            "Triangulated polygon tessellation failed relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
             relation_id,
             outer_idx,
             kind,
@@ -6378,7 +6384,7 @@ def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=N
     if not triangle_faces:
         telemetry["prep"] = time.perf_counter() - prep_started
         module_logger.warning(
-            "Triangulated water polygon produced no triangles relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
+            "Triangulated polygon produced no triangles relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s dropped_invalid_holes=%s",
             relation_id,
             outer_idx,
             kind,
@@ -6408,7 +6414,7 @@ def col_create_triangulated_polygon_mesh(name, polygon_with_holes, relation_id=N
     telemetry["delta_edges"] = len(mesh.edges)
 
     module_logger.info(
-        "Triangulated water polygon mesh relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s final_vertices=%s final_triangles=%s dropped_invalid_holes=%s holes_applied=%s",
+        "Triangulated polygon mesh relation=%s outer_idx=%s kind=%s source_outer_nodes=%s source_inner_rings=%s final_vertices=%s final_triangles=%s dropped_invalid_holes=%s holes_applied=%s",
         relation_id,
         outer_idx,
         kind,
@@ -7131,7 +7137,15 @@ def build_osm_nodes(data):
 
 
 
-def _build_empty_coloring_layer_artifact(kind, objects_created=0, objects_ignored=0, relation_member_ways_skipped=0, standalone_ways_rendered=0, relation_member_way_ids=0):
+def _build_empty_coloring_layer_artifact(
+    kind,
+    objects_created=0,
+    objects_ignored=0,
+    relation_member_ways_skipped=0,
+    standalone_ways_rendered=0,
+    relation_member_way_ids=0,
+    body_way_duplicates_skipped=0,
+):
     return {
         "kind": kind,
         "merged_object": None,
@@ -7140,6 +7154,7 @@ def _build_empty_coloring_layer_artifact(kind, objects_created=0, objects_ignore
             "objects_created": objects_created,
             "objects_ignored": objects_ignored,
             "relation_member_ways_skipped": relation_member_ways_skipped,
+            "body_way_duplicates_skipped": body_way_duplicates_skipped,
             "standalone_ways_rendered": standalone_ways_rendered,
             "relation_member_way_ids": relation_member_way_ids,
         },
@@ -7222,6 +7237,8 @@ def build_coloring_layer(map,kind = "WATER"):
     relation_member_way_ids = set()
     render_standalone_ways_only = True  # Debug fallback: keep standalone way rendering while suppressing relation-member duplicates.
     relation_member_ways_skipped = 0
+    rendered_body_way_ids = set()
+    body_way_duplicates_skipped = 0
     relation_debug_pairs = []
     standalone_ways_rendered = 0
 
@@ -7351,6 +7368,8 @@ def build_coloring_layer(map,kind = "WATER"):
                     relation_id = body.get("relation_id")
                     outer_rings = body.get("outers", [])
                     inner_rings = body.get("inners", [])
+                    body_source_way_ids = set(body.get("source_way_ids") or [])
+                    body_rendered = False
                     multipolygon_outer_area_threshold = min_area_effective
                     inner_area_threshold = min_area_effective
 
@@ -7529,7 +7548,7 @@ def build_coloring_layer(map,kind = "WATER"):
                             if not _boundary_should_create_fills():
                                 continue
 
-                        if kind == "WATER":
+                        if kind in {"WATER", "ROCK"}:
                             tobj, hole_telemetry = col_create_triangulated_polygon_mesh(
                                 f"Relation_{relation_id}_{i}_{j}",
                                 outer_polygon,
@@ -7540,7 +7559,7 @@ def build_coloring_layer(map,kind = "WATER"):
                             if not tobj:
                                 waterDeleted += 1
                                 module_logger.warning(
-                                    "Triangulated water mesh build failed relation=%s kind=%s outer_idx=%s reason=triangulated_mesh_creation_failed telemetry=%s",
+                                    "Triangulated polygon mesh build failed relation=%s kind=%s outer_idx=%s reason=triangulated_mesh_creation_failed telemetry=%s",
                                     relation_id,
                                     kind,
                                     j,
@@ -7649,6 +7668,7 @@ def build_coloring_layer(map,kind = "WATER"):
                                 hole_telemetry["candidate_holes"],
                             )
                         created_objects.append(tobj)
+                        body_rendered = True
                         if should_process_water_islands:
                             for island_obj in island_objects:
                                 relation_debug_pairs.append((
@@ -7675,6 +7695,9 @@ def build_coloring_layer(map,kind = "WATER"):
                                 holes_applied_total,
                                 len(valid_inners),
                             )
+
+                    if body_rendered:
+                        rendered_body_way_ids.update(body_source_way_ids)
 
                     normalized_hole_count = sum(len(outer.get("holes", [])) for outer in normalized_outer_polygons)
                     module_logger.info(
@@ -7703,6 +7726,9 @@ def build_coloring_layer(map,kind = "WATER"):
                         continue
                     if element.get("id") in relation_member_way_ids:
                         relation_member_ways_skipped += 1
+                        continue
+                    if element.get("id") in rendered_body_way_ids:
+                        body_way_duplicates_skipped += 1
                         continue
                     if not render_standalone_ways_only:
                         continue
@@ -7818,11 +7844,13 @@ def build_coloring_layer(map,kind = "WATER"):
 
     print(f"{kind} Objects Created: {waterCreated}, Objects Ignored: {waterDeleted}")
     module_logger.info(
-        "Duplicate fill telemetry kind=%s relation_member_ways_skipped=%s standalone_ways_rendered=%s relation_member_way_ids=%s",
+        "Duplicate fill telemetry kind=%s relation_member_ways_skipped=%s body_way_duplicates_skipped=%s standalone_ways_rendered=%s relation_member_way_ids=%s rendered_body_way_ids=%s",
         kind,
         relation_member_ways_skipped,
+        body_way_duplicates_skipped,
         standalone_ways_rendered,
         len(relation_member_way_ids),
+        len(rendered_body_way_ids),
     )
 
     #print(f"Creating {kind} Objects")
@@ -7891,6 +7919,7 @@ def build_coloring_layer(map,kind = "WATER"):
                 objects_created=waterCreated,
                 objects_ignored=waterDeleted,
                 relation_member_ways_skipped=relation_member_ways_skipped,
+                body_way_duplicates_skipped=body_way_duplicates_skipped,
                 standalone_ways_rendered=standalone_ways_rendered,
                 relation_member_way_ids=len(relation_member_way_ids),
             )
@@ -8020,6 +8049,7 @@ def build_coloring_layer(map,kind = "WATER"):
                     objects_created=waterCreated,
                     objects_ignored=waterDeleted,
                     relation_member_ways_skipped=relation_member_ways_skipped,
+                    body_way_duplicates_skipped=body_way_duplicates_skipped,
                     standalone_ways_rendered=standalone_ways_rendered,
                     relation_member_way_ids=len(relation_member_way_ids),
                 )
@@ -8070,6 +8100,7 @@ def build_coloring_layer(map,kind = "WATER"):
             "objects_created": waterCreated,
             "objects_ignored": waterDeleted,
             "relation_member_ways_skipped": relation_member_ways_skipped,
+            "body_way_duplicates_skipped": body_way_duplicates_skipped,
             "standalone_ways_rendered": standalone_ways_rendered,
             "relation_member_way_ids": len(relation_member_way_ids),
         },
