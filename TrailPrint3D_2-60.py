@@ -7548,7 +7548,7 @@ def build_coloring_layer(map,kind = "WATER"):
                             if not _boundary_should_create_fills():
                                 continue
 
-                        if kind in {"WATER", "ROCK"}:
+                        if kind == "WATER":
                             tobj, hole_telemetry = col_create_triangulated_polygon_mesh(
                                 f"Relation_{relation_id}_{i}_{j}",
                                 outer_polygon,
@@ -7860,9 +7860,16 @@ def build_coloring_layer(map,kind = "WATER"):
         found = 0
         biggestArea = 0
         kept_objects = []
+        area_filtered_count = 0
         for tobj in created_objects:
             if not _is_valid_blender_object(tobj):
                 continue
+            if kind == "ROCK":
+                _debug_preserve_object_if_enabled(
+                    tobj,
+                    _format_debug_step_name("ROCK", "PRE_FILTER", "SOURCE"),
+                    kind="ROCK",
+                )
             
             bm = bmesh.new()
             bm.from_mesh(tobj.data)
@@ -7879,6 +7886,7 @@ def build_coloring_layer(map,kind = "WATER"):
                 kept_objects.append(tobj)
                 #print(f"Area: {area}")
             else:
+                area_filtered_count += 1
                 mesh_data = tobj.data
                 _debug_preserve_object_if_enabled(
                     tobj,
@@ -7893,6 +7901,16 @@ def build_coloring_layer(map,kind = "WATER"):
                 continue
         
         created_objects = kept_objects
+        if kind == "ROCK" and waterCreated > 0 and not created_objects:
+            module_logger.warning(
+                "Rock geometry created but no objects survived filtering created=%s ignored=%s area_filtered=%s min_area=%.8f max_area=%.8f biggest_area=%.8f",
+                waterCreated,
+                waterDeleted,
+                area_filtered_count,
+                min_area_effective,
+                _rock_max_area(),
+                biggestArea,
+            )
         dropped_fragment_count = 0
         smallest_kept_area = None
         if kind == "WATER":
@@ -8002,6 +8020,34 @@ def build_coloring_layer(map,kind = "WATER"):
 
         #recalculate normals again after the Boolean operation
         recalculateNormals(merged_object)
+
+        if kind == "ROCK" and _is_valid_blender_object(merged_object) and len(merged_object.data.polygons) == 0:
+            module_logger.warning(
+                "Rock merged object has zero polygons after map intersection object=%s objects_created=%s objects_kept=%s min_area=%.8f max_area=%.8f biggest_area=%.8f",
+                merged_object.name,
+                waterCreated,
+                len(created_objects),
+                min_area_effective,
+                _rock_max_area(),
+                biggestArea,
+            )
+            mesh_data = merged_object.data
+            _debug_preserve_object_if_enabled(
+                merged_object,
+                _format_debug_step_name("ROCK", "POST_BOOLEAN", "EMPTY"),
+                kind="ROCK",
+            )
+            bpy.data.objects.remove(merged_object, do_unlink=True)
+            bpy.data.meshes.remove(mesh_data)
+            return _build_empty_coloring_layer_artifact(
+                kind,
+                objects_created=waterCreated,
+                objects_ignored=waterDeleted,
+                relation_member_ways_skipped=relation_member_ways_skipped,
+                body_way_duplicates_skipped=body_way_duplicates_skipped,
+                standalone_ways_rendered=standalone_ways_rendered,
+                relation_member_way_ids=len(relation_member_way_ids),
+            )
 
         #Disabled for now
         if col_KeepManifold == 0 and 1 == 0:
@@ -8297,6 +8343,23 @@ def _layer_objects_for_kind(layer_objects, kind):
     return [obj] if _is_valid_blender_object(obj) else []
 
 
+def _object_polygon_count(obj):
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data:
+        return 0
+    return len(obj.data.polygons)
+
+
+def _objects_xy_overlap(map_obj, layer_objects):
+    map_bbox = _xy_bbox_for_points(_world_vertices_for_object(map_obj))
+    if not map_bbox:
+        return False
+    for obj in layer_objects or []:
+        obj_bbox = _xy_bbox_for_points(_world_vertices_for_object(obj))
+        if _xy_bboxes_overlap(map_bbox, obj_bbox):
+            return True
+    return False
+
+
 def _island_objects_for_water_layer(layer_objects):
     water_layer = layer_objects.get("WATER") if layer_objects else None
     return water_layer.get("island_objects") if water_layer else []
@@ -8413,19 +8476,46 @@ def batch_paint_coloring_layers(map_obj, layer_objects):
         return {}
 
     island_objects = _island_objects_for_water_layer(layer_objects)
+    rock_objects = _layer_objects_for_kind(layer_objects, "ROCK")
     paint_entries = [
         _make_paint_entry("WATER", "WATER", _layer_objects_for_kind(layer_objects, "WATER")),
         _make_paint_entry("WATER_ISLANDS", "BASE", island_objects),
         _make_paint_entry("FOREST", "FOREST", _layer_objects_for_kind(layer_objects, "FOREST")),
         _make_paint_entry("CITY", "CITY", _layer_objects_for_kind(layer_objects, "CITY")),
         _make_paint_entry("GLACIER", "GLACIER", _layer_objects_for_kind(layer_objects, "GLACIER")),
-        _make_paint_entry("ROCK", "ROCK", _layer_objects_for_kind(layer_objects, "ROCK")),
+        _make_paint_entry("ROCK", "ROCK", rock_objects),
         _make_paint_entry("BUILDING", "BUILDING", _layer_objects_for_kind(layer_objects, "BUILDING")),
         _make_paint_entry("ROAD", "ROAD", _layer_objects_for_kind(layer_objects, "ROAD")),
         _make_paint_entry("BOUNDARY", "BOUNDARY", _layer_objects_for_kind(layer_objects, "BOUNDARY")),
     ]
 
     metrics = paint_map_faces_by_layers(map_obj, paint_entries)
+    if rock_objects:
+        rock_metrics = metrics.get("ROCK", {})
+        rock_source_polygons = sum(_object_polygon_count(obj) for obj in rock_objects)
+        rock_xy_overlap = _objects_xy_overlap(map_obj, rock_objects)
+        module_logger.info(
+            "Rock batch paint diagnostics map=%s source_objects=%s source_polygons=%s xy_overlap=%s faces_checked_up=%s faces_colored=%s ray_hits=%s projected_vertex_hits=%s",
+            getattr(map_obj, "name", None),
+            len(rock_objects),
+            rock_source_polygons,
+            rock_xy_overlap,
+            rock_metrics.get("faces_checked_up"),
+            rock_metrics.get("faces_colored"),
+            rock_metrics.get("ray_hits"),
+            rock_metrics.get("projected_vertex_hits"),
+        )
+        if int(rock_metrics.get("faces_colored", 0) or 0) == 0:
+            module_logger.warning(
+                "Rock layer produced a valid paint source but colored zero terrain faces map=%s source_objects=%s source_polygons=%s xy_overlap=%s faces_checked_up=%s ray_hits=%s projected_vertex_hits=%s",
+                getattr(map_obj, "name", None),
+                len(rock_objects),
+                rock_source_polygons,
+                rock_xy_overlap,
+                rock_metrics.get("faces_checked_up"),
+                rock_metrics.get("ray_hits"),
+                rock_metrics.get("projected_vertex_hits"),
+            )
 
     if metrics.get("WATER") and bpy.context.scene.tp3d.col_WaterSpotCleanup:
         _debug_preserve_object_if_enabled(
