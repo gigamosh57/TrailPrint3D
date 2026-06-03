@@ -144,6 +144,7 @@ objCity = None
 objGlacier = None
 objRoad = None
 objBoundary = None
+objRock = None
 
 # Define a path to store the counter data
 counter_file = os.path.join(bpy.utils.user_resource('CONFIG'), "api_request_counter.json")
@@ -505,6 +506,10 @@ class MyProperties(bpy.types.PropertyGroup):
     col_glActive: bpy.props.BoolProperty(name="Include Glaciers", default=False, description = "Include Glaciers (If there are any)")
     col_glArea: bpy.props.FloatProperty(name="Glacier Size Treshold", default = 1, description = "Glaciers smaller than the treshold wont be included")
     col_glMaxRequests: bpy.props.IntProperty(name="Glacier OSM Tile Budget", default = 300, min = 1, max = 5000, description = "Maximum number of OSM tile requests for glaciers before aborting")
+    col_rockActive: bpy.props.BoolProperty(name="Include Rock Features", default=False, description="Include exposed rock, cliffs, scree, blockfields, boulders, and mapped geologic outcrops from OSM")
+    col_rockArea: bpy.props.FloatProperty(name="Rock Size Treshold", default=0.25, min=0.0, description="Rock polygons smaller than the threshold wont be included")
+    col_rockMaxArea: bpy.props.FloatProperty(name="Rock Max Size", default=0.0, min=0.0, description="Rock polygons larger than this value wont be included. Set 0 to disable the maximum size filter.")
+    col_rockWidth: bpy.props.FloatProperty(name="Rock Line Buffer Size", default=0.12, min=0.01, max=10.0, description="Paint width for linear rock features such as cliffs and ridges")
     col_rActive: bpy.props.BoolProperty(name="Include Roads", default=False, description="Include OSM roads as a dark gray painted layer")
     col_rWidth: bpy.props.FloatProperty(name="Road Buffer Size", default=0.15, min=0.01, max=10.0, description="Base road paint width in map units. Major roads are buffered wider and minor roads narrower.")
     col_rMinType: bpy.props.EnumProperty(
@@ -945,7 +950,7 @@ class MY_OT_thicken(bpy.types.Operator):
             # Check if the custom property 'Object type' exists
             if "Object type" in zobj:
                 print(zobj.name)
-                if zobj["Object type"] in {"TRAIL", "WATER", "FOREST", "CITY", "BUILDING", "GLACIER", "ROAD", "BOUNDARY"}:
+                if zobj["Object type"] in {"TRAIL", "WATER", "FOREST", "CITY", "BUILDING", "GLACIER", "ROAD", "BOUNDARY", "ROCK"}:
                     zobj.location.z += val
                 elif zobj["Object type"] == "MAP" :
                     zobj.select_set(True)
@@ -1764,6 +1769,12 @@ class MY_PT_Advanced(bpy.types.Panel):
             box.prop(props, "col_glActive")
             box.prop(props, "col_glArea")
             box.prop(props, "col_glMaxRequests")
+            box = boxer.box()
+            box.label(text = "Rock Features")
+            box.prop(props, "col_rockActive")
+            box.prop(props, "col_rockArea")
+            box.prop(props, "col_rockMaxArea")
+            box.prop(props, "col_rockWidth")
             box = boxer.box()
             box.label(text = "Roads")
             box.prop(props, "col_rActive")
@@ -2953,6 +2964,41 @@ def setupColors():
 
     # Set base color
     bsdf.inputs["Base Color"].default_value = (0.45, 0.12, 0.85, 1.0)
+
+    #-------------------------------------------------------------------------------------------------------------------
+
+
+    #Create or get gray rock material
+    mat_name = "ROCK"
+    if mat_name not in bpy.data.materials:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+    else:
+        mat = bpy.data.materials[mat_name]
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    # Find Principled BSDF by type
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+    # If none exists, create one
+    if not bsdf:
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+
+    # Find Material Output
+    output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if not output:
+        output = nodes.new(type="ShaderNodeOutputMaterial")
+        output.location = (300, 0)
+
+    # Connect BSDF → Output
+    if not bsdf.outputs["BSDF"].is_linked:
+        links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+    # Set base color
+    bsdf.inputs["Base Color"].default_value = (0.38, 0.36, 0.33, 1.0)
 
     #-------------------------------------------------------------------------------------------------------------------
 
@@ -5560,6 +5606,37 @@ def _boundary_should_create_fills():
     return _boundary_render_mode() in {"FILL", "BOTH"}
 
 
+def _rock_max_area():
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    try:
+        return max(0.0, float(getattr(props, "col_rockMaxArea", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rock_buffer_width():
+    props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
+    try:
+        return max(0.01, float(getattr(props, "col_rockWidth", 0.12) or 0.12))
+    except (TypeError, ValueError):
+        return 0.12
+
+
+def _feature_exceeds_max_area(kind, area):
+    if kind != "ROCK":
+        return False
+    max_area = _rock_max_area()
+    return max_area > 0.0 and float(area or 0.0) > max_area
+
+
+def _is_rock_line_feature(tags):
+    tags = tags or {}
+    return (
+        tags.get("natural") in {"cliff", "ridge"}
+        or tags.get("geological") in {"outcrop", "rock"}
+    )
+
+
 def _osm_selector_lines(kind, south, west, north, east):
     if kind == "WATER":
         return [
@@ -5580,6 +5657,11 @@ def _osm_selector_lines(kind, south, west, north, east):
         return [f'nwr["building"]({south},{west},{north},{east});']
     if kind == "GLACIER":
         return [f'nwr["natural"="glacier"]({south},{west},{north},{east});']
+    if kind == "ROCK":
+        return [
+            f'nwr["natural"~"^(bare_rock|rock|stone|scree|blockfield|cliff|ridge)$"]({south},{west},{north},{east});',
+            f'nwr["geological"~"^(outcrop|rock|moraine)$"]({south},{west},{north},{east});',
+        ]
     if kind == "ROAD":
         props = getattr(getattr(bpy.context, "scene", None), "tp3d", None)
         road_min_type = getattr(props, "col_rMinType", "MAIN")
@@ -7085,6 +7167,8 @@ def build_coloring_layer(map,kind = "WATER"):
         col_Area = (bpy.context.scene.tp3d.col_bArea)
     if kind == "GLACIER":
         col_Area = (bpy.context.scene.tp3d.col_glArea)
+    if kind == "ROCK":
+        col_Area = (bpy.context.scene.tp3d.col_rockArea)
     if kind == "ROAD":
         col_Area = 0.0
     if kind == "BOUNDARY":
@@ -7095,12 +7179,14 @@ def build_coloring_layer(map,kind = "WATER"):
     should_process_water_islands = (kind == "WATER" and process_islands)
     min_area_effective = _compute_effective_min_area(kind, col_Area)
     module_logger.info(
-        "OSM layer build start kind=%s map=%s active=True paint_map=%s min_area=%.8f effective_min_area=%.8f",
+        "OSM layer build start kind=%s map=%s active=True paint_map=%s min_area=%.8f effective_min_area=%.8f max_area=%.8f line_width=%.4f",
         kind,
         getattr(map, "name", None),
         col_PaintMap,
         col_Area,
         min_area_effective,
+        _rock_max_area() if kind == "ROCK" else 0.0,
+        _rock_buffer_width() if kind == "ROCK" else 0.0,
     )
 
     global exportformat
@@ -7228,6 +7314,35 @@ def build_coloring_layer(map,kind = "WATER"):
                         waterway_way_count,
                         water_polygon_count,
                     )
+                if kind == "ROCK":
+                    rock_tag_counts = {}
+                    rock_node_count = 0
+                    rock_way_count = 0
+                    rock_relation_count = 0
+                    for el in filtered_elements:
+                        tags = el.get("tags") or {}
+                        tag_value = tags.get("natural") or tags.get("geological")
+                        if tag_value:
+                            rock_tag_counts[tag_value] = rock_tag_counts.get(tag_value, 0) + 1
+                        if el.get("type") == "node":
+                            rock_node_count += 1
+                        elif el.get("type") == "way":
+                            rock_way_count += 1
+                        elif el.get("type") == "relation":
+                            rock_relation_count += 1
+                    module_logger.info(
+                        "OSM rock feature telemetry tile=%s/%s bbox=%s nodes=%s ways=%s relations=%s tag_counts=%s min_area=%.8f max_area=%.8f line_width=%.4f",
+                        idx,
+                        len(bboxes),
+                        bbox,
+                        rock_node_count,
+                        rock_way_count,
+                        rock_relation_count,
+                        rock_tag_counts,
+                        min_area_effective,
+                        _rock_max_area(),
+                        _rock_buffer_width(),
+                    )
                 nodes = build_osm_nodes({"elements": filtered_elements})
                 bodies = [] if kind == "ROAD" else extract_multipolygon_bodies(filtered_elements, nodes)
                 #print(f"Nodes: {len(nodes)}, Bodies: {len(bodies)}")
@@ -7259,6 +7374,24 @@ def build_coloring_layer(map,kind = "WATER"):
                     normalization_diagnostics = normalized_relation["diagnostics"]
                     outer_rejections_by_reason = normalization_diagnostics["rejected"].get("outer", {})
                     inner_rejections_by_reason = normalization_diagnostics["rejected"].get("inner", {})
+                    if kind == "ROCK" and _rock_max_area() > 0.0:
+                        size_filtered_outers = []
+                        for outer in normalized_outer_polygons:
+                            outer_area = outer.get("area") or calculate_polygon_area_2d(outer.get("coordinates", []))
+                            if _feature_exceeds_max_area(kind, outer_area):
+                                waterDeleted += 1
+                                module_logger.debug(
+                                    "Rock multipolygon outer skipped by max size relation=%s outer_idx=%s area=%.8f max_area=%.8f bbox=%s holes=%s",
+                                    relation_id,
+                                    outer.get("index"),
+                                    outer_area,
+                                    _rock_max_area(),
+                                    outer.get("bbox"),
+                                    len(outer.get("holes", [])),
+                                )
+                                continue
+                            size_filtered_outers.append(outer)
+                        normalized_outer_polygons = size_filtered_outers
                     valid_outers = [outer["coordinates"] for outer in normalized_outer_polygons]
                     valid_inners = [hole for outer in normalized_outer_polygons for hole in outer.get("holes", [])]
 
@@ -7609,6 +7742,24 @@ def build_coloring_layer(map,kind = "WATER"):
                             )
                         else:
                             waterDeleted += 1
+                    elif kind == "ROCK" and not is_closed_way and _is_rock_line_feature(tags):
+                        rock_width = _rock_buffer_width()
+                        tobj = col_create_buffered_line_mesh(f"RockLineObject_{i}", coords, rock_width)
+                        if tobj:
+                            tobj["tp3d_ignore_area_filter"] = True
+                            created_objects.append(tobj)
+                            waterCreated += 1
+                            standalone_ways_rendered += 1
+                            module_logger.debug(
+                                "Rock line feature buffered way_id=%s natural=%s geological=%s node_count=%s width=%.4f",
+                                element.get("id"),
+                                tags.get("natural"),
+                                tags.get("geological"),
+                                len(coords),
+                                rock_width,
+                            )
+                        else:
+                            waterDeleted += 1
                     elif kind == "BOUNDARY" and _boundary_should_create_outlines():
                         boundary_width = _boundary_buffer_width()
                         tobj = col_create_buffered_line_mesh(f"BoundaryObject_{i}", coords, boundary_width)
@@ -7625,6 +7776,17 @@ def build_coloring_layer(map,kind = "WATER"):
                         else:
                             waterDeleted += 1
                     elif is_closed_way:
+                        if _feature_exceeds_max_area(kind, tArea):
+                            waterDeleted += 1
+                            module_logger.debug(
+                                "OSM closed way skipped by max size kind=%s way_id=%s area=%.8f max_area=%.8f tags=%s",
+                                kind,
+                                element.get("id"),
+                                tArea,
+                                _rock_max_area() if kind == "ROCK" else 0.0,
+                                tags,
+                            )
+                            continue
                         if tArea < min_area_effective:
                             waterDeleted += 1
                             continue
@@ -7681,7 +7843,8 @@ def build_coloring_layer(map,kind = "WATER"):
             #print(f"Area: {area}")
             if area > biggestArea:
                 biggestArea = area
-            if kind == "ROAD" or (kind == "BOUNDARY" and _boundary_should_create_outlines()) or area >= min_area_effective:
+            ignore_area_filter = bool(tobj.get("tp3d_ignore_area_filter", False))
+            if kind == "ROAD" or (kind == "BOUNDARY" and _boundary_should_create_outlines()) or ignore_area_filter or area >= min_area_effective:
                 found = 1
                 tobj.select_set(True)
                 ctx.view_layer.objects.active = tobj
@@ -8147,6 +8310,7 @@ def batch_paint_coloring_layers(map_obj, layer_objects):
         _make_paint_entry("FOREST", "FOREST", _layer_objects_for_kind(layer_objects, "FOREST")),
         _make_paint_entry("CITY", "CITY", _layer_objects_for_kind(layer_objects, "CITY")),
         _make_paint_entry("GLACIER", "GLACIER", _layer_objects_for_kind(layer_objects, "GLACIER")),
+        _make_paint_entry("ROCK", "ROCK", _layer_objects_for_kind(layer_objects, "ROCK")),
         _make_paint_entry("BUILDING", "BUILDING", _layer_objects_for_kind(layer_objects, "BUILDING")),
         _make_paint_entry("ROAD", "ROAD", _layer_objects_for_kind(layer_objects, "ROAD")),
         _make_paint_entry("BOUNDARY", "BOUNDARY", _layer_objects_for_kind(layer_objects, "BOUNDARY")),
@@ -8841,7 +9005,7 @@ def build_terrain_surface(map_obj):
 def collect_osm_layers(map_obj):
     """Collect all requested OSM coloring layers before painting the map.
 
-    Water, forest, city, building, and glacier layers are built independently so the
+    Water, forest, city, building, glacier, rock, road, and boundary layers are built independently so the
     updated coloring pipeline can paint the base material once, apply water,
     restore island/base areas, and then apply overlay layers in a stable order.
     """
@@ -8853,16 +9017,18 @@ def collect_osm_layers(map_obj):
     include_city = bool(getattr(props, "col_cActive", False))
     include_building = bool(getattr(props, "col_bActive", False))
     include_glacier = bool(getattr(props, "col_glActive", False))
+    include_rock = bool(getattr(props, "col_rockActive", False))
     include_road = bool(getattr(props, "col_rActive", False))
     include_boundary = bool(getattr(props, "col_boundaryActive", False))
     module_logger.info(
-        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s BOUNDARY=%s",
+        "OSM layer collection start map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROCK=%s ROAD=%s BOUNDARY=%s",
         getattr(map_obj, "name", None),
         include_water,
         include_forest,
         include_city,
         include_building,
         include_glacier,
+        include_rock,
         include_road,
         include_boundary,
     )
@@ -8877,18 +9043,21 @@ def collect_osm_layers(map_obj):
         layers["BUILDING"] = build_coloring_layer(map_obj, "BUILDING")
     if include_glacier:
         layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
+    if include_rock:
+        layers["ROCK"] = build_coloring_layer(map_obj, "ROCK")
     if include_road:
         layers["ROAD"] = build_coloring_layer(map_obj, "ROAD")
     if include_boundary:
         layers["BOUNDARY"] = build_coloring_layer(map_obj, "BOUNDARY")
     module_logger.info(
-        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s BOUNDARY=%s",
+        "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROCK=%s ROAD=%s BOUNDARY=%s",
         getattr(map_obj, "name", None),
         bool(layers.get("WATER")),
         bool(layers.get("FOREST")),
         bool(layers.get("CITY")),
         bool(layers.get("BUILDING")),
         bool(layers.get("GLACIER")),
+        bool(layers.get("ROCK")),
         bool(layers.get("ROAD")),
         bool(layers.get("BOUNDARY")),
     )
@@ -8953,6 +9122,7 @@ def apply_overlay_layers(map_obj, layer_objects):
         "FOREST": paint_coloring_layer(map_obj, layer_objects.get("FOREST")),
         "CITY": paint_coloring_layer(map_obj, layer_objects.get("CITY")),
         "GLACIER": paint_coloring_layer(map_obj, layer_objects.get("GLACIER")),
+        "ROCK": paint_coloring_layer(map_obj, layer_objects.get("ROCK")),
         "BUILDING": paint_coloring_layer(map_obj, layer_objects.get("BUILDING")),
         "ROAD": paint_coloring_layer(map_obj, layer_objects.get("ROAD")),
         "BOUNDARY": paint_coloring_layer(map_obj, layer_objects.get("BOUNDARY")),
@@ -8964,18 +9134,19 @@ def run_layer_pipeline(map_obj):
 
     The order is intentional: reset the whole map to BASE, paint water, repaint
     processed water islands as BASE, then paint forest, city, glacier, building,
-    road, and boundary overlays. This keeps islands visible while allowing later overlays to win
+    rock, road, and boundary overlays. This keeps islands visible while allowing later overlays to win
     where they overlap the terrain.
     """
     apply_land_base(map_obj)
     layer_objects = collect_osm_layers(map_obj)
     module_logger.info(
-        "Layer paint routing | WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROAD=%s BOUNDARY=%s via=paint_coloring_layer->color_map_faces_by_terrain",
+        "Layer paint routing | WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROCK=%s ROAD=%s BOUNDARY=%s via=paint_coloring_layer->color_map_faces_by_terrain",
         bool(layer_objects.get("WATER")),
         bool(layer_objects.get("FOREST")),
         bool(layer_objects.get("CITY")),
         bool(layer_objects.get("BUILDING")),
         bool(layer_objects.get("GLACIER")),
+        bool(layer_objects.get("ROCK")),
         bool(layer_objects.get("ROAD")),
         bool(layer_objects.get("BOUNDARY")),
     )
@@ -8988,6 +9159,7 @@ def run_layer_pipeline(map_obj):
             "CITY": None,
             "BUILDING": None,
             "GLACIER": None,
+            "ROCK": None,
             "ROAD": None,
             "BOUNDARY": None,
         }
@@ -9391,6 +9563,10 @@ def writeMetadata(obj, type = "MAP"):
         obj["col_bArea"] = bpy.context.scene.tp3d.col_bArea
         obj["col_glActive"] = bpy.context.scene.tp3d.col_glActive
         obj["col_glArea"] = bpy.context.scene.tp3d.col_glArea
+        obj["col_rockActive"] = bpy.context.scene.tp3d.col_rockActive
+        obj["col_rockArea"] = bpy.context.scene.tp3d.col_rockArea
+        obj["col_rockMaxArea"] = bpy.context.scene.tp3d.col_rockMaxArea
+        obj["col_rockWidth"] = bpy.context.scene.tp3d.col_rockWidth
         obj["col_rActive"] = bpy.context.scene.tp3d.col_rActive
         obj["col_rWidth"] = bpy.context.scene.tp3d.col_rWidth
         obj["col_rMinType"] = bpy.context.scene.tp3d.col_rMinType
@@ -9409,7 +9585,7 @@ def writeMetadata(obj, type = "MAP"):
 
         obj["overwritePathElevation"] = bpy.context.scene.tp3d.overwritePathElevation
     
-    if type in {"CITY", "WATER", "FOREST", "BUILDING", "GLACIER", "ROAD", "BOUNDARY"}:
+    if type in {"CITY", "WATER", "FOREST", "BUILDING", "GLACIER", "ROCK", "ROAD", "BOUNDARY"}:
         obj["Object type"] = type
         obj["Addon"] = category
         obj["Version"] = str(AddonVersion[0]) + "," + str(AddonVersion[1])
@@ -10180,13 +10356,14 @@ def runGeneration(type):
     
     
     layer_pipeline_result = run_layer_pipeline(obj)
-    global objWater, objForest, objCity, objBuilding, objGlacier, objRoad, objBoundary
+    global objWater, objForest, objCity, objBuilding, objGlacier, objRock, objRoad, objBoundary
     objWater = layer_pipeline_result["water"]
     overlay_layers = layer_pipeline_result["overlays"]
     objForest = overlay_layers.get("FOREST")
     objCity = overlay_layers.get("CITY")
     objBuilding = overlay_layers.get("BUILDING")
     objGlacier = overlay_layers.get("GLACIER")
+    objRock = overlay_layers.get("ROCK")
     objRoad = overlay_layers.get("ROAD")
     objBoundary = overlay_layers.get("BOUNDARY")
 
