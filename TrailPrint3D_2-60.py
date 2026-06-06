@@ -7949,14 +7949,77 @@ def build_coloring_layer(map,kind = "WATER"):
 
 
         #SETUP FOR MODIFIERS
-        
+
+        map_min_z_for_boolean, map_max_z_for_boolean = _world_mesh_z_range_from_vertices(map)
+        source_min_z_initial, source_max_z_initial = _world_mesh_z_range_from_vertices(merged_object)
+        source_min_z_pre_boolean = None
+        source_max_z_pre_boolean = None
+        z_ranges_overlap_pre_boolean = False
+        vertical_padding = 1.0
+        extrusion_height = 200.0
+        used_terrain_z_bounds = (
+            map_min_z_for_boolean is not None
+            and map_max_z_for_boolean is not None
+            and source_min_z_initial is not None
+            and source_max_z_initial is not None
+        )
+
+        if used_terrain_z_bounds:
+            map_z_range = max(0.0, map_max_z_for_boolean - map_min_z_for_boolean)
+            vertical_padding = max(1.0, map_z_range * 0.05)
+            target_bottom_z = map_min_z_for_boolean - vertical_padding
+            target_top_z = map_max_z_for_boolean + vertical_padding
+            source_initial_thickness = max(0.0, source_max_z_initial - source_min_z_initial)
+
+            merged_object.location.z += target_bottom_z - source_min_z_initial
+            extrusion_height = max(0.001, (target_top_z - target_bottom_z) - source_initial_thickness)
+        else:
+            module_logger.warning(
+                "OSM layer %s could not derive terrain/source world Z bounds; using legacy extrusion height kind=%s map_z_range=(%s,%s) source_z_range=(%s,%s)",
+                getattr(merged_object, "name", None),
+                kind,
+                map_min_z_for_boolean,
+                map_max_z_for_boolean,
+                source_min_z_initial,
+                source_max_z_initial,
+            )
+
         bpy.context.view_layer.objects.active = merged_object
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
         bpy.ops.mesh.extrude_region_move()
-        bpy.ops.transform.translate(value=(0, 0, 200))#bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.transform.translate(value=(0, 0, extrusion_height))#bpy.ops.mesh.select_all(action='DESELECT')
         bpy.ops.object.mode_set(mode='OBJECT')
-        merged_object.location.z -= 1
+
+        if used_terrain_z_bounds:
+            source_min_z_pre_boolean, source_max_z_pre_boolean = _world_mesh_z_range_from_vertices(merged_object)
+        else:
+            merged_object.location.z -= 1
+            source_min_z_pre_boolean, source_max_z_pre_boolean = _world_mesh_z_range_from_vertices(merged_object)
+
+        z_ranges_overlap_pre_boolean = (
+            source_min_z_pre_boolean is not None
+            and source_max_z_pre_boolean is not None
+            and map_min_z_for_boolean is not None
+            and map_max_z_for_boolean is not None
+            and source_min_z_pre_boolean <= map_max_z_for_boolean
+            and source_max_z_pre_boolean >= map_min_z_for_boolean
+        )
+
+        if kind == "ROCK":
+            module_logger.info(
+                "Rock source terrain Z diagnostics object=%s source_initial_z_range=(%s,%s) source_pre_boolean_z_range=(%s,%s) map_z_range=(%s,%s) extrusion_height=%.6f padding=%.6f ranges_overlap_pre_boolean=%s",
+                getattr(merged_object, "name", None),
+                source_min_z_initial,
+                source_max_z_initial,
+                source_min_z_pre_boolean,
+                source_max_z_pre_boolean,
+                map_min_z_for_boolean,
+                map_max_z_for_boolean,
+                extrusion_height,
+                vertical_padding,
+                z_ranges_overlap_pre_boolean,
+            )
 
 
         #Add Decimate modifier
@@ -8023,13 +8086,22 @@ def build_coloring_layer(map,kind = "WATER"):
 
         if kind == "ROCK" and _is_valid_blender_object(merged_object) and len(merged_object.data.polygons) == 0:
             module_logger.warning(
-                "Rock merged object has zero polygons after map intersection object=%s objects_created=%s objects_kept=%s min_area=%.8f max_area=%.8f biggest_area=%.8f",
+                "Rock merged object has zero polygons after map intersection object=%s objects_created=%s objects_kept=%s min_area=%.8f max_area=%.8f biggest_area=%.8f source_initial_z_range=(%s,%s) source_pre_boolean_z_range=(%s,%s) map_z_range=(%s,%s) extrusion_height=%.6f padding=%.6f ranges_overlap_pre_boolean=%s",
                 merged_object.name,
                 waterCreated,
                 len(created_objects),
                 min_area_effective,
                 _rock_max_area(),
                 biggestArea,
+                source_min_z_initial,
+                source_max_z_initial,
+                source_min_z_pre_boolean,
+                source_max_z_pre_boolean,
+                map_min_z_for_boolean,
+                map_max_z_for_boolean,
+                extrusion_height,
+                vertical_padding,
+                z_ranges_overlap_pre_boolean,
             )
             mesh_data = merged_object.data
             _debug_preserve_object_if_enabled(
@@ -8663,6 +8735,16 @@ def _mesh_z_range(obj):
     if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data.vertices:
         return None, None
     zs = [v.co.z for v in obj.data.vertices]
+    return min(zs), max(zs)
+
+
+def _world_mesh_z_range_from_vertices(obj):
+    """Return world-space min/max Z using mesh vertices transformed by matrix_world."""
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data or not obj.data.vertices:
+        return None, None
+
+    world_matrix = obj.matrix_world
+    zs = [(world_matrix @ v.co).z for v in obj.data.vertices]
     return min(zs), max(zs)
 
 
