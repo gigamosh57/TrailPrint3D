@@ -8153,6 +8153,19 @@ def build_coloring_layer(map,kind = "WATER"):
     }
 
 
+def _paint_up_threshold_for_kind(kind):
+    """Return the terrain-face normal threshold used while painting a layer.
+
+    Most projected OSM layers should only color top-facing terrain, but rock
+    features often describe steep rock faces or cliffs.  Allow near-vertical
+    faces for ROCK so an otherwise valid temporary rock overlay can paint the
+    visible terrain wall beneath it.
+    """
+    if kind == "ROCK":
+        return -0.05
+    return 0.05
+
+
 def paint_coloring_layer(map_obj, layer_artifact):
     if not layer_artifact:
         return None
@@ -8171,12 +8184,19 @@ def paint_coloring_layer(map_obj, layer_artifact):
     )
 
     if col_PaintMap and _is_valid_blender_object(merged_object):
-        paint_metrics = color_map_faces_by_terrain(map_obj, merged_object, return_metrics=True) or {}
+        paint_up_threshold = _paint_up_threshold_for_kind(kind)
+        paint_metrics = color_map_faces_by_terrain(
+            map_obj,
+            merged_object,
+            up_threshold=paint_up_threshold,
+            return_metrics=True,
+        ) or {}
         module_logger.info(
-            "Layer paint metrics kind=%s map=%s terrain=%s faces_colored=%s faces_checked_up=%s ray_hits=%s material_name_used=%s",
+            "Layer paint metrics kind=%s map=%s terrain=%s up_threshold=%.4f faces_colored=%s faces_checked_up=%s ray_hits=%s material_name_used=%s",
             kind,
             getattr(map_obj, "name", None),
             merged_object.name,
+            paint_up_threshold,
             paint_metrics.get("faces_colored"),
             paint_metrics.get("faces_checked_up"),
             paint_metrics.get("ray_hits"),
