@@ -8350,6 +8350,40 @@ def _xy_bbox_for_points(points):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def _format_xy_bbox(bbox):
+    if not bbox:
+        return None
+    return tuple(round(float(v), 6) for v in bbox)
+
+
+def _union_xy_bbox(bboxes):
+    valid = [bbox for bbox in bboxes if bbox]
+    if not valid:
+        return None
+    return (
+        min(bbox[0] for bbox in valid),
+        min(bbox[1] for bbox in valid),
+        max(bbox[2] for bbox in valid),
+        max(bbox[3] for bbox in valid),
+    )
+
+
+def _mesh_debug_summary(obj):
+    if not _is_valid_blender_object(obj):
+        return {"valid": False, "name": getattr(obj, "name", None)}
+    data = getattr(obj, "data", None)
+    world_vertices = _world_vertices_for_object(obj) if getattr(obj, "type", None) == 'MESH' else []
+    return {
+        "valid": True,
+        "name": getattr(obj, "name", None),
+        "type": getattr(obj, "type", None),
+        "verts": len(getattr(data, "vertices", []) or []),
+        "polys": len(getattr(data, "polygons", []) or []),
+        "materials": [mat.name for mat in getattr(data, "materials", []) if mat] if data else [],
+        "xy_bbox": _format_xy_bbox(_xy_bbox_for_points(world_vertices)),
+    }
+
+
 def _xy_bboxes_overlap(a, b, epsilon=1e-9):
     if not a or not b:
         return False
@@ -8406,26 +8440,73 @@ def _record_projects_inside_face(record, face_points, face_bbox):
 
 
 def _make_paint_entry(kind, material_name, objects):
+    entry_start = time.perf_counter()
     valid_objects = [obj for obj in (objects or []) if _is_valid_blender_object(obj) and obj.type == 'MESH']
+    invalid_count = len(objects or []) - len(valid_objects)
     bvh_records = []
+    module_logger.info(
+        "Layer paint entry build start kind=%s material=%s objects_total=%s valid_mesh_objects=%s invalid_objects=%s",
+        kind,
+        material_name,
+        len(objects or []),
+        len(valid_objects),
+        invalid_count,
+    )
     for obj in valid_objects:
+        object_start = time.perf_counter()
+        world_vertices = _world_vertices_for_object(obj)
+        xy_bbox = _xy_bbox_for_points(world_vertices)
+        module_logger.info(
+            "Layer paint entry object inspect kind=%s object=%s verts=%s polys=%s xy_bbox=%s",
+            kind,
+            getattr(obj, "name", None),
+            len(getattr(obj.data, "vertices", []) or []) if obj.data else 0,
+            len(getattr(obj.data, "polygons", []) or []) if obj.data else 0,
+            _format_xy_bbox(xy_bbox),
+        )
         bvh = _build_world_bvh_for_object(obj)
         if bvh is not None:
-            world_vertices = _world_vertices_for_object(obj)
             bvh_records.append({
                 "object": obj,
                 "bvh": bvh,
                 "world_vertices": world_vertices,
-                "xy_bbox": _xy_bbox_for_points(world_vertices),
+                "xy_bbox": xy_bbox,
             })
+            module_logger.info(
+                "Layer paint entry object BVH built kind=%s object=%s duration=%.3fs",
+                kind,
+                getattr(obj, "name", None),
+                time.perf_counter() - object_start,
+            )
+        else:
+            module_logger.warning(
+                "Layer paint entry object skipped without BVH kind=%s object=%s duration=%.3fs",
+                kind,
+                getattr(obj, "name", None),
+                time.perf_counter() - object_start,
+            )
+
+    entry_bbox = _union_xy_bbox([record.get("xy_bbox") for record in bvh_records])
+    module_logger.info(
+        "Layer paint entry build complete kind=%s material=%s bvh_count=%s combined_xy_bbox=%s duration=%.3fs",
+        kind,
+        material_name,
+        len(bvh_records),
+        _format_xy_bbox(entry_bbox),
+        time.perf_counter() - entry_start,
+    )
     return {
         "kind": kind,
         "material_name": material_name,
         "objects": valid_objects,
         "bvh_records": bvh_records,
+        "xy_bbox": entry_bbox,
         "faces_colored": 0,
         "ray_hits": 0,
         "projected_vertex_hits": 0,
+        "bbox_skipped_faces": 0,
+        "bbox_skipped_records": 0,
+        "ray_tests": 0,
     }
 
 
@@ -8485,42 +8566,95 @@ def _cleanup_painted_layer_sources(layer_objects):
 
 
 def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
+    paint_start = time.perf_counter()
     if not _is_valid_blender_object(map_obj) or map_obj.type != 'MESH':
+        module_logger.warning(
+            "Batch layer paint skipped invalid map map=%s valid=%s type=%s",
+            getattr(map_obj, "name", None),
+            _is_valid_blender_object(map_obj),
+            getattr(map_obj, "type", None),
+        )
         return {}
 
     active_entries = [entry for entry in paint_entries if entry.get("bvh_records")]
+    inactive_entries = [entry for entry in paint_entries if not entry.get("bvh_records")]
+    map_bbox = _xy_bbox_for_points(_world_vertices_for_object(map_obj))
+    module_logger.info(
+        "Batch layer paint start map=%s faces=%s verts=%s up_threshold=%.4f map_xy_bbox=%s active_entries=%s inactive_entries=%s entries=%s",
+        getattr(map_obj, "name", None),
+        len(getattr(map_obj.data, "polygons", []) or []),
+        len(getattr(map_obj.data, "vertices", []) or []),
+        up_threshold,
+        _format_xy_bbox(map_bbox),
+        len(active_entries),
+        [entry.get("kind") for entry in inactive_entries],
+        [
+            {
+                "kind": entry.get("kind"),
+                "material": entry.get("material_name"),
+                "objects": len(entry.get("objects", [])),
+                "bvh": len(entry.get("bvh_records", [])),
+                "xy_bbox": _format_xy_bbox(entry.get("xy_bbox")),
+            }
+            for entry in paint_entries
+        ],
+    )
     if not active_entries:
+        module_logger.info("Batch layer paint skipped no active BVH entries map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - paint_start)
         return {}
 
+    recalculate_start = time.perf_counter()
     recalculateNormals(map_obj)
+    module_logger.info("Batch layer paint normals recalculated map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - recalculate_start)
     mesh = map_obj.data
+    material_start = time.perf_counter()
     material_indices = {
         entry["material_name"]: _ensure_material_slot(mesh, entry["material_name"])
         for entry in active_entries
     }
+    module_logger.info("Batch layer paint material slots ready map=%s materials=%s duration=%.3fs", getattr(map_obj, "name", None), material_indices, time.perf_counter() - material_start)
 
+    bmesh_start = time.perf_counter()
     bm = bmesh.new()
     bm.from_mesh(mesh)
     bm.faces.ensure_lookup_table()
+    total_faces = len(bm.faces)
+    module_logger.info("Batch layer paint bmesh ready map=%s faces=%s duration=%.3fs", getattr(map_obj, "name", None), total_faces, time.perf_counter() - bmesh_start)
 
     up = Vector((0, 0, 1))
     map_world = map_obj.matrix_world
     map_direction_matrix = map_world.to_3x3()
     faces_checked_up = 0
+    faces_skipped_by_normal = 0
+    faces_without_bbox_overlap = 0
+    faces_with_hits = 0
+    loop_start = time.perf_counter()
+    next_progress_at = loop_start + 5.0
+    progress_every_faces = max(1000, total_faces // 20) if total_faces else 1000
 
-    for face in bm.faces:
+    for face_index, face in enumerate(bm.faces):
         normal_world = (map_direction_matrix @ face.normal).normalized()
         if normal_world.dot(up) <= up_threshold:
+            faces_skipped_by_normal += 1
             continue
 
         faces_checked_up += 1
         sample_points, face_points = _face_sample_points_world(face, map_world)
         face_bbox = _xy_bbox_for_points(face_points)
         winning_entry = None
+        any_entry_bbox_overlap = False
         for entry in reversed(active_entries):
             hit = False
             projected_vertex_hit = False
+            if not _xy_bboxes_overlap(face_bbox, entry.get("xy_bbox")):
+                entry["bbox_skipped_faces"] += 1
+                continue
+            any_entry_bbox_overlap = True
             for record in entry["bvh_records"]:
+                if not _xy_bboxes_overlap(face_bbox, record.get("xy_bbox")):
+                    entry["bbox_skipped_records"] += 1
+                    continue
+                entry["ray_tests"] += len(sample_points) * 2
                 if _ray_hits_bvh_from_points(record["bvh"], sample_points):
                     hit = True
                     break
@@ -8535,12 +8669,54 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
                 winning_entry = entry
                 break
 
+        if not any_entry_bbox_overlap:
+            faces_without_bbox_overlap += 1
+
         if winning_entry:
             face.material_index = material_indices[winning_entry["material_name"]]
             winning_entry["faces_colored"] += 1
+            faces_with_hits += 1
 
+        now = time.perf_counter()
+        if now >= next_progress_at or (face_index + 1) % progress_every_faces == 0:
+            module_logger.info(
+                "Batch layer paint progress map=%s face=%s/%s checked_up=%s skipped_normal=%s no_bbox_overlap=%s colored=%s elapsed=%.1fs entries=%s",
+                getattr(map_obj, "name", None),
+                face_index + 1,
+                total_faces,
+                faces_checked_up,
+                faces_skipped_by_normal,
+                faces_without_bbox_overlap,
+                faces_with_hits,
+                now - loop_start,
+                {
+                    entry["kind"]: {
+                        "colored": entry["faces_colored"],
+                        "ray_hits": entry["ray_hits"],
+                        "ray_tests": entry.get("ray_tests", 0),
+                        "bbox_skipped_faces": entry.get("bbox_skipped_faces", 0),
+                        "bbox_skipped_records": entry.get("bbox_skipped_records", 0),
+                    }
+                    for entry in active_entries
+                },
+            )
+            next_progress_at = now + 5.0
+
+    module_logger.info(
+        "Batch layer paint face loop complete map=%s faces=%s checked_up=%s skipped_normal=%s no_bbox_overlap=%s colored=%s duration=%.3fs",
+        getattr(map_obj, "name", None),
+        total_faces,
+        faces_checked_up,
+        faces_skipped_by_normal,
+        faces_without_bbox_overlap,
+        faces_with_hits,
+        time.perf_counter() - loop_start,
+    )
+
+    write_start = time.perf_counter()
     bm.to_mesh(mesh)
     bm.free()
+    module_logger.info("Batch layer paint mesh write complete map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - write_start)
 
     metrics = {
         entry["kind"]: {
@@ -8551,13 +8727,18 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
             "material_name_used": entry["material_name"],
             "source_objects": len(entry["objects"]),
             "bvh_count": len(entry["bvh_records"]),
+            "xy_bbox": _format_xy_bbox(entry.get("xy_bbox")),
+            "bbox_skipped_faces": entry.get("bbox_skipped_faces", 0),
+            "bbox_skipped_records": entry.get("bbox_skipped_records", 0),
+            "ray_tests": entry.get("ray_tests", 0),
         }
         for entry in active_entries
     }
     module_logger.info(
-        "Batch layer paint complete map=%s faces_checked_up=%s metrics=%s",
+        "Batch layer paint complete map=%s faces_checked_up=%s duration=%.3fs metrics=%s",
         getattr(map_obj, "name", None),
         faces_checked_up,
+        time.perf_counter() - paint_start,
         metrics,
     )
     return metrics
@@ -9178,15 +9359,37 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     bm.from_mesh(map_mesh)
     bm.faces.ensure_lookup_table()
 
+    paint_start = time.perf_counter()
+    module_logger.info(
+        "Terrain paint start map=%s terrain=%s up_threshold=%.4f map_faces=%s map_verts=%s terrain_faces=%s terrain_verts=%s paint_material_override=%s",
+        getattr(map_obj, "name", None),
+        getattr(terrain_obj, "name", None),
+        up_threshold,
+        len(getattr(map_mesh, "polygons", []) or []),
+        len(getattr(map_mesh, "vertices", []) or []),
+        len(getattr(terrain_mesh, "polygons", []) or []),
+        len(getattr(terrain_mesh, "vertices", []) or []),
+        paint_material_name,
+    )
+
     # Build BVH tree for Terrain in world space
+    bvh_start = time.perf_counter()
     terrain_world = terrain_obj.matrix_world
     verts = [terrain_world @ v.co for v in terrain_mesh.vertices]
     polys = [p.vertices for p in terrain_mesh.polygons]
     bvh = bvhtree.BVHTree.FromPolygons(verts, polys)
+    terrain_bbox = _xy_bbox_for_points(verts)
     terrain_record = {
         "world_vertices": verts,
-        "xy_bbox": _xy_bbox_for_points(verts),
+        "xy_bbox": terrain_bbox,
     }
+    module_logger.info(
+        "Terrain paint BVH built map=%s terrain=%s terrain_xy_bbox=%s duration=%.3fs",
+        getattr(map_obj, "name", None),
+        getattr(terrain_obj, "name", None),
+        _format_xy_bbox(terrain_bbox),
+        time.perf_counter() - bvh_start,
+    )
 
     # Get or create a material for terrain color
     if paint_material_name:
@@ -9217,6 +9420,13 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
     debug_every = max(1, len(bm.faces) // debug_samples)
     map_world = map_obj.matrix_world
     map_direction_matrix = map_world.to_3x3()
+    total_faces = len(bm.faces)
+    faces_skipped_by_normal = 0
+    faces_skipped_by_bbox = 0
+    ray_tests = 0
+    loop_start = time.perf_counter()
+    next_progress_at = loop_start + 5.0
+    progress_every_faces = max(1000, total_faces // 20) if total_faces else 1000
 
     for i, f in enumerate(bm.faces):
         normal_world = (map_direction_matrix @ f.normal).normalized()
@@ -9230,15 +9440,22 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
             primary_ray_dir = Vector((0, 0, 1))
             fallback_ray_dir = Vector((0, 0, -1))
             cast_results = []
-            for sample_point in sample_points:
-                for cast_name, ray_dir in (("up", primary_ray_dir), ("down", fallback_ray_dir)):
-                    loc, norm, idx, dist = bvh.ray_cast(sample_point, ray_dir, 1000)
-                    if loc is not None and dist is not None and dist > 1e-6:
-                        cast_results.append((dist, cast_name, ray_dir, loc, norm, idx))
+            if not _xy_bboxes_overlap(face_bbox, terrain_bbox):
+                faces_skipped_by_bbox += 1
+                loc = norm = idx = dist = None
+                hit_direction_name = None
+                hit_direction_vec = primary_ray_dir
+            else:
+                for sample_point in sample_points:
+                    for cast_name, ray_dir in (("up", primary_ray_dir), ("down", fallback_ray_dir)):
+                        ray_tests += 1
+                        loc, norm, idx, dist = bvh.ray_cast(sample_point, ray_dir, 1000)
+                        if loc is not None and dist is not None and dist > 1e-6:
+                            cast_results.append((dist, cast_name, ray_dir, loc, norm, idx))
 
             if cast_results:
                 dist, hit_direction_name, hit_direction_vec, loc, norm, idx = min(cast_results, key=lambda x: x[0])
-            elif _record_projects_inside_face(terrain_record, face_points, face_bbox):
+            elif _xy_bboxes_overlap(face_bbox, terrain_bbox) and _record_projects_inside_face(terrain_record, face_points, face_bbox):
                 hit_direction_name = "projected_vertex"
                 hit_direction_vec = primary_ray_dir
                 loc = center_world
@@ -9280,6 +9497,39 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
                 # Assign terrain material to this face
                 f.material_index = mat_index
                 colored_count += 1
+        else:
+            faces_skipped_by_normal += 1
+
+        now = time.perf_counter()
+        if now >= next_progress_at or (i + 1) % progress_every_faces == 0:
+            module_logger.info(
+                "Terrain paint progress map=%s terrain=%s face=%s/%s checked_up=%s skipped_normal=%s skipped_bbox=%s colored=%s ray_tests=%s elapsed=%.1fs",
+                getattr(map_obj, "name", None),
+                getattr(terrain_obj, "name", None),
+                i + 1,
+                total_faces,
+                faces_checked_up,
+                faces_skipped_by_normal,
+                faces_skipped_by_bbox,
+                colored_count,
+                ray_tests,
+                now - loop_start,
+            )
+            next_progress_at = now + 5.0
+
+    module_logger.info(
+        "Terrain paint face loop complete map=%s terrain=%s faces=%s checked_up=%s skipped_normal=%s skipped_bbox=%s colored=%s ray_hits=%s ray_tests=%s duration=%.3fs",
+        getattr(map_obj, "name", None),
+        getattr(terrain_obj, "name", None),
+        total_faces,
+        faces_checked_up,
+        faces_skipped_by_normal,
+        faces_skipped_by_bbox,
+        colored_count,
+        ray_hits,
+        ray_tests,
+        time.perf_counter() - loop_start,
+    )
 
     bm.to_mesh(map_mesh)
     bm.free()
@@ -9291,6 +9541,10 @@ def color_map_faces_by_terrain(map_obj, terrain_obj, up_threshold=0.05, paint_ma
             "ray_hits": ray_hits,
             "faces_colored": colored_count,
             "material_name_used": mat.name if mat else None,
+            "faces_skipped_by_normal": faces_skipped_by_normal,
+            "faces_skipped_by_bbox": faces_skipped_by_bbox,
+            "ray_tests": ray_tests,
+            "duration_seconds": round(time.perf_counter() - paint_start, 3),
         }
     return None
 
@@ -9347,22 +9601,32 @@ def collect_osm_layers(map_obj):
         include_boundary,
     )
 
-    if include_water:
-        layers["WATER"] = build_coloring_layer(map_obj, "WATER")
-    if include_forest:
-        layers["FOREST"] = build_coloring_layer(map_obj, "FOREST")
-    if include_city:
-        layers["CITY"] = build_coloring_layer(map_obj, "CITY")
-    if include_building:
-        layers["BUILDING"] = build_coloring_layer(map_obj, "BUILDING")
-    if include_glacier:
-        layers["GLACIER"] = build_coloring_layer(map_obj, "GLACIER")
-    if include_rock:
-        layers["ROCK"] = build_coloring_layer(map_obj, "ROCK")
-    if include_road:
-        layers["ROAD"] = build_coloring_layer(map_obj, "ROAD")
-    if include_boundary:
-        layers["BOUNDARY"] = build_coloring_layer(map_obj, "BOUNDARY")
+    requested_layers = (
+        ("WATER", include_water),
+        ("FOREST", include_forest),
+        ("CITY", include_city),
+        ("BUILDING", include_building),
+        ("GLACIER", include_glacier),
+        ("ROCK", include_rock),
+        ("ROAD", include_road),
+        ("BOUNDARY", include_boundary),
+    )
+    for kind, enabled in requested_layers:
+        if not enabled:
+            module_logger.info("OSM layer collection skipped kind=%s enabled=False", kind)
+            continue
+        layer_start = time.perf_counter()
+        module_logger.info("OSM layer collection step start kind=%s map=%s", kind, getattr(map_obj, "name", None))
+        layers[kind] = build_coloring_layer(map_obj, kind)
+        module_logger.info(
+            "OSM layer collection step complete kind=%s map=%s duration=%.3fs merged=%s islands=%s cleanup=%s",
+            kind,
+            getattr(map_obj, "name", None),
+            time.perf_counter() - layer_start,
+            _mesh_debug_summary(layers[kind].get("merged_object")) if layers.get(kind) else None,
+            len(layers[kind].get("island_objects") or []) if layers.get(kind) else 0,
+            layers[kind].get("cleanup_telemetry") if layers.get(kind) else None,
+        )
     module_logger.info(
         "OSM layer collection complete map=%s WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROCK=%s ROAD=%s BOUNDARY=%s",
         getattr(map_obj, "name", None),
@@ -9451,10 +9715,25 @@ def run_layer_pipeline(map_obj):
     rock, road, and boundary overlays. This keeps islands visible while allowing later overlays to win
     where they overlap the terrain.
     """
-    apply_land_base(map_obj)
-    layer_objects = collect_osm_layers(map_obj)
+    pipeline_start = time.perf_counter()
     module_logger.info(
-        "Layer paint routing | WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROCK=%s ROAD=%s BOUNDARY=%s via=paint_coloring_layer->color_map_faces_by_terrain",
+        "Layer pipeline start map=%s summary=%s col_PaintMap=%s",
+        getattr(map_obj, "name", None),
+        _mesh_debug_summary(map_obj),
+        getattr(bpy.context.scene.tp3d, "col_PaintMap", None),
+    )
+
+    step_start = time.perf_counter()
+    module_logger.info("Layer pipeline step start step=apply_land_base map=%s", getattr(map_obj, "name", None))
+    apply_land_base(map_obj)
+    module_logger.info("Layer pipeline step complete step=apply_land_base map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
+
+    step_start = time.perf_counter()
+    module_logger.info("Layer pipeline step start step=collect_osm_layers map=%s", getattr(map_obj, "name", None))
+    layer_objects = collect_osm_layers(map_obj)
+    module_logger.info("Layer pipeline step complete step=collect_osm_layers map=%s duration=%.3fs layer_keys=%s", getattr(map_obj, "name", None), time.perf_counter() - step_start, list(layer_objects.keys()))
+    module_logger.info(
+        "Layer paint routing | WATER=%s FOREST=%s CITY=%s BUILDING=%s GLACIER=%s ROCK=%s ROAD=%s BOUNDARY=%s via=%s",
         bool(layer_objects.get("WATER")),
         bool(layer_objects.get("FOREST")),
         bool(layer_objects.get("CITY")),
@@ -9463,10 +9742,30 @@ def run_layer_pipeline(map_obj):
         bool(layer_objects.get("ROCK")),
         bool(layer_objects.get("ROAD")),
         bool(layer_objects.get("BOUNDARY")),
+        "batch_paint_coloring_layers->paint_map_faces_by_layers" if bpy.context.scene.tp3d.col_PaintMap else "paint_coloring_layer->color_map_faces_by_terrain",
     )
+    for kind in ("WATER", "FOREST", "CITY", "BUILDING", "GLACIER", "ROCK", "ROAD", "BOUNDARY"):
+        layer = layer_objects.get(kind)
+        if not layer:
+            module_logger.info("Layer pipeline layer absent kind=%s", kind)
+            continue
+        module_logger.info(
+            "Layer pipeline layer summary kind=%s merged=%s islands=%s cleanup=%s",
+            kind,
+            _mesh_debug_summary(layer.get("merged_object")),
+            len(layer.get("island_objects") or []),
+            layer.get("cleanup_telemetry"),
+        )
+
+    step_start = time.perf_counter()
+    module_logger.info("Layer pipeline step start step=paint_entire_map_base map=%s", getattr(map_obj, "name", None))
     paint_entire_map_base(map_obj, base_material='BASE')
+    module_logger.info("Layer pipeline step complete step=paint_entire_map_base map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
     if bpy.context.scene.tp3d.col_PaintMap:
+        step_start = time.perf_counter()
+        module_logger.info("Layer pipeline step start step=batch_paint_coloring_layers map=%s", getattr(map_obj, "name", None))
         batch_metrics = batch_paint_coloring_layers(map_obj, layer_objects)
+        module_logger.info("Layer pipeline step complete step=batch_paint_coloring_layers map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
         water_obj = None
         overlay_objs = {
             "FOREST": None,
@@ -9479,9 +9778,19 @@ def run_layer_pipeline(map_obj):
         }
         module_logger.info("Layer batch paint metrics map=%s metrics=%s", getattr(map_obj, "name", None), batch_metrics)
     else:
+        step_start = time.perf_counter()
+        module_logger.info("Layer pipeline step start step=apply_water_layer map=%s", getattr(map_obj, "name", None))
         water_obj = apply_water_layer(map_obj, layer_objects)
+        module_logger.info("Layer pipeline step complete step=apply_water_layer map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
+        step_start = time.perf_counter()
+        module_logger.info("Layer pipeline step start step=apply_island_layer map=%s", getattr(map_obj, "name", None))
         apply_island_layer(map_obj, layer_objects)
+        module_logger.info("Layer pipeline step complete step=apply_island_layer map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
+        step_start = time.perf_counter()
+        module_logger.info("Layer pipeline step start step=apply_overlay_layers map=%s", getattr(map_obj, "name", None))
         overlay_objs = apply_overlay_layers(map_obj, layer_objects)
+        module_logger.info("Layer pipeline step complete step=apply_overlay_layers map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
+    module_logger.info("Layer pipeline complete map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - pipeline_start)
     return {
         "water": water_obj,
         "overlays": overlay_objs,
