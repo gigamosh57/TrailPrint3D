@@ -358,6 +358,7 @@ class MyProperties(bpy.types.PropertyGroup):
         items=[
             ("HEXAGON", "Hexagon", "Hexagonal map"),
             ("SQUARE", "Square", "Square map"),
+            ("PRECISE SQUARE", "Precise square", "Square map from an explicit latitude/longitude bounding box without a GPX trail"),
             #("CIRCLE", "Circle", "Circular map"),
             #("OCTAGON", "Octagon", "Octagon Map"), #Premium
             #("ELLIPSE", "Ellipse", "Ellipse Map"), #Premium
@@ -551,6 +552,8 @@ class MyProperties(bpy.types.PropertyGroup):
     col_QueryBatchScale: bpy.props.FloatProperty(name="Query Batch Scale", default=1.0, min=0.25, max=4.0, description="Scale OSM tile/API request sizes. Higher is faster when providers allow larger requests; lower is safer.")
     col_KeepManifold: bpy.props.BoolProperty(name="Keep Non-Manifold Objects", default=False, description = "Keep Broken/Non-Manifold Water Parts")
     col_PaintMap: bpy.props.BoolProperty(name="Paint Map", default=True, description = "Paint map instead of Generating Separate Objects (Reccomended for MAC users)")
+    col_PaintRainbow: bpy.props.BoolProperty(name="Paint Rainbow", default=False, description = "Paint the base terrain in elevation color bands before OSM layers are applied")
+    col_RainbowSpacing: bpy.props.FloatProperty(name="Rainbow Vertical Spacing", default=2.0, min=0.1, max=1000.0, description="Vertical spacing in mm between rainbow terrain color bands")
     col_WaterSpotCleanup: bpy.props.BoolProperty(name="Water Spot Cleanup", default=True, description = "Remove tiny WATER paint spots and optionally fill tiny BASE holes")
     col_WaterSpotCleanupMul: bpy.props.FloatProperty(name="Water Cleanup Threshold Mult", default=2.0, min=0.0, description="Cluster threshold in multiples of median map face area")
     col_WaterHoleFillEnabled: bpy.props.BoolProperty(name="Water Hole Fill", default=False, description="Promote small enclosed BASE holes to WATER during cleanup")
@@ -596,6 +599,10 @@ class MyProperties(bpy.types.PropertyGroup):
     jMapLat2: bpy.props.FloatProperty(name="Latitude2", default = 49.00)
     jMapLon1: bpy.props.FloatProperty(name="Longitude1", default = 8.00)
     jMapLon2: bpy.props.FloatProperty(name="Longitude2", default = 9.00)
+    preciseSouth: bpy.props.FloatProperty(name="South Latitude", default = 48.00, min = -90.0, max = 90.0, description = "Southern edge of the precise square bounding box")
+    preciseWest: bpy.props.FloatProperty(name="West Longitude", default = 8.00, min = -180.0, max = 180.0, description = "Western edge of the precise square bounding box")
+    preciseNorth: bpy.props.FloatProperty(name="North Latitude", default = 49.00, min = -90.0, max = 90.0, description = "Northern edge of the precise square bounding box")
+    preciseEast: bpy.props.FloatProperty(name="East Longitude", default = 9.00, min = -180.0, max = 180.0, description = "Eastern edge of the precise square bounding box")
 
     specialBlend_path: bpy.props.StringProperty(
         name="TP3dSpecial.blend Path",
@@ -626,7 +633,10 @@ class MY_OT_runGeneration(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.tp3d  # Access stored variables
         
-        runGeneration(0)
+        if props.shape == "PRECISE SQUARE":
+            runGeneration(5)
+        else:
+            runGeneration(0)
         
         return {'FINISHED'}
 
@@ -1608,32 +1618,41 @@ class MY_PT_Generate(bpy.types.Panel):
         layout.label(text = "Create the File")
         layout.operator("wm.run_my_script", icon='DISC')
         box = layout.box()
-        box.prop(props, "file_path", icon = "ANIM")
+        if props.shape != "PRECISE SQUARE":
+            box.prop(props, "file_path", icon = "ANIM")
         box.prop(props, "export_path", icon = "FILE_FOLDER")
         box.prop(props, "trailName", icon = "SORTALPHA")
         box.prop(props, "shape")
+        if props.shape == "PRECISE SQUARE":
+            row = box.row()
+            row.prop(props, "preciseSouth")
+            row.prop(props, "preciseWest")
+            row = box.row()
+            row.prop(props, "preciseNorth")
+            row.prop(props, "preciseEast")
         box.separator()  # Adds a horizontal line
         box.prop(props, "objSize")
         box.prop(props, "num_subdivisions")
         box.prop(props, "scaleElevation")
-        box.prop(props, "pathThickness")
-        box.prop(props, "pathRemeshEnabled")
-        box.prop(props, "scalemode")
-        if props.scalemode == "FACTOR":
-            box.prop(props, "pathScale")
-        elif props.scalemode == "COORDINATES":
-            row = box.row()
-            row.prop(props,"scaleLat1")
-            row.prop(props,"scaleLon1")
-            row = box.row()
-            row.prop(props,"scaleLat2")
-            row.prop(props,"scaleLon2")
-        elif props.scalemode == "SCALE":
-            box.prop(props, "pathScale")
-        else:
-            box.label(text=props.scalemode)
+        if props.shape != "PRECISE SQUARE":
+            box.prop(props, "pathThickness")
+            box.prop(props, "pathRemeshEnabled")
+            box.prop(props, "scalemode")
+            if props.scalemode == "FACTOR":
+                box.prop(props, "pathScale")
+            elif props.scalemode == "COORDINATES":
+                row = box.row()
+                row.prop(props,"scaleLat1")
+                row.prop(props,"scaleLon1")
+                row = box.row()
+                row.prop(props,"scaleLat2")
+                row.prop(props,"scaleLon2")
+            elif props.scalemode == "SCALE":
+                box.prop(props, "pathScale")
+            else:
+                box.label(text=props.scalemode)
 
-        box.prop(props, "overwritePathElevation") #, icon = "NORMALIZE_FCURVES"
+            box.prop(props, "overwritePathElevation") #, icon = "NORMALIZE_FCURVES"
 
         layout.label(text = props.o_time, icon = "TIME")
         layout.label(text = "------------------------------")
@@ -1792,6 +1811,9 @@ class MY_PT_Advanced(bpy.types.Panel):
 
             #layout.prop(props, "col_KeepManifold")
             boxer.prop(props,"col_PaintMap")
+            boxer.prop(props, "col_PaintRainbow")
+            if props.col_PaintRainbow:
+                boxer.prop(props, "col_RainbowSpacing")
             if props.col_wActive and props.col_PaintMap:
                 boxer.prop(props, "col_WaterSpotCleanup")
                 if props.col_WaterSpotCleanup:
@@ -3072,6 +3094,52 @@ def setupColors():
     bsdf.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
     
     #-------------------------------------------------------------------------------------------------------------------
+
+def ensure_principled_material(mat_name, base_color):
+    if mat_name not in bpy.data.materials:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+    else:
+        mat = bpy.data.materials[mat_name]
+        if not mat.use_nodes:
+            mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if not bsdf:
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+
+    output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if not output:
+        output = nodes.new(type="ShaderNodeOutputMaterial")
+        output.location = (300, 0)
+
+    if not bsdf.outputs["BSDF"].is_linked:
+        links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+    bsdf.inputs["Base Color"].default_value = base_color
+    return mat
+
+
+def ensure_rainbow_materials_on_mesh(mesh):
+    rainbow_specs = [
+        ("RAINBOW_RED", (0.95, 0.05, 0.04, 1.0)),
+        ("RAINBOW_ORANGE", (1.0, 0.42, 0.02, 1.0)),
+        ("RAINBOW_YELLOW", (0.95, 0.85, 0.05, 1.0)),
+        ("RAINBOW_GREEN", (0.05, 0.65, 0.12, 1.0)),
+        ("RAINBOW_BLUE", (0.02, 0.20, 0.95, 1.0)),
+        ("RAINBOW_PURPLE", (0.42, 0.05, 0.85, 1.0)),
+    ]
+
+    indices = []
+    for mat_name, color in rainbow_specs:
+        mat = ensure_principled_material(mat_name, color)
+        if mesh.materials.find(mat_name) == -1:
+            mesh.materials.append(mat)
+        indices.append(mesh.materials.find(mat_name))
+    return indices
 
 
 
@@ -8390,6 +8458,165 @@ def _xy_bboxes_overlap(a, b, epsilon=1e-9):
     return not (a[2] < b[0] - epsilon or b[2] < a[0] - epsilon or a[3] < b[1] - epsilon or b[3] < a[1] - epsilon)
 
 
+def _xy_grid_cell_size(map_bbox, total_faces, target_cells_per_axis=256):
+    if not map_bbox:
+        return 1.0
+    width = max(float(map_bbox[2] - map_bbox[0]), 1e-6)
+    height = max(float(map_bbox[3] - map_bbox[1]), 1e-6)
+    by_axis = max(width, height) / max(16, int(target_cells_per_axis))
+    if total_faces:
+        by_face_density = max(width, height) / max(16, math.sqrt(max(total_faces, 1)) / 2.0)
+        return max(min(by_axis, by_face_density), 1e-4)
+    return max(by_axis, 1e-4)
+
+
+def _xy_grid_cell_range(bbox, origin, cell_size):
+    if not bbox or cell_size <= 0:
+        return range(0), range(0)
+    ox, oy = origin
+    min_ix = math.floor((bbox[0] - ox) / cell_size)
+    max_ix = math.floor((bbox[2] - ox) / cell_size)
+    min_iy = math.floor((bbox[1] - oy) / cell_size)
+    max_iy = math.floor((bbox[3] - oy) / cell_size)
+    return range(int(min_ix), int(max_ix) + 1), range(int(min_iy), int(max_iy) + 1)
+
+
+def _xy_grid_keys_for_bbox(bbox, origin, cell_size):
+    xs, ys = _xy_grid_cell_range(bbox, origin, cell_size)
+    return [(ix, iy) for ix in xs for iy in ys]
+
+
+def _build_record_spatial_grid(record, origin, cell_size):
+    obj = record.get("object")
+    world_vertices = record.get("world_vertices") or []
+    if not _is_valid_blender_object(obj) or obj.type != 'MESH' or not obj.data or not world_vertices:
+        return None
+
+    polygon_grid = {}
+    vertex_grid = {}
+    polygon_cells = 0
+
+    for vertex in world_vertices:
+        cell = (
+            int(math.floor((vertex.x - origin[0]) / cell_size)),
+            int(math.floor((vertex.y - origin[1]) / cell_size)),
+        )
+        vertex_grid.setdefault(cell, []).append(vertex)
+
+    for poly in obj.data.polygons:
+        poly_points = [world_vertices[idx] for idx in poly.vertices]
+        poly_bbox = _xy_bbox_for_points(poly_points)
+        if not poly_bbox:
+            continue
+        keys = _xy_grid_keys_for_bbox(poly_bbox, origin, cell_size)
+        polygon_cells += len(keys)
+        for key in keys:
+            polygon_grid[key] = True
+
+    return {
+        "origin": origin,
+        "cell_size": cell_size,
+        "polygon_grid": polygon_grid,
+        "vertex_grid": vertex_grid,
+        "polygon_cells": polygon_cells,
+        "polygon_cell_count": len(polygon_grid),
+        "vertex_cell_count": len(vertex_grid),
+    }
+
+
+def _query_record_vertices_for_face(record, face_bbox):
+    spatial_grid = record.get("spatial_grid")
+    if not spatial_grid:
+        return record.get("world_vertices", [])
+
+    candidates = []
+    seen = set()
+    origin = spatial_grid["origin"]
+    cell_size = spatial_grid["cell_size"]
+    vertex_grid = spatial_grid.get("vertex_grid") or {}
+    for key in _xy_grid_keys_for_bbox(face_bbox, origin, cell_size):
+        for point in vertex_grid.get(key, []):
+            point_key = (round(point.x, 7), round(point.y, 7), round(point.z, 7))
+            if point_key in seen:
+                continue
+            seen.add(point_key)
+            candidates.append(point)
+    return candidates
+
+
+def _build_combined_paint_grid(active_entries, map_bbox, total_faces):
+    grid_start = time.perf_counter()
+    if not active_entries or not map_bbox:
+        return None
+
+    origin = (float(map_bbox[0]), float(map_bbox[1]))
+    cell_size = _xy_grid_cell_size(map_bbox, total_faces)
+    combined_grid = {}
+    priority_entries = list(reversed(active_entries))
+    record_id = 0
+    record_count = 0
+
+    for priority, entry in enumerate(priority_entries):
+        for record in entry.get("bvh_records", []):
+            record_id += 1
+            record["paint_record_id"] = record_id
+            spatial_grid = _build_record_spatial_grid(record, origin, cell_size)
+            record["spatial_grid"] = spatial_grid
+            if not spatial_grid:
+                continue
+            record_count += 1
+            for key in spatial_grid["polygon_grid"].keys():
+                combined_grid.setdefault(key, []).append((priority, entry, record))
+
+    for candidates in combined_grid.values():
+        candidates.sort(key=lambda item: item[0])
+
+    module_logger.info(
+        "Combined layer paint grid built entries=%s records=%s cells=%s cell_size=%.6f duration=%.3fs record_grids=%s",
+        len(active_entries),
+        record_count,
+        len(combined_grid),
+        cell_size,
+        time.perf_counter() - grid_start,
+        [
+            {
+                "kind": entry.get("kind"),
+                "records": len(entry.get("bvh_records", [])),
+                "polygon_cells": [
+                    (record.get("spatial_grid") or {}).get("polygon_cell_count", 0)
+                    for record in entry.get("bvh_records", [])
+                ],
+                "vertex_cells": [
+                    (record.get("spatial_grid") or {}).get("vertex_cell_count", 0)
+                    for record in entry.get("bvh_records", [])
+                ],
+            }
+            for entry in active_entries
+        ],
+    )
+    return {
+        "origin": origin,
+        "cell_size": cell_size,
+        "grid": combined_grid,
+    }
+
+
+def _query_combined_paint_grid(combined_index, face_bbox):
+    if not combined_index or not face_bbox:
+        return []
+    seen_records = set()
+    candidates = []
+    for key in _xy_grid_keys_for_bbox(face_bbox, combined_index["origin"], combined_index["cell_size"]):
+        for priority, entry, record in combined_index["grid"].get(key, []):
+            record_id = record.get("paint_record_id")
+            if record_id in seen_records:
+                continue
+            seen_records.add(record_id)
+            candidates.append((priority, entry, record))
+    candidates.sort(key=lambda item: item[0])
+    return [(entry, record) for _, entry, record in candidates]
+
+
 def _point_in_face_xy(point, face_points, epsilon=1e-9):
     if len(face_points) < 3:
         return False
@@ -8433,10 +8660,13 @@ def _ray_hits_bvh_from_points(bvh, points, max_dist=1000):
     return any(_ray_hits_bvh_from_point(bvh, point, max_dist=max_dist) for point in points)
 
 
-def _record_projects_inside_face(record, face_points, face_bbox):
+def _record_projects_inside_face(record, face_points, face_bbox, entry=None):
     if not _xy_bboxes_overlap(face_bbox, record.get("xy_bbox")):
         return False
-    return any(_point_in_face_xy(point, face_points) for point in record.get("world_vertices", []))
+    candidate_vertices = _query_record_vertices_for_face(record, face_bbox)
+    if entry is not None:
+        entry["projected_vertex_tests"] += len(candidate_vertices)
+    return any(_point_in_face_xy(point, face_points) for point in candidate_vertices)
 
 
 def _make_paint_entry(kind, material_name, objects):
@@ -8506,6 +8736,9 @@ def _make_paint_entry(kind, material_name, objects):
         "projected_vertex_hits": 0,
         "bbox_skipped_faces": 0,
         "bbox_skipped_records": 0,
+        "grid_candidate_faces": 0,
+        "grid_skipped_faces": 0,
+        "projected_vertex_tests": 0,
         "ray_tests": 0,
     }
 
@@ -8621,6 +8854,8 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
     total_faces = len(bm.faces)
     module_logger.info("Batch layer paint bmesh ready map=%s faces=%s duration=%.3fs", getattr(map_obj, "name", None), total_faces, time.perf_counter() - bmesh_start)
 
+    combined_index = _build_combined_paint_grid(active_entries, map_bbox, total_faces)
+
     up = Vector((0, 0, 1))
     map_world = map_obj.matrix_world
     map_direction_matrix = map_world.to_3x3()
@@ -8642,35 +8877,35 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
         sample_points, face_points = _face_sample_points_world(face, map_world)
         face_bbox = _xy_bbox_for_points(face_points)
         winning_entry = None
-        any_entry_bbox_overlap = False
-        for entry in reversed(active_entries):
-            hit = False
-            projected_vertex_hit = False
-            if not _xy_bboxes_overlap(face_bbox, entry.get("xy_bbox")):
-                entry["bbox_skipped_faces"] += 1
-                continue
-            any_entry_bbox_overlap = True
-            for record in entry["bvh_records"]:
+        candidate_records = _query_combined_paint_grid(combined_index, face_bbox)
+        if not candidate_records:
+            faces_without_bbox_overlap += 1
+            for entry in active_entries:
+                entry["grid_skipped_faces"] += 1
+        else:
+            candidate_entries = {id(entry) for entry, _ in candidate_records}
+            for entry in active_entries:
+                if id(entry) in candidate_entries:
+                    entry["grid_candidate_faces"] += 1
+                else:
+                    entry["grid_skipped_faces"] += 1
+
+            for entry, record in candidate_records:
+                projected_vertex_hit = False
                 if not _xy_bboxes_overlap(face_bbox, record.get("xy_bbox")):
                     entry["bbox_skipped_records"] += 1
                     continue
                 entry["ray_tests"] += len(sample_points) * 2
                 if _ray_hits_bvh_from_points(record["bvh"], sample_points):
-                    hit = True
+                    entry["ray_hits"] += 1
+                    winning_entry = entry
                     break
-                if _record_projects_inside_face(record, face_points, face_bbox):
-                    hit = True
+                if _record_projects_inside_face(record, face_points, face_bbox, entry=entry):
                     projected_vertex_hit = True
-                    break
-            if hit:
-                entry["ray_hits"] += 1
-                if projected_vertex_hit:
+                    entry["ray_hits"] += 1
                     entry["projected_vertex_hits"] += 1
-                winning_entry = entry
-                break
-
-        if not any_entry_bbox_overlap:
-            faces_without_bbox_overlap += 1
+                    winning_entry = entry
+                    break
 
         if winning_entry:
             face.material_index = material_indices[winning_entry["material_name"]]
@@ -8696,6 +8931,10 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
                         "ray_tests": entry.get("ray_tests", 0),
                         "bbox_skipped_faces": entry.get("bbox_skipped_faces", 0),
                         "bbox_skipped_records": entry.get("bbox_skipped_records", 0),
+                        "grid_candidates": entry.get("grid_candidate_faces", 0),
+                        "grid_skipped": entry.get("grid_skipped_faces", 0),
+                        "projected_vertex_hits": entry.get("projected_vertex_hits", 0),
+                        "projected_vertex_tests": entry.get("projected_vertex_tests", 0),
                     }
                     for entry in active_entries
                 },
@@ -8730,6 +8969,9 @@ def paint_map_faces_by_layers(map_obj, paint_entries, up_threshold=0.05):
             "xy_bbox": _format_xy_bbox(entry.get("xy_bbox")),
             "bbox_skipped_faces": entry.get("bbox_skipped_faces", 0),
             "bbox_skipped_records": entry.get("bbox_skipped_records", 0),
+            "grid_candidate_faces": entry.get("grid_candidate_faces", 0),
+            "grid_skipped_faces": entry.get("grid_skipped_faces", 0),
+            "projected_vertex_tests": entry.get("projected_vertex_tests", 0),
             "ray_tests": entry.get("ray_tests", 0),
         }
         for entry in active_entries
@@ -9672,6 +9914,146 @@ def paint_entire_map_base(map_obj, base_material='BASE'):
         poly.material_index = base_index
 
 
+def paint_rainbow_terrain_bands(map_obj, spacing, base_material='BASE'):
+    if not map_obj or map_obj.type != 'MESH' or not map_obj.data:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "invalid_map"}
+
+    spacing = float(spacing or 0)
+    if spacing <= 0:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "invalid_spacing"}
+
+    mesh = map_obj.data
+    base_index = mesh.materials.find(base_material)
+    if base_index == -1:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "missing_base_material"}
+
+    rainbow_material_indices = ensure_rainbow_materials_on_mesh(mesh)
+    if not rainbow_material_indices:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "missing_rainbow_materials"}
+
+    band_material_names = [
+        mesh.materials[index].name
+        for index in rainbow_material_indices
+        if 0 <= index < len(mesh.materials) and mesh.materials[index]
+    ]
+    if not band_material_names:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "missing_rainbow_materials"}
+
+    source_verts = [vertex.co.copy() for vertex in mesh.vertices]
+    if not source_verts:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "empty_map_mesh"}
+
+    min_z = min(vertex.z for vertex in source_verts)
+    max_z = max(vertex.z for vertex in source_verts)
+    if max_z <= min_z:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "flat_or_invalid_z_range"}
+
+    candidate_polys = [
+        poly for poly in mesh.polygons
+        if poly.normal.z > 0.02
+    ]
+    if not candidate_polys:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "no_terrain_faces"}
+
+    center_x = sum(point.x for point in source_verts) / len(source_verts)
+    center_y = sum(point.y for point in source_verts) / len(source_verts)
+    xy_expand = max(spacing * 0.01, 0.02)
+
+    def expanded_xy(co):
+        x, y = co.x, co.y
+        dx = x - center_x
+        dy = y - center_y
+        length = math.sqrt(dx * dx + dy * dy)
+        if length > 1e-9:
+            return x + (dx / length) * xy_expand, y + (dy / length) * xy_expand
+        return x, y
+
+    rainbow_name = f"{map_obj.name}_RainbowBands"
+    old_obj = bpy.data.objects.get(rainbow_name)
+    if old_obj:
+        bpy.data.objects.remove(old_obj, do_unlink=True)
+
+    new_verts = []
+    new_faces = []
+    new_face_materials = []
+
+    layer_count = int(math.ceil((max_z - min_z) / spacing))
+    columns_created = 0
+    for poly in candidate_polys:
+        poly_surface_z = sum(mesh.vertices[v_idx].co.z for v_idx in poly.vertices) / len(poly.vertices)
+        if poly_surface_z <= min_z:
+            continue
+
+        layer_limit = int(math.ceil((poly_surface_z - min_z) / spacing))
+        poly_xy = [expanded_xy(mesh.vertices[v_idx].co) for v_idx in poly.vertices]
+        for layer_index in range(layer_limit):
+            lower_z = min_z + layer_index * spacing
+            upper_z = min(poly_surface_z, lower_z + spacing)
+            if upper_z <= lower_z:
+                continue
+            band_index = layer_index % len(band_material_names)
+            lower_indices = []
+            upper_indices = []
+            for x, y in poly_xy:
+                lower_indices.append(len(new_verts))
+                new_verts.append((x, y, lower_z))
+            for x, y in poly_xy:
+                upper_indices.append(len(new_verts))
+                new_verts.append((x, y, upper_z))
+
+            new_faces.append(upper_indices)
+            new_face_materials.append(band_index)
+            new_faces.append(list(reversed(lower_indices)))
+            new_face_materials.append(band_index)
+
+            for pos, lower_a in enumerate(lower_indices):
+                lower_b = lower_indices[(pos + 1) % len(lower_indices)]
+                upper_b = upper_indices[(pos + 1) % len(upper_indices)]
+                upper_a = upper_indices[pos]
+                new_faces.append([lower_a, lower_b, upper_b, upper_a])
+                new_face_materials.append(band_index)
+            columns_created += 1
+
+    if not new_faces:
+        return {"objects_created": 0, "faces_banded": 0, "reason": "no_band_geometry"}
+
+    rainbow_mesh = bpy.data.meshes.new(rainbow_name)
+    rainbow_obj = bpy.data.objects.new(rainbow_name, rainbow_mesh)
+    bpy.context.collection.objects.link(rainbow_obj)
+    rainbow_mesh.from_pydata(new_verts, [], new_faces)
+    rainbow_mesh.update()
+    rainbow_obj.matrix_world = map_obj.matrix_world.copy()
+
+    for mat_name in band_material_names:
+        rainbow_mesh.materials.append(bpy.data.materials[mat_name])
+    for poly, material_index in zip(rainbow_mesh.polygons, new_face_materials):
+        poly.material_index = material_index
+
+    rainbow_obj["type"] = "RAINBOW_BANDS"
+    rainbow_obj["source_map"] = map_obj.name
+    rainbow_obj["rainbow_spacing"] = spacing
+    rainbow_obj["rainbow_layer_count"] = int(layer_count)
+    rainbow_obj["rainbow_xy_expand"] = float(xy_expand)
+    rainbow_obj["rainbow_columns_created"] = int(columns_created)
+    recalculateNormals(rainbow_obj)
+
+    metrics = {
+        "objects_created": 1,
+        "object": rainbow_obj.name,
+        "layers_created": layer_count,
+        "terrain_faces_used": len(candidate_polys),
+        "columns_created": columns_created,
+        "mesh_faces_created": len(new_faces),
+        "mesh_verts_created": len(new_verts),
+        "spacing": spacing,
+        "bands": len(band_material_names),
+        "z_range": (float(min_z), float(max_z)),
+        "xy_expand": float(xy_expand),
+    }
+    module_logger.info("Rainbow terrain band object complete map=%s metrics=%s", getattr(map_obj, "name", None), metrics)
+    return metrics
+
+
 def apply_water_layer(map_obj, layer_objects):
     layer = layer_objects.get("WATER")
     return paint_coloring_layer(map_obj, layer) if layer else None
@@ -9790,6 +10172,24 @@ def run_layer_pipeline(map_obj):
         module_logger.info("Layer pipeline step start step=apply_overlay_layers map=%s", getattr(map_obj, "name", None))
         overlay_objs = apply_overlay_layers(map_obj, layer_objects)
         module_logger.info("Layer pipeline step complete step=apply_overlay_layers map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - step_start)
+    if bpy.context.scene.tp3d.col_PaintRainbow:
+        step_start = time.perf_counter()
+        module_logger.info(
+            "Layer pipeline step start step=paint_rainbow_terrain_bands map=%s spacing=%s",
+            getattr(map_obj, "name", None),
+            bpy.context.scene.tp3d.col_RainbowSpacing,
+        )
+        rainbow_metrics = paint_rainbow_terrain_bands(
+            map_obj,
+            bpy.context.scene.tp3d.col_RainbowSpacing,
+            base_material='BASE',
+        )
+        module_logger.info(
+            "Layer pipeline step complete step=paint_rainbow_terrain_bands map=%s duration=%.3fs metrics=%s",
+            getattr(map_obj, "name", None),
+            time.perf_counter() - step_start,
+            rainbow_metrics,
+        )
     module_logger.info("Layer pipeline complete map=%s duration=%.3fs", getattr(map_obj, "name", None), time.perf_counter() - pipeline_start)
     return {
         "water": water_obj,
@@ -10198,6 +10598,8 @@ def writeMetadata(obj, type = "MAP"):
         obj["col_boundaryMode"] = bpy.context.scene.tp3d.col_boundaryMode
         obj["col_boundaryWidth"] = bpy.context.scene.tp3d.col_boundaryWidth
         obj["col_boundaryArea"] = bpy.context.scene.tp3d.col_boundaryArea
+        obj["col_PaintRainbow"] = bpy.context.scene.tp3d.col_PaintRainbow
+        obj["col_RainbowSpacing"] = bpy.context.scene.tp3d.col_RainbowSpacing
 
 
 
@@ -10443,6 +10845,14 @@ def runGeneration(type):
     jMapLat2 = bpy.context.scene.tp3d.get("jMapLat2",49)
     global jMapLon2
     jMapLon2 = bpy.context.scene.tp3d.get("jMapLon2",9)
+    global preciseSouth
+    preciseSouth = bpy.context.scene.tp3d.get("preciseSouth",48)
+    global preciseWest
+    preciseWest = bpy.context.scene.tp3d.get("preciseWest",8)
+    global preciseNorth
+    preciseNorth = bpy.context.scene.tp3d.get("preciseNorth",49)
+    global preciseEast
+    preciseEast = bpy.context.scene.tp3d.get("preciseEast",9)
 
 
     global buggyDataset
@@ -10494,6 +10904,15 @@ def runGeneration(type):
     if type == 3:
         #check if inputs are valid
         pass
+    if type == 5:
+        if preciseSouth >= preciseNorth:
+            show_message_box("Precise square bounds are invalid: South Latitude must be less than North Latitude.")
+            toggle_console()
+            return
+        if preciseWest >= preciseEast:
+            show_message_box("Precise square bounds are invalid: West Longitude must be less than East Longitude.")
+            toggle_console()
+            return
     if exportPath == None:
         show_message_box("Export path cant be empty")
         toggle_console()
@@ -10532,6 +10951,8 @@ def runGeneration(type):
             name = os.path.splitext(name_with_ext)[0]
         if type == 2 or type == 3:
             name = "T"
+        if type == 5:
+            name = "PreciseSquare"
         
     #GENERATE COLORS IF THEY ARENT THERE YET
     setupColors()
@@ -10565,6 +10986,7 @@ def runGeneration(type):
     tempcoordinates = []
     separate_paths = []
     blender_coords_separate = []
+    map_only_generation = type in (2, 3, 5)
     # Load GPX data       
     if 1 == 1: 
     #try:
@@ -10592,6 +11014,13 @@ def runGeneration(type):
         if type == 3:
             separate_paths.append([(jMapLat1,jMapLon1,0,0)])
             separate_paths.append([(jMapLat2,jMapLon2,0,0)])
+        if type == 5:
+            separate_paths.append([
+                (preciseSouth, preciseWest, 0, 0),
+                (preciseSouth, preciseEast, 0, 0),
+                (preciseNorth, preciseEast, 0, 0),
+                (preciseNorth, preciseWest, 0, 0)
+            ])
     #except Exception as e:
     else:
         show_message_box(f"Something went Wrong reading the GPX. Type {type}")
@@ -10622,7 +11051,7 @@ def runGeneration(type):
     global time_str
     time_str = f"{hours}h {minutes}m"
 
-    while len(coordinates) < 300 and len(coordinates) > 1 and type != 2:
+    while len(coordinates) < 300 and len(coordinates) > 1 and not map_only_generation:
         i = 0
         while i < len(coordinates) - 1:
             p1 = coordinates[i]
@@ -10720,7 +11149,7 @@ def runGeneration(type):
     #print("Creating MapObject")
     if shape == "HEXAGON": #hexagon
         MapObject = create_hexagon(size/2)
-    elif shape == "SQUARE": #rectangle
+    elif shape == "SQUARE" or shape == "PRECISE SQUARE": #rectangle
         MapObject = create_rectangle(size,size)
     elif shape == "HEXAGON INNER TEXT": #Hexagon with inner text
         MapObject = create_hexagon(size/2)
@@ -10781,21 +11210,22 @@ def runGeneration(type):
     #RECALCULATE THE COORDS WITH AUTOSCALE APPLIED
     blender_coords = [convert_to_blender_coordinates(lat, lon, ele,timestamp) for lat, lon, ele, timestamp in coordinates]
 
-    target_spacing = max(0.12, 0.35 * pathThickness)
-    blender_coords = resample_path_spacing(blender_coords, target_spacing)
-    blender_coords = simplify_curve(blender_coords, .12)
+    if not map_only_generation:
+        target_spacing = max(0.12, 0.35 * pathThickness)
+        blender_coords = resample_path_spacing(blender_coords, target_spacing)
+        blender_coords = simplify_curve(blender_coords, .12)
 
-    #PREVENT CLIPPING OF IDENTICAL COORDINATES
-    blender_coords = separate_duplicate_xy(blender_coords, 0.05) 
-    
-    if (type == 1 or len(separate_paths) > 1) and type != 4:
-        blender_coords_separate = [
-            resample_path_spacing(
-                [convert_to_blender_coordinates(lat, lon, ele, timestamp) for lat, lon, ele, timestamp in path],
-                target_spacing
-            )
-            for path in separate_paths
-            ]
+        #PREVENT CLIPPING OF IDENTICAL COORDINATES
+        blender_coords = separate_duplicate_xy(blender_coords, 0.05) 
+        
+        if (type == 1 or len(separate_paths) > 1) and type != 4:
+            blender_coords_separate = [
+                resample_path_spacing(
+                    [convert_to_blender_coordinates(lat, lon, ele, timestamp) for lat, lon, ele, timestamp in path],
+                    target_spacing
+                )
+                for path in separate_paths
+                ]
     
     #calculate real Scale
     tdist = 0
@@ -10810,13 +11240,14 @@ def runGeneration(type):
     #print(f"scale: {mscale}")
     bpy.context.scene.tp3d["o_mapScale"] = f"{mscale:.0f}"
 
-    path_max_len = 0.5 * pathThickness
-    blender_coords = densify_path_segments(blender_coords, path_max_len)
+    if not map_only_generation:
+        path_max_len = 0.5 * pathThickness
+        blender_coords = densify_path_segments(blender_coords, path_max_len)
 
-    if blender_coords_separate:
-        blender_coords_separate = [
-            densify_path_segments(path_coords, path_max_len) for path_coords in blender_coords_separate
-        ]
+        if blender_coords_separate:
+            blender_coords_separate = [
+                densify_path_segments(path_coords, path_max_len) for path_coords in blender_coords_separate
+            ]
 
     #------------------------------------------------------------------------------------------------------------------------
     #CREATE THE PATH
@@ -10828,12 +11259,12 @@ def runGeneration(type):
     print(f"paths: {len(blender_coords_separate)}")
     #if 1 == 1:
     try:
-        if (type == 0 and len(blender_coords_separate) <= 1) and type != 2 or type == 4:
+        if not map_only_generation and ((type == 0 and len(blender_coords_separate) <= 1) and type != 2 or type == 4):
             #print(blender_coords)
             print("YES")
             create_curve_from_coordinates(blender_coords)
             curveObj = bpy.context.view_layer.objects.active
-        elif (type == 1 or len(blender_coords_separate) > 1) and type != 4 and type != 2:
+        elif not map_only_generation and (type == 1 or len(blender_coords_separate) > 1) and type != 4 and type != 2:
             for crds in blender_coords_separate:
                 create_curve_from_coordinates(crds)
                 
@@ -10996,7 +11427,7 @@ def runGeneration(type):
     #obj.select_set(True)
     #SINGLE COLOR
 
-    if singleColorMode == 1:
+    if singleColorMode == 1 and curveObj:
         single_color_mode(curveObj,obj.name)
 
     #SCM for Elements Currently Paused because it doesnt work if the Water object is Non-manifold
@@ -11047,7 +11478,7 @@ def runGeneration(type):
     #STORE VALUES IN MAP
     writeMetadata(obj)
 
-    if type != 2:
+    if curveObj:
         writeMetadata(curveObj,"TRAIL")
     
     #API Counter updaten
